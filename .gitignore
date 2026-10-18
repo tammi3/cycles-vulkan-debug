@@ -11,6 +11,10 @@ __pycache__/
 *.swo
 *#
 
+#tests
+
+*.ppm
+
 # QtCreator
 CMakeLists.txt.user
 
@@ -31,3 +35,7 @@ install*/
 
 # OSL compiled examples
 examples/osl/*.oso
+
+
+# library
+lib/windows_x64/

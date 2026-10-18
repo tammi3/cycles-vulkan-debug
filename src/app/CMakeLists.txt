@@ -144,6 +144,20 @@ if(WITH_CYCLES_STANDALONE)
     COMMAND ${app_install_dir}/$<TARGET_FILE_NAME:cycles> --version)
 endif()
 
+# --- Vulkan port: BVH dump harness -------------------------------------
+if(WITH_CYCLES_STANDALONE)
+  add_executable(cycles_bvh_dump
+    cycles_bvh_dump.cpp
+    cycles_xml.cpp        # the XML loader is compiled into the cycles exe, not a library
+    cycles_xml.h
+    ${INC} ${INC_SYS})
+  target_link_libraries(cycles_bvh_dump PRIVATE ${LIB})
+
+  if(CYCLES_STANDALONE_REPOSITORY)
+    cycles_install_libraries(cycles_bvh_dump)
+  endif()
+endif()
+
 if(WITH_CYCLES_PRECOMPUTE)
   set(SRC
     cycles_precompute.cpp
