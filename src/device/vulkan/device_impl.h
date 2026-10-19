@@ -52,6 +52,7 @@ class VulkanDevice : public GPUDevice {
   // Vulkan specific helpers
   VkDevice vk_device() const { return device; }
   VkPhysicalDevice vk_physical_device() const { return physical_device; }
+  uint32_t find_queue_family(VkPhysicalDevice phys_dev);
   uint32_t find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties);
   void submit_and_wait(VkCommandBuffer cmd);
 
@@ -65,6 +66,9 @@ class VulkanDevice : public GPUDevice {
 
   std::unordered_map<uint64_t, VulkanAlloc> address_to_alloc_map;
   std::unordered_map<std::string, size_t> const_offsets;
+  // Snapshot of the last uploaded contents of each MEM_GLOBAL buffer, so we can
+  // detect when the device_ptr values inside it changed and re-upload.
+  std::unordered_map<const device_memory *, vector<uint8_t>> global_last_uploaded;
   
   size_t const_buffer_size;
   VkBuffer const_buffer;

@@ -89,12 +89,12 @@ VulkanDevice::VulkanDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
   buffer_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
   buffer_address_features.bufferDeviceAddress = VK_TRUE;
 
-  VkPhysicalDeviceShaderInt64Features int64_features{};
-  int64_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_INT64_FEATURES;
-  int64_features.shaderInt64 = VK_TRUE;
-  
-  buffer_address_features.pNext = &int64_features;
+  // shaderInt64 lives in the BASE VkPhysicalDeviceFeatures struct (core since Vulkan 1.0),
+  // not in an extension struct. There is no VkPhysicalDeviceShaderInt64Features type.
+  VkPhysicalDeviceFeatures base_features{};
+  base_features.shaderInt64 = VK_TRUE;
 
+  // Extension features are chained via the pNext pointer instead.
   float queue_priority = 1.0f;
   VkDeviceQueueCreateInfo queue_create_info{};
   queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -106,7 +106,8 @@ VulkanDevice::VulkanDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
   dev_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
   dev_create_info.queueCreateInfoCount = 1;
   dev_create_info.pQueueCreateInfos = &queue_create_info;
-  dev_create_info.pNext = &buffer_address_features; // Enable features
+  dev_create_info.pFeatures = &base_features; // Core features (shaderInt64)
+  dev_create_info.pNext = &buffer_address_features; // Chained extension features (BDA)
 
   if (vkCreateDevice(physical_device, &dev_create_info, nullptr, &device) != VK_SUCCESS) {
     LOG_FATAL << "Vulkan: Failed to create logical device.";
@@ -231,7 +232,9 @@ void VulkanDevice::const_copy_to(const char *name, void *host, const size_t size
 
 bool VulkanDevice::load_kernels(uint) { return true; }
 unique_ptr<DeviceQueue> VulkanDevice::gpu_queue_create() { return make_unique<VulkanQueue>(this); }
-void VulkanDevice::build_bvh(BVH *, Progress &, bool) {}
+// NOTE: no build_bvh() override here. Device::build_bvh() in src/device/device.cpp
+// already provides the generic CPU-side BVH2 build, which is exactly what we want
+// until GPU-side BVH building exists. Adding an empty stub would silently disable it.
 
 // =========================================================================
 // HIGH-LEVEL MEMORY OVERRIDES
@@ -239,35 +242,57 @@ void VulkanDevice::build_bvh(BVH *, Progress &, bool) {}
 void VulkanDevice::mem_alloc(device_memory &mem) { generic_alloc(mem); }
 void VulkanDevice::mem_copy_to(device_memory &mem) {
   if (mem.type == MEM_GLOBAL) {
+    // A MEM_GLOBAL is a kernel-side global array: the buffer holds an array of
+    // device_ptrs, and each element may point to another Vulkan buffer. Upload
+    // the *current* pointer values every time they change (compare against the
+    // last uploaded snapshot; do not rely on generic_copy_to's residency check,
+    // which skips re-uploads when host data "looks" unchanged).
+    const size_t size = mem.memory_size();
     if (!mem.device_pointer) {
-      generic_alloc(mem);
+      alloc_device(mem.device_pointer, size);
     }
-    if (mem.is_resident(this)) {
-      generic_copy_to(mem);
+    auto it = address_to_alloc_map.find((uint64_t)mem.device_pointer);
+    const bool contents_changed =
+        (global_last_uploaded[&mem].data() == nullptr ||
+         memcmp(global_last_uploaded[&mem].data(), mem.host_pointer, size) != 0);
+    if (it != address_to_alloc_map.end() && it->second.size >= size && contents_changed) {
+      copy_host_to_device(mem.device_pointer, mem.host_pointer, size);
+      global_last_uploaded[&mem].resize(size);
+      memcpy(global_last_uploaded[&mem].data(), mem.host_pointer, size);
     }
-    // Tell the kernel where this global array is located in VRAM
+    // Tell the kernel where this global array lives in VRAM (device_ptr value
+    // = BDA address), written into the constant buffer at the symbol's offset.
     const_copy_to(mem.global_name(), &mem.device_pointer, sizeof(device_ptr));
-  } 
-  else {
+  } else {
     generic_copy_to(mem);
   }
 }
 void VulkanDevice::mem_move_to_host(device_memory &) {}
 void VulkanDevice::mem_copy_from(device_memory &mem, const size_t y, size_t w, const size_t h, size_t elem) {
-  if (!mem.device_pointer) return;
+  // Cycles' tiling contract (see CUDADevice::mem_copy_from): the tile is a
+  // CONTIGUOUS block of `h` rows of width `w`. The caller keeps host and device
+  // buffers laid out identically for the current region, so a single linear
+  // strided copy at offset = elem*y*w is correct; row-splitting would be WRONG.
+  if (!mem.host_pointer) return;
+
+  const size_t size_bytes = mem.memory_elements_size(elem * w) * h;
+  const size_t offset_bytes = mem.memory_elements_size(elem * y * w);
+
+  if (!mem.device_pointer) {
+    // Device never got the data; zero the host tile so the image isn't garbage.
+    memset(static_cast<uint8_t *>(mem.host_pointer) + offset_bytes, 0, size_bytes);
+    return;
+  }
+
   auto it = address_to_alloc_map.find((uint64_t)mem.device_pointer);
   if (it == address_to_alloc_map.end()) return;
-
-  // Calculate the specific tile/bucket offset and size
-  size_t offset = elem * y * w;
-  size_t size = elem * w * h;
-  if (size == 0) size = mem.memory_size();
+  if (size_bytes == 0) return;
 
   VkBuffer staging;
   VkDeviceMemory staging_mem;
   VkBufferCreateInfo st_info{};
   st_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  st_info.size = size;
+  st_info.size = size_bytes;
   st_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   vkCreateBuffer(device, &st_info, nullptr, &staging);
 
@@ -293,18 +318,19 @@ void VulkanDevice::mem_copy_from(device_memory &mem, const size_t y, size_t w, c
   begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   vkBeginCommandBuffer(cmd, &begin_info);
 
+  // Single linear copy of the tile region.
   VkBufferCopy copy_region{};
-  copy_region.size = size;
-  copy_region.srcOffset = offset; // Crucial: read from the tile offset
+  copy_region.size = size_bytes;
+  copy_region.srcOffset = offset_bytes;
+  copy_region.dstOffset = 0;
   vkCmdCopyBuffer(cmd, it->second.buffer, staging, 1, &copy_region);
 
   vkEndCommandBuffer(cmd);
   submit_and_wait(cmd);
 
-  void* mapped;
-  vkMapMemory(device, staging_mem, 0, size, 0, &mapped);
-  // Crucial: write to the host pointer at the tile offset
-  memcpy(static_cast<uint8_t*>(mem.host_pointer) + offset, mapped, size);
+  void *mapped;
+  vkMapMemory(device, staging_mem, 0, size_bytes, 0, &mapped);
+  memcpy(static_cast<uint8_t *>(mem.host_pointer) + offset_bytes, mapped, size_bytes);
   vkUnmapMemory(device, staging_mem);
 
   vkDestroyBuffer(device, staging, nullptr);
