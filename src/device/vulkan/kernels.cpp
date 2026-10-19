@@ -78,7 +78,7 @@ void device_vulkan_info(vector<DeviceInfo> &devices)
 
   VkInstance instance = VK_NULL_HANDLE;
   if (vkCreateInstance(&create_info, nullptr, &instance) != VK_SUCCESS) {
-    VLOG_ERROR << "Vulkan: failed to create instance during device enumeration.";
+    LOG_ERROR << "Vulkan: failed to create instance during device enumeration.";
     return;
   }
 
@@ -91,25 +91,21 @@ void device_vulkan_info(vector<DeviceInfo> &devices)
     VkPhysicalDeviceProperties props;
     vkGetPhysicalDeviceProperties(physical_devices[i], &props);
 
+    /* NOTE: DeviceInfo has no `name`, `total_memory`, `free_memory` or
+     * `has_automatic_memory_managed_by_kernels` members in this version of
+     * Cycles (see src/device/device.h). Follow the CUDA backend convention:
+     *   - description: human-readable name shown by --list-devices
+     *   - id:          stable identifier persisted in user preferences
+     * Memory reporting is not part of DeviceInfo here; the VulkanDevice
+     * queries VkPhysicalDeviceMemoryProperties itself at allocation time. */
     DeviceInfo info;
-    info.id = string("VK") + to_string(i);
-    info.name = props.deviceName;
     info.type = DEVICE_VULKAN;
+    info.description = string(props.deviceName);
     info.num = i;
-    info.has_automatic_memory_managed_by_kernels = true;
-
-    /* Report only the device-local heap as usable memory; Cycles uses this
-     * to decide what fits on the GPU. */
-    VkPhysicalDeviceMemoryProperties mem_props;
-    vkGetPhysicalDeviceMemoryProperties(physical_devices[i], &mem_props);
-    size_t device_local = 0;
-    for (uint32_t h = 0; h < mem_props.memoryHeapCount; h++) {
-      if (mem_props.memoryHeaps[h].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-        device_local += mem_props.memoryHeaps[h].size;
-      }
-    }
-    info.total_memory = device_local;
-    info.free_memory = device_local;
+    info.id = string_printf("VULKAN_%s_%.8x_%.8x",
+                            props.deviceName,
+                            props.vendorID,
+                            props.deviceID);
 
     devices.push_back(info);
   }
