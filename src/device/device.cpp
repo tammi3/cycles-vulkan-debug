@@ -19,6 +19,7 @@
 #include "device/multi/device.h"
 #include "device/oneapi/device.h"
 #include "device/optix/device.h"
+#include "device/vulkan/device.h"
 
 #include "util/log.h"
 #include "util/math.h"
@@ -70,6 +71,12 @@ vector<DeviceInfo> &Device::oneapi_devices()
 {
   static vector<DeviceInfo> devices_;
   return devices_;
+}
+
+vector<DeviceInfo> &Device::vulkan_devices() //
+{
+static vector<DeviceInfo> devices_;
+return devices_;
 }
 
 /* Device */
@@ -139,6 +146,14 @@ unique_ptr<Device> Device::create(const DeviceInfo &info,
       break;
 #endif
 
+#ifdef WITH_VULKAN /* <-- ADDED */
+  case DEVICE_VULKAN:
+    if (device_vulkan_init()) {
+      device = device_vulkan_create(info, stats, profiler, headless);
+    }
+    break;
+#endif
+
 #ifdef WITH_METAL
     case DEVICE_METAL:
       if (device_metal_init()) {
@@ -181,6 +196,9 @@ DeviceType Device::type_from_string(const char *name)
   if (strcmp(name, "HIP") == 0) {
     return DEVICE_HIP;
   }
+    if (strcmp(name, "VULKAN") == 0) { //
+    return DEVICE_VULKAN;
+  }
   if (strcmp(name, "METAL") == 0) {
     return DEVICE_METAL;
   }
@@ -211,6 +229,9 @@ string Device::string_from_type(DeviceType type)
   if (type == DEVICE_HIP) {
     return "HIP";
   }
+    if (type == DEVICE_VULKAN) { //
+    return "VULKAN";
+  }
   if (type == DEVICE_METAL) {
     return "METAL";
   }
@@ -236,6 +257,9 @@ vector<DeviceType> Device::available_types()
 #endif
 #ifdef WITH_HIP
   types.push_back(DEVICE_HIP);
+#endif
+#ifdef WITH_VULKAN //
+  types.push_back(DEVICE_VULKAN);
 #endif
 #ifdef WITH_METAL
   types.push_back(DEVICE_METAL);
@@ -296,6 +320,20 @@ vector<DeviceInfo> Device::available_devices(const uint mask)
       devices_initialized_mask |= DEVICE_MASK_HIP;
     }
     for (DeviceInfo &info : hip_devices()) {
+      devices.push_back(info);
+    }
+  }
+#endif
+
+#ifdef WITH_VULKAN //
+  if (mask & DEVICE_MASK_VULKAN) {
+    if (!(devices_initialized_mask & DEVICE_MASK_VULKAN)) {
+      if (device_vulkan_init()) {
+        device_vulkan_info(vulkan_devices());
+      }
+      devices_initialized_mask |= DEVICE_MASK_VULKAN;
+    }
+    for (DeviceInfo &info : vulkan_devices()) {
       devices.push_back(info);
     }
   }
@@ -378,6 +416,18 @@ string Device::device_capabilities(const uint mask)
       const string device_capabilities = device_hip_capabilities();
       if (!device_capabilities.empty()) {
         capabilities += "\nHIP device capabilities:\n";
+        capabilities += device_capabilities;
+      }
+    }
+  }
+#endif
+
+#ifdef WITH_VULKAN /* <-- ADDED */
+  if (mask & DEVICE_MASK_VULKAN) {
+    if (device_vulkan_init()) {
+      const string device_capabilities = device_vulkan_capabilities();
+      if (!device_capabilities.empty()) {
+        capabilities += "\nVulkan device capabilities:\n";
         capabilities += device_capabilities;
       }
     }
@@ -501,6 +551,7 @@ void Device::free_memory()
   cuda_devices().free_memory();
   optix_devices().free_memory();
   hip_devices().free_memory();
+  vulkan_devices().free_memory();//
   oneapi_devices().free_memory();
   cpu_devices().free_memory();
   metal_devices().free_memory();

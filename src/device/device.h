@@ -45,6 +45,7 @@ enum DeviceType {
   DEVICE_HIPRT,
   DEVICE_METAL,
   DEVICE_ONEAPI,
+  DEVICE_VULKAN,
   DEVICE_DUMMY,
 };
 
@@ -55,6 +56,7 @@ enum DeviceTypeMask {
   DEVICE_MASK_HIP = (1 << DEVICE_HIP),
   DEVICE_MASK_METAL = (1 << DEVICE_METAL),
   DEVICE_MASK_ONEAPI = (1 << DEVICE_ONEAPI),
+  DEVICE_MASK_VULKAN = (1 << DEVICE_VULKAN),
   DEVICE_MASK_ALL = ~0
 };
 
@@ -368,6 +370,7 @@ class Device {
   static vector<DeviceInfo> &hip_devices();
   static vector<DeviceInfo> &metal_devices();
   static vector<DeviceInfo> &oneapi_devices();
+  static vector<DeviceInfo> &vulkan_devices();//
   static uint devices_initialized_mask;
 };
 

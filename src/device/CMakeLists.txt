@@ -84,6 +84,13 @@ set(SRC_ONEAPI
   oneapi/queue.h
 )
 
+set(SRC_VULKAN
+  vulkan/device.cpp
+  vulkan/device.h
+  vulkan/device_impl.cpp
+  vulkan/device_impl.h
+)
+
 set(SRC_DUMMY
   dummy/device.cpp
   dummy/device.h
@@ -139,6 +146,7 @@ set(SRC
   ${SRC_DUMMY}
   ${SRC_MULTI}
   ${SRC_OPTIX}
+  ${SRC_VULKAN}
   ${SRC_HEADERS}
 )
 
@@ -230,9 +238,19 @@ if(WITH_CYCLES_DEVICE_ONEAPI)
   unset(CMAKE_REQUIRED_LIBRARIES)
 endif()
 
+# --- Vulkan SDK Linking ---
+if(WITH_CYCLES_DEVICE_VULKAN)
+    # Hardcode Vulkan SDK paths to bypass CMake's FindVulkan quirks
+    set(VULKAN_INCLUDE_DIR "C:/VulkanSDK/1.4.363.0/Include")
+    set(VULKAN_LIBRARY "C:/VulkanSDK/1.4.363.0/Lib/vulkan-1.lib")
+    
+    list(APPEND INC_SYS ${VULKAN_INCLUDE_DIR})
+    list(APPEND LIB ${VULKAN_LIBRARY})
+    add_definitions(-DWITH_VULKAN)
+endif()
+
 include_directories(${INC})
 include_directories(SYSTEM ${INC_SYS})
-
 cycles_add_library(cycles_device "${LIB}" ${SRC})
 
 if(WITH_CYCLES_DEVICE_ONEAPI)
@@ -250,4 +268,5 @@ source_group("multi" FILES ${SRC_MULTI})
 source_group("metal" FILES ${SRC_METAL})
 source_group("optix" FILES ${SRC_OPTIX})
 source_group("oneapi" FILES ${SRC_ONEAPI})
+source_group("vulkan" FILES ${SRC_VULKAN})
 source_group("common" FILES ${SRC_BASE} ${SRC_HEADERS})
