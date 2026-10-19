@@ -84,13 +84,6 @@ set(SRC_ONEAPI
   oneapi/queue.h
 )
 
-set(SRC_VULKAN
-  vulkan/device.cpp
-  vulkan/device.h
-  vulkan/device_impl.cpp
-  vulkan/device_impl.h
-)
-
 set(SRC_DUMMY
   dummy/device.cpp
   dummy/device.h
@@ -240,13 +233,19 @@ endif()
 
 # --- Vulkan SDK Linking ---
 if(WITH_CYCLES_DEVICE_VULKAN)
-    # Hardcode Vulkan SDK paths to bypass CMake's FindVulkan quirks
-    set(VULKAN_INCLUDE_DIR "C:/VulkanSDK/1.4.363.0/Include")
-    set(VULKAN_LIBRARY "C:/VulkanSDK/1.4.363.0/Lib/vulkan-1.lib")
-    
-    list(APPEND INC_SYS ${VULKAN_INCLUDE_DIR})
-    list(APPEND LIB ${VULKAN_LIBRARY})
+    find_package(Vulkan REQUIRED)
+    list(APPEND INC_SYS ${Vulkan_INCLUDE_DIRS})
+    list(APPEND LIB ${Vulkan_LIBRARIES})
     add_definitions(-DWITH_VULKAN)
+    
+    # Append directly to SRC, and omit device_impl.cpp since we deleted it
+    list(APPEND SRC
+        vulkan/device.cpp
+        vulkan/device.h
+        vulkan/device_impl.h
+        vulkan/queue.cpp
+        vulkan/queue.h
+    )
 endif()
 
 include_directories(${INC})
