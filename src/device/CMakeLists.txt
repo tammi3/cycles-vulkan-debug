@@ -238,13 +238,15 @@ if(WITH_CYCLES_DEVICE_VULKAN)
     add_definitions(-DWITH_VULKAN)
     
     # Append directly to SRC
-    list(APPEND SRC
+    set(SRC_VULKAN
         vulkan/device.cpp
         vulkan/device.h
         vulkan/device_impl.h
+        vulkan/kernels.cpp
         vulkan/queue.cpp
         vulkan/queue.h
     )
+    list(APPEND SRC ${SRC_VULKAN})
 endif()
 
 include_directories(${INC})

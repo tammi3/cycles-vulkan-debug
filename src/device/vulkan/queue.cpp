@@ -48,12 +48,12 @@ void VulkanQueue::copy_to_device(device_memory &m) {
 }
 
 void VulkanQueue::copy_from_device(device_memory &m) { 
-  vulkan_device_->mem_copy_from(m, 0, m.data_width, m.data_height == 0 ? 1 : m.data_height, m.data_element_size()); 
+  vulkan_device_->mem_copy_from(m, 0, m.data_width, m.data_height == 0 ? 1 : m.data_height, m.data_elements); 
 }
 
 void *VulkanQueue::copy_from_device_synchronized(device_memory &m, vector<uint8_t> &s) {
   s.resize(m.memory_size());
-  vulkan_device_->mem_copy_from(m, 0, m.data_width, m.data_height == 0 ? 1 : m.data_height, m.data_element_size());
+  vulkan_device_->mem_copy_from(m, 0, m.data_width, m.data_height == 0 ? 1 : m.data_height, m.data_elements);
   memcpy(s.data(), m.host_pointer, s.size());
   return s.data();
 }
