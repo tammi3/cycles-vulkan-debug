@@ -1,6 +1,13 @@
 Cycles Renderer
 ===============
 
+Fork by tammi3 to implement Vulkan as a backend for Cycles X, reference https://github.com/tammi3/Vulkan-backend-Blender-CyclesX .
+
+Currently VulkanDevice initializes but i haven't even began writing the kernel dispatch, still figuring out if the Slang shader should be compiled at runtime or 
+
+if there's a way to have it statically and populate the memory, i swear i hear the Dracula motif every time i'm reminded about the integrator
+
+
 Cycles is a path tracing renderer focused on interactivity and ease of use, while supporting many production features.
 
 https://www.cycles-renderer.org
