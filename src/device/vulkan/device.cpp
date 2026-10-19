@@ -245,17 +245,24 @@ void VulkanDevice::mem_copy_to(device_memory &mem) {
     if (mem.is_resident(this)) {
       generic_copy_to(mem);
     }
-    // Tell the kernel where this global array is
+    // Tell the kernel where this global array is located in VRAM
     const_copy_to(mem.global_name(), &mem.device_pointer, sizeof(device_ptr));
-  } else {
+  } 
+  else {
     generic_copy_to(mem);
   }
 }
 void VulkanDevice::mem_move_to_host(device_memory &) {}
 void VulkanDevice::mem_copy_from(device_memory &mem, const size_t y, size_t w, const size_t h, size_t elem) {
-  const size_t size = mem.memory_size();
-  void* dev_ptr = (void*)mem.device_pointer;
-  
+  if (!mem.device_pointer) return;
+  auto it = address_to_alloc_map.find((uint64_t)mem.device_pointer);
+  if (it == address_to_alloc_map.end()) return;
+
+  // Calculate the specific tile/bucket offset and size
+  size_t offset = elem * y * w;
+  size_t size = elem * w * h;
+  if (size == 0) size = mem.memory_size();
+
   VkBuffer staging;
   VkDeviceMemory staging_mem;
   VkBufferCreateInfo st_info{};
@@ -266,6 +273,7 @@ void VulkanDevice::mem_copy_from(device_memory &mem, const size_t y, size_t w, c
 
   VkMemoryRequirements st_reqs;
   vkGetBufferMemoryRequirements(device, staging, &st_reqs);
+
   VkMemoryAllocateInfo st_alloc{};
   st_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
   st_alloc.allocationSize = st_reqs.size;
@@ -273,37 +281,43 @@ void VulkanDevice::mem_copy_from(device_memory &mem, const size_t y, size_t w, c
   vkAllocateMemory(device, &st_alloc, nullptr, &staging_mem);
   vkBindBufferMemory(device, staging, staging_mem, 0);
 
-  auto it = address_to_alloc_map.find((uint64_t)dev_ptr);
-  if (it != address_to_alloc_map.end()) {
-    VkCommandBufferAllocateInfo cmd_alloc{};
-    cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-    cmd_alloc.commandPool = cmd_pool;
-    cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cmd_alloc.commandBufferCount = 1;
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device, &cmd_alloc, &cmd);
+  VkCommandBufferAllocateInfo cmd_alloc{};
+  cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  cmd_alloc.commandPool = cmd_pool;
+  cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cmd_alloc.commandBufferCount = 1;
+  VkCommandBuffer cmd;
+  vkAllocateCommandBuffers(device, &cmd_alloc, &cmd);
 
-    VkCommandBufferBeginInfo begin_info{};
-    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-    vkBeginCommandBuffer(cmd, &begin_info);
+  VkCommandBufferBeginInfo begin_info{};
+  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  vkBeginCommandBuffer(cmd, &begin_info);
 
-    VkBufferCopy copy_region{};
-    copy_region.size = size;
-    vkCmdCopyBuffer(cmd, it->second.buffer, staging, 1, &copy_region);
+  VkBufferCopy copy_region{};
+  copy_region.size = size;
+  copy_region.srcOffset = offset; // Crucial: read from the tile offset
+  vkCmdCopyBuffer(cmd, it->second.buffer, staging, 1, &copy_region);
 
-    vkEndCommandBuffer(cmd);
-    submit_and_wait(cmd);
-  }
+  vkEndCommandBuffer(cmd);
+  submit_and_wait(cmd);
 
   void* mapped;
   vkMapMemory(device, staging_mem, 0, size, 0, &mapped);
-  memcpy(mem.host_pointer, mapped, size);
+  // Crucial: write to the host pointer at the tile offset
+  memcpy(static_cast<uint8_t*>(mem.host_pointer) + offset, mapped, size);
   vkUnmapMemory(device, staging_mem);
 
   vkDestroyBuffer(device, staging, nullptr);
   vkFreeMemory(device, staging_mem, nullptr);
 }
+
+
 void VulkanDevice::mem_zero(device_memory &mem) {
+  // Safety check: allocate if Cycles hasn't allocated it yet
+  if (!mem.device_pointer) {
+    generic_alloc(mem);
+  }
+  
   auto it = address_to_alloc_map.find((uint64_t)mem.device_pointer);
   if (it != address_to_alloc_map.end()) {
     VkCommandBufferAllocateInfo cmd_alloc{};
@@ -322,6 +336,11 @@ void VulkanDevice::mem_zero(device_memory &mem) {
 
     vkEndCommandBuffer(cmd);
     submit_and_wait(cmd);
+  }
+  
+  // Keep the CPU host pointer in sync with the GPU
+  if (mem.host_pointer) {
+    memset(mem.host_pointer, 0, mem.memory_size());
   }
 }
 void VulkanDevice::mem_free(device_memory &mem) { generic_free(mem); }

@@ -139,7 +139,6 @@ set(SRC
   ${SRC_DUMMY}
   ${SRC_MULTI}
   ${SRC_OPTIX}
-  ${SRC_VULKAN}
   ${SRC_HEADERS}
 )
 
@@ -238,7 +237,7 @@ if(WITH_CYCLES_DEVICE_VULKAN)
     list(APPEND LIB ${Vulkan_LIBRARIES})
     add_definitions(-DWITH_VULKAN)
     
-    # Append directly to SRC, and omit device_impl.cpp since we deleted it
+    # Append directly to SRC
     list(APPEND SRC
         vulkan/device.cpp
         vulkan/device.h
