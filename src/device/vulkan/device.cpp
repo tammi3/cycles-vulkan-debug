@@ -102,12 +102,17 @@ VulkanDevice::VulkanDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
   queue_create_info.queueCount = 1;
   queue_create_info.pQueuePriorities = &queue_priority;
 
-  VkDeviceCreateInfo dev_create_info{};
-  dev_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-  dev_create_info.queueCreateInfoCount = 1;
-  dev_create_info.pQueueCreateInfos = &queue_create_info;
-  dev_create_info.pFeatures = &base_features; // Core features (shaderInt64)
-  dev_create_info.pNext = &buffer_address_features; // Chained extension features (BDA)
+  // NOTE: we use designated initializers instead of assigning to a member like
+  // `pFeatures`/`enabledFeatures`. The struct's feature-pointer member was
+  // renamed across Vulkan header revisions, and aggregate init works with any
+  // of them because it names the *enumerator*, not a field path.
+  const VkDeviceCreateInfo dev_create_info{
+      .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
+      .pNext = &buffer_address_features,        // Chained extension features (BDA)
+      .queueCreateInfoCount = 1,
+      .pQueueCreateInfos = &queue_create_info,
+      .pEnabledFeatures = &base_features,       // Core features (shaderInt64)
+  };
 
   if (vkCreateDevice(physical_device, &dev_create_info, nullptr, &device) != VK_SUCCESS) {
     LOG_FATAL << "Vulkan: Failed to create logical device.";
@@ -249,14 +254,24 @@ void VulkanDevice::mem_copy_to(device_memory &mem) {
     // which skips re-uploads when host data "looks" unchanged).
     const size_t size = mem.memory_size();
     if (!mem.device_pointer) {
-      alloc_device(mem.device_pointer, size);
+      // GPUDevice::alloc_device() takes `void *&` (CUDA/HIP pass real pointers).
+      // We store Buffer Device Address values in device_ptr (uint64_t), so go
+      // through a local void* and copy the address back afterwards.
+      void *device_pointer = nullptr;
+      if (!alloc_device(device_pointer, size)) {
+        LOG_ERROR << "Vulkan: failed to allocate MEM_GLOBAL '" << mem.name_
+                  << "' (" << size << " bytes).";
+        return;
+      }
+      mem.device_pointer = reinterpret_cast<device_ptr>(reinterpret_cast<uintptr_t>(device_pointer));
     }
     auto it = address_to_alloc_map.find((uint64_t)mem.device_pointer);
+    vector<uint8_t> &last = global_last_uploaded[&mem];
     const bool contents_changed =
-        (global_last_uploaded[&mem].data() == nullptr ||
-         memcmp(global_last_uploaded[&mem].data(), mem.host_pointer, size) != 0);
+        (last.size() != size || memcmp(last.data(), mem.host_pointer, size) != 0);
     if (it != address_to_alloc_map.end() && it->second.size >= size && contents_changed) {
-      copy_host_to_device(mem.device_pointer, mem.host_pointer, size);
+      void *device_pointer = reinterpret_cast<void *>(static_cast<uintptr_t>(mem.device_pointer));
+      copy_host_to_device(device_pointer, mem.host_pointer, size);
       global_last_uploaded[&mem].resize(size);
       memcpy(global_last_uploaded[&mem].data(), mem.host_pointer, size);
     }
