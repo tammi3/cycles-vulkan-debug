@@ -232,9 +232,51 @@ endif()
 
 # --- Vulkan SDK Linking ---
 if(WITH_CYCLES_DEVICE_VULKAN)
-    find_package(Vulkan REQUIRED)
-    list(APPEND INC_SYS ${Vulkan_INCLUDE_DIRS})
-    list(APPEND LIB ${Vulkan_LIBRARIES})
+    # Honor user-supplied paths (cache variables VULKAN_INCLUDE_DIR /
+    # VULKAN_LIBRARY, or the legacy -DVULKAN_SDK hint) before falling back to
+    # CMake's built-in FindVulkan. NOTE: this project ships its own (outdated)
+    # FindVulkan.cmake in src/cmake/Modules which takes precedence over
+    # CMake's module and only understands VULKAN_ROOT_DIR, so we bypass it by
+    # calling the built-in finder via its full module path.
+    if(DEFINED VULKAN_SDK AND NOT DEFINED VULKAN_ROOT_DIR)
+      set(VULKAN_ROOT_DIR "${VULKAN_SDK}")
+    endif()
+
+    # Fallback: search explicitly in the SDK root (covers the case where the
+    # user passed -DVULKAN_SDK but not the granular paths; also handles the
+    # Windows SDK layout Include/ and Lib/).
+    if(NOT VULKAN_INCLUDE_DIR AND VULKAN_ROOT_DIR)
+      find_path(VULKAN_INCLUDE_DIR
+        NAMES vulkan/vulkan.h
+        HINTS "${VULKAN_ROOT_DIR}/Include" "${VULKAN_ROOT_DIR}/include")
+    endif()
+    if(NOT VULKAN_LIBRARY AND VULKAN_ROOT_DIR)
+      find_library(VULKAN_LIBRARY
+        NAMES vulkan-1 vulkan
+        HINTS "${VULKAN_ROOT_DIR}/Lib" "${VULKAN_ROOT_DIR}/lib")
+    endif()
+
+    if(NOT VULKAN_INCLUDE_DIR OR NOT VULKAN_LIBRARY)
+      include("${CMAKE_ROOT}/Modules/FindVulkan.cmake")
+      if(Vulkan_FOUND)
+        set(VULKAN_INCLUDE_DIR "${Vulkan_INCLUDE_DIRS}" CACHE PATH
+            "Vulkan headers directory" FORCE)
+        set(VULKAN_LIBRARY "${Vulkan_LIBRARIES}" CACHE FILEPATH
+            "Vulkan library" FORCE)
+      endif()
+    endif()
+
+    message(STATUS "Vulkan: include=${VULKAN_INCLUDE_DIR} lib=${VULKAN_LIBRARY}")
+
+    if(NOT VULKAN_INCLUDE_DIR OR NOT VULKAN_LIBRARY)
+      message(FATAL_ERROR
+        "Vulkan SDK not found. Either set the VULKAN_SDK environment variable "
+        "or pass -DVULKAN_INCLUDE_DIR=<path>/Include "
+        "-DVULKAN_LIBRARY=<path>/Lib/vulkan-1.lib")
+    endif()
+
+    list(APPEND INC_SYS ${VULKAN_INCLUDE_DIR})
+    list(APPEND LIB ${VULKAN_LIBRARY})
     add_definitions(-DWITH_VULKAN)
     
     # Append directly to SRC
