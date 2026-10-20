@@ -263,7 +263,10 @@ void VulkanDevice::mem_copy_to(device_memory &mem) {
                   << "' (" << size << " bytes).";
         return;
       }
-      mem.device_pointer = reinterpret_cast<device_ptr>(reinterpret_cast<uintptr_t>(device_pointer));
+      /* `device_ptr` is a plain integer typedef (util/types_base.h: uint64_t),
+       * so reinterpret_cast (which only works between pointer types) is illegal
+       * here. A void* -> integer conversion needs static_cast instead. */
+      mem.device_pointer = static_cast<device_ptr>(reinterpret_cast<uintptr_t>(device_pointer));
     }
     auto it = address_to_alloc_map.find((uint64_t)mem.device_pointer);
     vector<uint8_t> &last = global_last_uploaded[&mem];
