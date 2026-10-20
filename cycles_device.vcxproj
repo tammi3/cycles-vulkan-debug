@@ -1,0 +1,658 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="17.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <PreferredToolArchitecture>x64</PreferredToolArchitecture>
+  </PropertyGroup>
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="MinSizeRel|x64">
+      <Configuration>MinSizeRel</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="RelWithDebInfo|x64">
+      <Configuration>RelWithDebInfo</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{F2F7E5AE-9FB9-3809-9A77-4290DB449D3A}</ProjectGuid>
+    <Keyword>Win32Proj</Keyword>
+    <VcpkgEnabled>false</VcpkgEnabled>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+    <Platform>x64</Platform>
+    <ProjectName>cycles_device</ProjectName>
+    <VCProjectUpgraderObjectName>NoUpgrade</VCProjectUpgraderObjectName>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'" Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <CharacterSet>MultiByte</CharacterSet>
+    <PlatformToolset>v143</PlatformToolset>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <ImportGroup Label="ExtensionSettings">
+  </ImportGroup>
+  <ImportGroup Label="PropertySheets">
+    <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
+  </ImportGroup>
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <_ProjectFileVersion>10.0.20506.1</_ProjectFileVersion>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">C:\dev\cycles-vulkan-debug\build\lib\Debug\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">cycles_device.dir\Debug\</IntDir>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">cycles_device</TargetName>
+    <TargetExt Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">.lib</TargetExt>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">C:\dev\cycles-vulkan-debug\build\lib\Release\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='Release|x64'">cycles_device.dir\Release\</IntDir>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='Release|x64'">cycles_device</TargetName>
+    <TargetExt Condition="'$(Configuration)|$(Platform)'=='Release|x64'">.lib</TargetExt>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">C:\dev\cycles-vulkan-debug\build\lib\MinSizeRel\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">cycles_device.dir\MinSizeRel\</IntDir>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">cycles_device</TargetName>
+    <TargetExt Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">.lib</TargetExt>
+    <OutDir Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">C:\dev\cycles-vulkan-debug\build\lib\RelWithDebInfo\</OutDir>
+    <IntDir Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">cycles_device.dir\RelWithDebInfo\</IntDir>
+    <TargetName Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">cycles_device</TargetName>
+    <TargetExt Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">.lib</TargetExt>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>C:\dev\cycles-vulkan-debug\lib\windows_x64\pthreads\include;C:\dev\cycles-vulkan-debug\third_party\cuew\include;C:\dev\cycles-vulkan-debug\third_party\hipew\include;C:\dev\cycles-vulkan-debug\third_party\sky\include;C:\dev\cycles-vulkan-debug\third_party\mikktspace;C:\dev\cycles-vulkan-debug\src\..\..\extern\cuew\include;C:\dev\cycles-vulkan-debug\src\..\..\extern\hipew\include;C:\dev\cycles-vulkan-debug\src\..\third_party\atomic;C:\dev\cycles-vulkan-debug\src\device\..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "C:/VulkanSDK/1.4.363.0/Include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/OpenImageIO/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/tbb/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/embree/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/openvdb/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/opensubdiv/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/osl/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/imath/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/imath/include/Imath" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/openimagedenoise/include" /J /bigobj /utf-8 /Zc:__cplusplus /jumptablerdata /utf-8</AdditionalOptions>
+      <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
+      <BasicRuntimeChecks>EnableFastChecks</BasicRuntimeChecks>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <CallingConvention>Cdecl</CallingConvention>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <DisableSpecificWarnings>4996;4244;4267</DisableSpecificWarnings>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <FloatingPointModel>Fast</FloatingPointModel>
+      <ForceConformanceInForLoopScope></ForceConformanceInForLoopScope>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <MinimalRebuild></MinimalRebuild>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <Optimization>Disabled</Optimization>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RemoveUnreferencedCodeData>false</RemoveUnreferencedCodeData>
+      <RuntimeLibrary>MultiThreadedDebugDLL</RuntimeLibrary>
+      <SupportJustMyCode></SupportJustMyCode>
+      <SuppressStartupBanner>true</SuppressStartupBanner>
+      <TreatWChar_tAsBuiltInType></TreatWChar_tAsBuiltInType>
+      <UseFullPaths>false</UseFullPaths>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);_CRT_SECURE_NO_WARNINGS;DEBUG;_DEBUG;_USE_MATH_DEFINES;WIN32_LEAN_AND_MEAN;NOMINMAX;WITH_KERNEL_SSE42;WITH_KERNEL_AVX2;CCL_NAMESPACE_BEGIN=namespace ccl {;CCL_NAMESPACE_END=};WITH_OSL;WITH_CUDA;WITH_CUDA_DYNLOAD;WITH_HIP;WITH_HIP_DYNLOAD;WITH_EMBREE;EMBREE_MAJOR_VERSION=4;WITH_OPENIMAGEDENOISE;WITH_OPENVDB;WITH_NANOVDB;WITH_OPENSUBDIV;WITH_OCIO;WITH_PUGIXML;WITH_SYSTEM_PUGIXML;WITH_USD;CYCLES_RUNTIME_OPTIX_ROOT_DIR="";WITH_VULKAN;WITH_TBB;IMATH_DLL;OIDN_STATIC_LIB;CMAKE_INTDIR="Debug"</PreprocessorDefinitions>
+      <ObjectFileName>$(IntDir)</ObjectFileName>
+      <ScanSourceForModuleDependencies>false</ScanSourceForModuleDependencies>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_DEBUG;_CRT_SECURE_NO_WARNINGS;DEBUG;_USE_MATH_DEFINES;WIN32_LEAN_AND_MEAN;NOMINMAX;WITH_KERNEL_SSE42;WITH_KERNEL_AVX2;CCL_NAMESPACE_BEGIN=namespace ccl {;CCL_NAMESPACE_END=};WITH_OSL;WITH_CUDA;WITH_CUDA_DYNLOAD;WITH_HIP;WITH_HIP_DYNLOAD;WITH_EMBREE;EMBREE_MAJOR_VERSION=4;WITH_OPENIMAGEDENOISE;WITH_OPENVDB;WITH_NANOVDB;WITH_OPENSUBDIV;WITH_OCIO;WITH_PUGIXML;WITH_SYSTEM_PUGIXML;WITH_USD;CYCLES_RUNTIME_OPTIX_ROOT_DIR=\"\";WITH_VULKAN;WITH_TBB;IMATH_DLL;OIDN_STATIC_LIB;CMAKE_INTDIR=\"Debug\"</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>C:\dev\cycles-vulkan-debug\lib\windows_x64\pthreads\include;C:\dev\cycles-vulkan-debug\third_party\cuew\include;C:\dev\cycles-vulkan-debug\third_party\hipew\include;C:\dev\cycles-vulkan-debug\third_party\sky\include;C:\dev\cycles-vulkan-debug\third_party\mikktspace;C:\dev\cycles-vulkan-debug\src\..\..\extern\cuew\include;C:\dev\cycles-vulkan-debug\src\..\..\extern\hipew\include;C:\dev\cycles-vulkan-debug\src\..\third_party\atomic;C:\dev\cycles-vulkan-debug\src\device\..;C:\VulkanSDK\1.4.363.0\Include;C:\dev\cycles-vulkan-debug\lib\windows_x64\OpenImageIO\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\tbb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\embree\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\openvdb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\opensubdiv\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\osl\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include\Imath;C:\dev\cycles-vulkan-debug\lib\windows_x64\openimagedenoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Midl>
+      <AdditionalIncludeDirectories>C:\dev\cycles-vulkan-debug\lib\windows_x64\pthreads\include;C:\dev\cycles-vulkan-debug\third_party\cuew\include;C:\dev\cycles-vulkan-debug\third_party\hipew\include;C:\dev\cycles-vulkan-debug\third_party\sky\include;C:\dev\cycles-vulkan-debug\third_party\mikktspace;C:\dev\cycles-vulkan-debug\src\..\..\extern\cuew\include;C:\dev\cycles-vulkan-debug\src\..\..\extern\hipew\include;C:\dev\cycles-vulkan-debug\src\..\third_party\atomic;C:\dev\cycles-vulkan-debug\src\device\..;C:\VulkanSDK\1.4.363.0\Include;C:\dev\cycles-vulkan-debug\lib\windows_x64\OpenImageIO\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\tbb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\embree\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\openvdb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\opensubdiv\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\osl\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include\Imath;C:\dev\cycles-vulkan-debug\lib\windows_x64\openimagedenoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+    <Lib>
+      <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>C:\dev\cycles-vulkan-debug\lib\windows_x64\pthreads\include;C:\dev\cycles-vulkan-debug\third_party\cuew\include;C:\dev\cycles-vulkan-debug\third_party\hipew\include;C:\dev\cycles-vulkan-debug\third_party\sky\include;C:\dev\cycles-vulkan-debug\third_party\mikktspace;C:\dev\cycles-vulkan-debug\src\..\..\extern\cuew\include;C:\dev\cycles-vulkan-debug\src\..\..\extern\hipew\include;C:\dev\cycles-vulkan-debug\src\..\third_party\atomic;C:\dev\cycles-vulkan-debug\src\device\..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "C:/VulkanSDK/1.4.363.0/Include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/OpenImageIO/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/tbb/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/embree/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/openvdb/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/opensubdiv/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/osl/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/imath/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/imath/include/Imath" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/openimagedenoise/include" /J /bigobj /utf-8 /Zc:__cplusplus /jumptablerdata /utf-8</AdditionalOptions>
+      <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <CallingConvention>Cdecl</CallingConvention>
+      <DisableSpecificWarnings>4996;4244;4267</DisableSpecificWarnings>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <FloatingPointModel>Fast</FloatingPointModel>
+      <ForceConformanceInForLoopScope></ForceConformanceInForLoopScope>
+      <InlineFunctionExpansion>AnySuitable</InlineFunctionExpansion>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <MinimalRebuild></MinimalRebuild>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <Optimization>Full</Optimization>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RemoveUnreferencedCodeData>false</RemoveUnreferencedCodeData>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <SupportJustMyCode></SupportJustMyCode>
+      <SuppressStartupBanner>true</SuppressStartupBanner>
+      <TreatWChar_tAsBuiltInType></TreatWChar_tAsBuiltInType>
+      <UseFullPaths>false</UseFullPaths>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);_CRT_SECURE_NO_WARNINGS;NDEBUG;_USE_MATH_DEFINES;WIN32_LEAN_AND_MEAN;NOMINMAX;WITH_KERNEL_SSE42;WITH_KERNEL_AVX2;CCL_NAMESPACE_BEGIN=namespace ccl {;CCL_NAMESPACE_END=};WITH_OSL;WITH_CUDA;WITH_CUDA_DYNLOAD;WITH_HIP;WITH_HIP_DYNLOAD;WITH_EMBREE;EMBREE_MAJOR_VERSION=4;WITH_OPENIMAGEDENOISE;WITH_OPENVDB;WITH_NANOVDB;WITH_OPENSUBDIV;WITH_OCIO;WITH_PUGIXML;WITH_SYSTEM_PUGIXML;WITH_USD;CYCLES_RUNTIME_OPTIX_ROOT_DIR="";WITH_VULKAN;WITH_TBB;IMATH_DLL;OIDN_STATIC_LIB;CMAKE_INTDIR="Release"</PreprocessorDefinitions>
+      <ObjectFileName>$(IntDir)</ObjectFileName>
+      <DebugInformationFormat>
+      </DebugInformationFormat>
+      <ScanSourceForModuleDependencies>false</ScanSourceForModuleDependencies>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_CRT_SECURE_NO_WARNINGS;NDEBUG;_USE_MATH_DEFINES;WIN32_LEAN_AND_MEAN;NOMINMAX;WITH_KERNEL_SSE42;WITH_KERNEL_AVX2;CCL_NAMESPACE_BEGIN=namespace ccl {;CCL_NAMESPACE_END=};WITH_OSL;WITH_CUDA;WITH_CUDA_DYNLOAD;WITH_HIP;WITH_HIP_DYNLOAD;WITH_EMBREE;EMBREE_MAJOR_VERSION=4;WITH_OPENIMAGEDENOISE;WITH_OPENVDB;WITH_NANOVDB;WITH_OPENSUBDIV;WITH_OCIO;WITH_PUGIXML;WITH_SYSTEM_PUGIXML;WITH_USD;CYCLES_RUNTIME_OPTIX_ROOT_DIR=\"\";WITH_VULKAN;WITH_TBB;IMATH_DLL;OIDN_STATIC_LIB;CMAKE_INTDIR=\"Release\"</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>C:\dev\cycles-vulkan-debug\lib\windows_x64\pthreads\include;C:\dev\cycles-vulkan-debug\third_party\cuew\include;C:\dev\cycles-vulkan-debug\third_party\hipew\include;C:\dev\cycles-vulkan-debug\third_party\sky\include;C:\dev\cycles-vulkan-debug\third_party\mikktspace;C:\dev\cycles-vulkan-debug\src\..\..\extern\cuew\include;C:\dev\cycles-vulkan-debug\src\..\..\extern\hipew\include;C:\dev\cycles-vulkan-debug\src\..\third_party\atomic;C:\dev\cycles-vulkan-debug\src\device\..;C:\VulkanSDK\1.4.363.0\Include;C:\dev\cycles-vulkan-debug\lib\windows_x64\OpenImageIO\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\tbb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\embree\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\openvdb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\opensubdiv\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\osl\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include\Imath;C:\dev\cycles-vulkan-debug\lib\windows_x64\openimagedenoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Midl>
+      <AdditionalIncludeDirectories>C:\dev\cycles-vulkan-debug\lib\windows_x64\pthreads\include;C:\dev\cycles-vulkan-debug\third_party\cuew\include;C:\dev\cycles-vulkan-debug\third_party\hipew\include;C:\dev\cycles-vulkan-debug\third_party\sky\include;C:\dev\cycles-vulkan-debug\third_party\mikktspace;C:\dev\cycles-vulkan-debug\src\..\..\extern\cuew\include;C:\dev\cycles-vulkan-debug\src\..\..\extern\hipew\include;C:\dev\cycles-vulkan-debug\src\..\third_party\atomic;C:\dev\cycles-vulkan-debug\src\device\..;C:\VulkanSDK\1.4.363.0\Include;C:\dev\cycles-vulkan-debug\lib\windows_x64\OpenImageIO\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\tbb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\embree\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\openvdb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\opensubdiv\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\osl\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include\Imath;C:\dev\cycles-vulkan-debug\lib\windows_x64\openimagedenoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+    <Lib>
+      <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>C:\dev\cycles-vulkan-debug\lib\windows_x64\pthreads\include;C:\dev\cycles-vulkan-debug\third_party\cuew\include;C:\dev\cycles-vulkan-debug\third_party\hipew\include;C:\dev\cycles-vulkan-debug\third_party\sky\include;C:\dev\cycles-vulkan-debug\third_party\mikktspace;C:\dev\cycles-vulkan-debug\src\..\..\extern\cuew\include;C:\dev\cycles-vulkan-debug\src\..\..\extern\hipew\include;C:\dev\cycles-vulkan-debug\src\..\third_party\atomic;C:\dev\cycles-vulkan-debug\src\device\..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "C:/VulkanSDK/1.4.363.0/Include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/OpenImageIO/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/tbb/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/embree/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/openvdb/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/opensubdiv/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/osl/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/imath/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/imath/include/Imath" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/openimagedenoise/include" /J /bigobj /utf-8 /Zc:__cplusplus /jumptablerdata /utf-8</AdditionalOptions>
+      <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <CallingConvention>Cdecl</CallingConvention>
+      <DisableSpecificWarnings>4996;4244;4267</DisableSpecificWarnings>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <FloatingPointModel>Fast</FloatingPointModel>
+      <ForceConformanceInForLoopScope></ForceConformanceInForLoopScope>
+      <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <MinimalRebuild></MinimalRebuild>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <Optimization>Full</Optimization>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RemoveUnreferencedCodeData>false</RemoveUnreferencedCodeData>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <SupportJustMyCode></SupportJustMyCode>
+      <SuppressStartupBanner>true</SuppressStartupBanner>
+      <TreatWChar_tAsBuiltInType></TreatWChar_tAsBuiltInType>
+      <UseFullPaths>false</UseFullPaths>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);_CRT_SECURE_NO_WARNINGS;NDEBUG;_USE_MATH_DEFINES;WIN32_LEAN_AND_MEAN;NOMINMAX;WITH_KERNEL_SSE42;WITH_KERNEL_AVX2;CCL_NAMESPACE_BEGIN=namespace ccl {;CCL_NAMESPACE_END=};WITH_OSL;WITH_CUDA;WITH_CUDA_DYNLOAD;WITH_HIP;WITH_HIP_DYNLOAD;WITH_EMBREE;EMBREE_MAJOR_VERSION=4;WITH_OPENIMAGEDENOISE;WITH_OPENVDB;WITH_NANOVDB;WITH_OPENSUBDIV;WITH_OCIO;WITH_PUGIXML;WITH_SYSTEM_PUGIXML;WITH_USD;CYCLES_RUNTIME_OPTIX_ROOT_DIR="";WITH_VULKAN;WITH_TBB;IMATH_DLL;OIDN_STATIC_LIB;CMAKE_INTDIR="MinSizeRel"</PreprocessorDefinitions>
+      <ObjectFileName>$(IntDir)</ObjectFileName>
+      <DebugInformationFormat>
+      </DebugInformationFormat>
+      <ScanSourceForModuleDependencies>false</ScanSourceForModuleDependencies>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_CRT_SECURE_NO_WARNINGS;NDEBUG;_USE_MATH_DEFINES;WIN32_LEAN_AND_MEAN;NOMINMAX;WITH_KERNEL_SSE42;WITH_KERNEL_AVX2;CCL_NAMESPACE_BEGIN=namespace ccl {;CCL_NAMESPACE_END=};WITH_OSL;WITH_CUDA;WITH_CUDA_DYNLOAD;WITH_HIP;WITH_HIP_DYNLOAD;WITH_EMBREE;EMBREE_MAJOR_VERSION=4;WITH_OPENIMAGEDENOISE;WITH_OPENVDB;WITH_NANOVDB;WITH_OPENSUBDIV;WITH_OCIO;WITH_PUGIXML;WITH_SYSTEM_PUGIXML;WITH_USD;CYCLES_RUNTIME_OPTIX_ROOT_DIR=\"\";WITH_VULKAN;WITH_TBB;IMATH_DLL;OIDN_STATIC_LIB;CMAKE_INTDIR=\"MinSizeRel\"</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>C:\dev\cycles-vulkan-debug\lib\windows_x64\pthreads\include;C:\dev\cycles-vulkan-debug\third_party\cuew\include;C:\dev\cycles-vulkan-debug\third_party\hipew\include;C:\dev\cycles-vulkan-debug\third_party\sky\include;C:\dev\cycles-vulkan-debug\third_party\mikktspace;C:\dev\cycles-vulkan-debug\src\..\..\extern\cuew\include;C:\dev\cycles-vulkan-debug\src\..\..\extern\hipew\include;C:\dev\cycles-vulkan-debug\src\..\third_party\atomic;C:\dev\cycles-vulkan-debug\src\device\..;C:\VulkanSDK\1.4.363.0\Include;C:\dev\cycles-vulkan-debug\lib\windows_x64\OpenImageIO\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\tbb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\embree\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\openvdb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\opensubdiv\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\osl\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include\Imath;C:\dev\cycles-vulkan-debug\lib\windows_x64\openimagedenoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Midl>
+      <AdditionalIncludeDirectories>C:\dev\cycles-vulkan-debug\lib\windows_x64\pthreads\include;C:\dev\cycles-vulkan-debug\third_party\cuew\include;C:\dev\cycles-vulkan-debug\third_party\hipew\include;C:\dev\cycles-vulkan-debug\third_party\sky\include;C:\dev\cycles-vulkan-debug\third_party\mikktspace;C:\dev\cycles-vulkan-debug\src\..\..\extern\cuew\include;C:\dev\cycles-vulkan-debug\src\..\..\extern\hipew\include;C:\dev\cycles-vulkan-debug\src\..\third_party\atomic;C:\dev\cycles-vulkan-debug\src\device\..;C:\VulkanSDK\1.4.363.0\Include;C:\dev\cycles-vulkan-debug\lib\windows_x64\OpenImageIO\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\tbb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\embree\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\openvdb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\opensubdiv\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\osl\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include\Imath;C:\dev\cycles-vulkan-debug\lib\windows_x64\openimagedenoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+    <Lib>
+      <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">
+    <ClCompile>
+      <AdditionalIncludeDirectories>C:\dev\cycles-vulkan-debug\lib\windows_x64\pthreads\include;C:\dev\cycles-vulkan-debug\third_party\cuew\include;C:\dev\cycles-vulkan-debug\third_party\hipew\include;C:\dev\cycles-vulkan-debug\third_party\sky\include;C:\dev\cycles-vulkan-debug\third_party\mikktspace;C:\dev\cycles-vulkan-debug\src\..\..\extern\cuew\include;C:\dev\cycles-vulkan-debug\src\..\..\extern\hipew\include;C:\dev\cycles-vulkan-debug\src\..\third_party\atomic;C:\dev\cycles-vulkan-debug\src\device\..;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>%(AdditionalOptions) /external:I "C:/VulkanSDK/1.4.363.0/Include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/OpenImageIO/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/tbb/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/embree/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/openvdb/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/opensubdiv/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/osl/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/imath/include" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/imath/include/Imath" /external:I "C:/dev/cycles-vulkan-debug/lib/windows_x64/openimagedenoise/include" /J /bigobj /utf-8 /Zc:__cplusplus /jumptablerdata /utf-8</AdditionalOptions>
+      <AssemblerListingLocation>$(IntDir)</AssemblerListingLocation>
+      <BasicRuntimeChecks>Default</BasicRuntimeChecks>
+      <BufferSecurityCheck>false</BufferSecurityCheck>
+      <CallingConvention>Cdecl</CallingConvention>
+      <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
+      <DisableSpecificWarnings>4996;4244;4267</DisableSpecificWarnings>
+      <ExceptionHandling>Sync</ExceptionHandling>
+      <ExternalWarningLevel>TurnOffAllWarnings</ExternalWarningLevel>
+      <FloatingPointModel>Fast</FloatingPointModel>
+      <ForceConformanceInForLoopScope></ForceConformanceInForLoopScope>
+      <InlineFunctionExpansion>OnlyExplicitInline</InlineFunctionExpansion>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <MinimalRebuild></MinimalRebuild>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <Optimization>Full</Optimization>
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+      <RemoveUnreferencedCodeData>false</RemoveUnreferencedCodeData>
+      <RuntimeLibrary>MultiThreadedDLL</RuntimeLibrary>
+      <SupportJustMyCode></SupportJustMyCode>
+      <SuppressStartupBanner>true</SuppressStartupBanner>
+      <TreatWChar_tAsBuiltInType></TreatWChar_tAsBuiltInType>
+      <UseFullPaths>false</UseFullPaths>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);_CRT_SECURE_NO_WARNINGS;NDEBUG;_USE_MATH_DEFINES;WIN32_LEAN_AND_MEAN;NOMINMAX;WITH_KERNEL_SSE42;WITH_KERNEL_AVX2;CCL_NAMESPACE_BEGIN=namespace ccl {;CCL_NAMESPACE_END=};WITH_OSL;WITH_CUDA;WITH_CUDA_DYNLOAD;WITH_HIP;WITH_HIP_DYNLOAD;WITH_EMBREE;EMBREE_MAJOR_VERSION=4;WITH_OPENIMAGEDENOISE;WITH_OPENVDB;WITH_NANOVDB;WITH_OPENSUBDIV;WITH_OCIO;WITH_PUGIXML;WITH_SYSTEM_PUGIXML;WITH_USD;CYCLES_RUNTIME_OPTIX_ROOT_DIR="";WITH_VULKAN;WITH_TBB;IMATH_DLL;OIDN_STATIC_LIB;CMAKE_INTDIR="RelWithDebInfo"</PreprocessorDefinitions>
+      <ObjectFileName>$(IntDir)</ObjectFileName>
+      <ScanSourceForModuleDependencies>false</ScanSourceForModuleDependencies>
+    </ClCompile>
+    <ResourceCompile>
+      <PreprocessorDefinitions>%(PreprocessorDefinitions);WIN32;_CRT_SECURE_NO_WARNINGS;NDEBUG;_USE_MATH_DEFINES;WIN32_LEAN_AND_MEAN;NOMINMAX;WITH_KERNEL_SSE42;WITH_KERNEL_AVX2;CCL_NAMESPACE_BEGIN=namespace ccl {;CCL_NAMESPACE_END=};WITH_OSL;WITH_CUDA;WITH_CUDA_DYNLOAD;WITH_HIP;WITH_HIP_DYNLOAD;WITH_EMBREE;EMBREE_MAJOR_VERSION=4;WITH_OPENIMAGEDENOISE;WITH_OPENVDB;WITH_NANOVDB;WITH_OPENSUBDIV;WITH_OCIO;WITH_PUGIXML;WITH_SYSTEM_PUGIXML;WITH_USD;CYCLES_RUNTIME_OPTIX_ROOT_DIR=\"\";WITH_VULKAN;WITH_TBB;IMATH_DLL;OIDN_STATIC_LIB;CMAKE_INTDIR=\"RelWithDebInfo\"</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>C:\dev\cycles-vulkan-debug\lib\windows_x64\pthreads\include;C:\dev\cycles-vulkan-debug\third_party\cuew\include;C:\dev\cycles-vulkan-debug\third_party\hipew\include;C:\dev\cycles-vulkan-debug\third_party\sky\include;C:\dev\cycles-vulkan-debug\third_party\mikktspace;C:\dev\cycles-vulkan-debug\src\..\..\extern\cuew\include;C:\dev\cycles-vulkan-debug\src\..\..\extern\hipew\include;C:\dev\cycles-vulkan-debug\src\..\third_party\atomic;C:\dev\cycles-vulkan-debug\src\device\..;C:\VulkanSDK\1.4.363.0\Include;C:\dev\cycles-vulkan-debug\lib\windows_x64\OpenImageIO\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\tbb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\embree\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\openvdb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\opensubdiv\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\osl\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include\Imath;C:\dev\cycles-vulkan-debug\lib\windows_x64\openimagedenoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Midl>
+      <AdditionalIncludeDirectories>C:\dev\cycles-vulkan-debug\lib\windows_x64\pthreads\include;C:\dev\cycles-vulkan-debug\third_party\cuew\include;C:\dev\cycles-vulkan-debug\third_party\hipew\include;C:\dev\cycles-vulkan-debug\third_party\sky\include;C:\dev\cycles-vulkan-debug\third_party\mikktspace;C:\dev\cycles-vulkan-debug\src\..\..\extern\cuew\include;C:\dev\cycles-vulkan-debug\src\..\..\extern\hipew\include;C:\dev\cycles-vulkan-debug\src\..\third_party\atomic;C:\dev\cycles-vulkan-debug\src\device\..;C:\VulkanSDK\1.4.363.0\Include;C:\dev\cycles-vulkan-debug\lib\windows_x64\OpenImageIO\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\tbb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\embree\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\openvdb\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\opensubdiv\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\osl\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include;C:\dev\cycles-vulkan-debug\lib\windows_x64\imath\include\Imath;C:\dev\cycles-vulkan-debug\lib\windows_x64\openimagedenoise\include;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <OutputDirectory>$(ProjectDir)/$(IntDir)</OutputDirectory>
+      <HeaderFileName>%(Filename).h</HeaderFileName>
+      <TypeLibraryName>%(Filename).tlb</TypeLibraryName>
+      <InterfaceIdentifierFileName>%(Filename)_i.c</InterfaceIdentifierFileName>
+      <ProxyFileName>%(Filename)_p.c</ProxyFileName>
+    </Midl>
+    <Lib>
+      <AdditionalOptions>%(AdditionalOptions) /machine:x64</AdditionalOptions>
+    </Lib>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <CustomBuild Include="C:\dev\cycles-vulkan-debug\src\device\CMakeLists.txt">
+      <UseUtf8Encoding>Always</UseUtf8Encoding>
+      <Message Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">Building Custom Rule C:/dev/cycles-vulkan-debug/src/device/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/dev/cycles-vulkan-debug -BC:/dev/cycles-vulkan-debug/build --check-stamp-file C:/dev/cycles-vulkan-debug/build/src/device/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">C:\dev\cycles-vulkan-debug\build\src\device\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='Release|x64'">Building Custom Rule C:/dev/cycles-vulkan-debug/src/device/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='Release|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/dev/cycles-vulkan-debug -BC:/dev/cycles-vulkan-debug/build --check-stamp-file C:/dev/cycles-vulkan-debug/build/src/device/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='Release|x64'">C:\dev\cycles-vulkan-debug\build\src\device\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='Release|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">Building Custom Rule C:/dev/cycles-vulkan-debug/src/device/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/dev/cycles-vulkan-debug -BC:/dev/cycles-vulkan-debug/build --check-stamp-file C:/dev/cycles-vulkan-debug/build/src/device/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">C:\dev\cycles-vulkan-debug\build\src\device\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='MinSizeRel|x64'">false</LinkObjects>
+      <Message Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">Building Custom Rule C:/dev/cycles-vulkan-debug/src/device/CMakeLists.txt</Message>
+      <Command Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">setlocal
+"C:\Program Files\CMake\bin\cmake.exe" -SC:/dev/cycles-vulkan-debug -BC:/dev/cycles-vulkan-debug/build --check-stamp-file C:/dev/cycles-vulkan-debug/build/src/device/CMakeFiles/generate.stamp
+if %errorlevel% neq 0 goto :cmEnd
+:cmEnd
+endlocal &amp; call :cmErrorLevel %errorlevel% &amp; goto :cmDone
+:cmErrorLevel
+exit /b %1
+:cmDone
+if %errorlevel% neq 0 goto :VCEnd</Command>
+      <AdditionalInputs Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">%(AdditionalInputs)</AdditionalInputs>
+      <Outputs Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">C:\dev\cycles-vulkan-debug\build\src\device\CMakeFiles\generate.stamp</Outputs>
+      <LinkObjects Condition="'$(Configuration)|$(Platform)'=='RelWithDebInfo|x64'">false</LinkObjects>
+    </CustomBuild>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\device.cpp">
+      <ObjectFileName>$(IntDir)device.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\denoise.cpp" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\graphics_interop.cpp">
+      <ObjectFileName>$(IntDir)graphics_interop.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\kernel.cpp">
+      <ObjectFileName>$(IntDir)kernel.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\memory.cpp" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\queue.cpp">
+      <ObjectFileName>$(IntDir)queue.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\cpu\device.cpp">
+      <ObjectFileName>$(IntDir)cpu/device.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\cpu\device.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\cpu\device_impl.cpp">
+      <ObjectFileName>$(IntDir)cpu/device_impl.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\cpu\device_impl.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\cpu\kernel.cpp">
+      <ObjectFileName>$(IntDir)cpu/kernel.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\cpu\kernel.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\cpu\kernel_function.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\cuda\device.cpp">
+      <ObjectFileName>$(IntDir)cuda/device.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\cuda\device.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\cuda\device_impl.cpp">
+      <ObjectFileName>$(IntDir)cuda/device_impl.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\cuda\device_impl.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\cuda\graphics_interop.cpp">
+      <ObjectFileName>$(IntDir)cuda/graphics_interop.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\cuda\graphics_interop.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\cuda\kernel.cpp">
+      <ObjectFileName>$(IntDir)cuda/kernel.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\cuda\kernel.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\cuda\queue.cpp">
+      <ObjectFileName>$(IntDir)cuda/queue.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\cuda\queue.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\cuda\util.cpp">
+      <ObjectFileName>$(IntDir)cuda/util.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\cuda\util.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\hip\device.cpp">
+      <ObjectFileName>$(IntDir)hip/device.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\hip\device.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\hip\device_impl.cpp">
+      <ObjectFileName>$(IntDir)hip/device_impl.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\hip\device_impl.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\hip\graphics_interop.cpp">
+      <ObjectFileName>$(IntDir)hip/graphics_interop.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\hip\graphics_interop.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\hip\kernel.cpp">
+      <ObjectFileName>$(IntDir)hip/kernel.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\hip\kernel.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\hip\queue.cpp">
+      <ObjectFileName>$(IntDir)hip/queue.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\hip\queue.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\hip\util.cpp">
+      <ObjectFileName>$(IntDir)hip/util.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\hip\util.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\hiprt\device_impl.cpp">
+      <ObjectFileName>$(IntDir)hiprt/device_impl.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\hiprt\device_impl.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\hiprt\queue.cpp">
+      <ObjectFileName>$(IntDir)hiprt/queue.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\hiprt\queue.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\dummy\device.cpp">
+      <ObjectFileName>$(IntDir)dummy/device.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\dummy\device.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\multi\device.cpp">
+      <ObjectFileName>$(IntDir)multi/device.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\multi\device.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\optix\device.cpp">
+      <ObjectFileName>$(IntDir)optix/device.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\optix\device.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\optix\device_impl.cpp">
+      <ObjectFileName>$(IntDir)optix/device_impl.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\optix\device_impl.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\optix\queue.cpp">
+      <ObjectFileName>$(IntDir)optix/queue.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\optix\queue.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\optix\util.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\device.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\denoise.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\graphics_interop.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\memory.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\kernel.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\queue.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\vulkan\device.cpp">
+      <ObjectFileName>$(IntDir)vulkan/device.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\vulkan\device.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\vulkan\device_impl.h" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\vulkan\kernels.cpp" />
+    <ClCompile Include="C:\dev\cycles-vulkan-debug\src\device\vulkan\queue.cpp">
+      <ObjectFileName>$(IntDir)vulkan/queue.cpp.obj</ObjectFileName>
+    </ClCompile>
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\device\vulkan\queue.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\bake\bake.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\bvh\bvh.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\bvh\intersect_filter.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\bvh\nodes.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\bvh\shadow_all.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\bvh\local.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\bvh\traversal.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\bvh\types.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\bvh\util.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\bvh\volume.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\bvh\volume_all.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\camera\camera.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\camera\projection.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\alloc.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_ashikhmin_velvet.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_burley.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_diffuse.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_diffuse_ramp.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_microfacet.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_oren_nayar.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_phong_ramp.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_ray_portal.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_sheen.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_toon.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_transparent.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_util.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_ashikhmin_shirley.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_hair.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bssrdf.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\emissive.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\volume.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\volume_util.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\volume_henyey_greenstein.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\volume_rayleigh.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\volume_fournier_forand.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\volume_draine.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_principled_hair_chiang.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\closure\bsdf_principled_hair_huang.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\film\adaptive_sampling.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\film\aov_passes.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\film\data_passes.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\film\denoising_passes.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\film\volume_guiding_denoise.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\film\cryptomatte_passes.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\film\light_passes.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\film\read.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\film\write.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\attribute.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\curve.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\curve_intersect.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\geom_intersect.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\motion_curve.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\motion_point.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\motion_triangle.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\motion_triangle_intersect.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\motion_triangle_shader.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\object.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\point.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\point_intersect.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\primitive.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\shader_data.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\triangle.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\triangle_intersect.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\geom\volume.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\displacement_shader.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\init_from_bake.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\init_from_camera.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\intersect_dedicated_light.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\intersect_closest.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\intersect_mnee.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\intersect_shadow.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\intersect_subsurface.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\intersect_volume_stack.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\guiding.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\megakernel.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\mnee.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\path_state.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\shade_background.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\shade_light.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\shade_shadow.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\shade_surface.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\shade_volume.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\shade_dedicated_light.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\shadow_catcher.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\shadow_linking.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\shadow_state_template.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\state_flow.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\state.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\state_template.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\state_util.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\subsurface_disk.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\subsurface.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\subsurface_random_walk.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\surface_shader.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\volume_shader.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\integrator\volume_stack.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\light\area.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\light\background.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\light\common.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\light\distribution.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\light\light.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\light\point.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\light\sample.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\light\spot.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\light\sun.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\light\tree.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\light\triangle.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\osl\osl.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\osl\camera.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\osl\closures_setup.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\osl\closures_template.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\osl\services_gpu.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\osl\strings.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\osl\types.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\sample\lcg.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\sample\mapping.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\sample\mis.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\sample\pattern.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\sample\sobol_burley.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\sample\tabulated_sobol.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\sample\util.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\svm.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\ao.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\aov.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\attribute.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\bevel.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\blackbody.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\bump.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\camera.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\clamp.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\closure.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\convert.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\checker.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\color_util.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\brick.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\displace.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\fresnel.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\wireframe.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\wavelength.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\gabor.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\gamma.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\brightness.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\geometry.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\gradient.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\hsv.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\ies.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\image.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\invert.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\light_path.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\magic.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\map_range.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\mapping.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\mapping_util.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\math.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\math_util.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\mix.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\node_types.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\node_types_template.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\noise.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\noisetex.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\normal.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\ramp.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\ramp_util.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\radial_tiling.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\radial_tiling_shared.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\raycast.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\scene_time.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\sepcomb_color.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\sepcomb_vector.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\sky.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\tex_coord.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\fractal_noise.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\types.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\util.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\value.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\vector_rotate.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\vector_transform.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\voronoi.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\wave.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\white_noise.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\svm\vertex_color.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\data_arrays.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\data_template.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\features.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\globals.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\image.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\tables.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\types.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\util\colorspace.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\util\differential.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\util\ies.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\util\image_2d.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\util\image_3d.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\util\lookup_table.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\util\nanovdb.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\util\profiler.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\device\gpu\block_sizes.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\device\gpu\image.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\device\gpu\kernel.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\device\gpu\parallel_active_index.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\device\gpu\parallel_prefix_sum.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\device\gpu\parallel_sorted_index.h" />
+    <ClInclude Include="C:\dev\cycles-vulkan-debug\src\kernel\device\gpu\work_stealing.h" />
+  </ItemGroup>
+  <ItemGroup />
+  <ItemGroup>
+    <ProjectReference Include="C:\dev\cycles-vulkan-debug\build\src\integrator\cycles_integrator.vcxproj">
+      <Project>{4ACCAAC1-BD42-3709-9D05-7F5219931D2F}</Project>
+      <Name>cycles_integrator</Name>
+    </ProjectReference>
+  </ItemGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets">
+  </ImportGroup>
+</Project>
