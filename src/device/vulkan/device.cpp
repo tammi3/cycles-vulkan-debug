@@ -235,7 +235,19 @@ void VulkanDevice::const_copy_to(const char *name, void *host, const size_t size
   vkFreeMemory(device, staging_mem, nullptr);
 }
 
-bool VulkanDevice::load_kernels(uint) { return true; }
+bool VulkanDevice::load_kernels(uint)
+{
+  /* M3 exit criterion: fail gracefully. Cycles has no C++->SPIR-V pipeline
+   * yet (the "kernel compilation problem", our M4 work). Returning false
+   * makes Session abort cleanly before any task is enqueued, instead of
+   * letting a render run into the VulkanQueue::enqueue() stub mid-frame. */
+  const string message =
+      "Vulkan: no kernels compiled yet -- device is enumerated and memory-routed "
+      "only (Milestone 3). Rendering on Vulkan will be implemented in Milestone 4.";
+  LOG(WARNING) << message;
+  set_error(message); /* Scene::load_kernels() surfaces error_message() to the UI/CLI. */
+  return false;
+}
 unique_ptr<DeviceQueue> VulkanDevice::gpu_queue_create() { return make_unique<VulkanQueue>(this); }
 // NOTE: no build_bvh() override here. Device::build_bvh() in src/device/device.cpp
 // already provides the generic CPU-side BVH2 build, which is exactly what we want

@@ -196,6 +196,11 @@ if(NOT APPLE AND NOT (WIN32 AND CMAKE_SYSTEM_PROCESSOR STREQUAL "ARM64"))
 
 endif()
 
+# Vulkan (device enumeration + M3 skeleton; kernels intentionally not compiled yet)
+if(WITH_CYCLES_DEVICE_VULKAN)
+  add_compile_definitions(WITH_VULKAN)
+endif()
+
 # Apple Metal
 if(APPLE)
   option(WITH_CYCLES_DEVICE_METAL "Enable Cycles Apple Metal compute support" ON)
