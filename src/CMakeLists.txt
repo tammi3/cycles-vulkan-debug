@@ -280,6 +280,16 @@ if(WITH_CYCLES_DEVICE_ONEAPI)
   add_definitions(-DWITH_ONEAPI)
 endif()
 
+# NOTE: this must live in the top-level src/ scope (added before any
+# add_subdirectory() calls below) so that ALL Cycles libraries see it.
+# Device::available_types()/create_device()/capabilities() in
+# device/device.cpp are guarded by WITH_VULKAN; if the define only reaches
+# the cycles_device target, those files compile as if Vulkan does not
+# exist and --list-devices silently omits the VULKAN entry.
+if(WITH_CYCLES_DEVICE_VULKAN)
+  add_definitions(-DWITH_VULKAN)
+endif()
+
 if(WITH_CYCLES_EMBREE)
   add_definitions(-DWITH_EMBREE)
   if(WITH_CYCLES_DEVICE_ONEAPI AND EMBREE_SYCL_SUPPORT)
