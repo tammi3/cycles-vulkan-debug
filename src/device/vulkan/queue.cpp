@@ -9,6 +9,10 @@
 
 CCL_NAMESPACE_BEGIN
 
+/* M4b ABI probe hook, implemented in kernels.cpp. Runs at most once and is
+ * a no-op unless CYCLES_VULKAN_ABI_PROBE=1 is set. */
+bool vulkan_abi_probe(VulkanDevice *device);
+
 VulkanQueue::VulkanQueue(VulkanDevice *d) : DeviceQueue(d), vulkan_device_(d) {}
 
 int VulkanQueue::num_concurrent_states(const size_t s) const {
@@ -29,6 +33,11 @@ void VulkanQueue::load_image_info() {
 
 bool VulkanQueue::enqueue(DeviceKernel k, const int n, const DeviceKernelArguments &) {
   debug_enqueue_begin(k, n);
+  /* M4b: optional one-shot ABI probe (env CYCLES_VULKAN_ABI_PROBE=1). The
+   * first enqueue happens after the scene upload, so the probe sees what
+   * Cycles actually put in the params buffer. No-op unless the env var is
+   * set; the M4 stub error below is emitted either way. */
+  vulkan_abi_probe(vulkan_device_);
   vulkan_device_->set_error("Vulkan: kernel dispatch not implemented yet (M4)");
   debug_enqueue_end();
   return false;

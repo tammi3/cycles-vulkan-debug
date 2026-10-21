@@ -1,140 +1,198 @@
-1\. Frozen infrastructure (non-negotiable)
-
-
-
-&#x20;   M0–M3 are frozen. Do not modify VulkanDevice, BVH traversal, the wavefront queue implementation, descriptor set layouts, or any .slang file that already passes its validation gate. If a task appears to require changing them, stop and report what's blocking you instead of editing.
-
-
-
-This is the single most important rule. Free models will happily "improve" working code and break it. Name the files explicitly so there's no ambiguity.
-
-2\. One function per session, scope locked
-
-
-
-&#x20;   One translation unit per task. The input is one Cycles function (or one small cluster of functions it calls). The output is the Slang equivalent of that function only. Everything else in the file stays untouched. Do not port, refactor, rename, or "clean up" neighboring code.
-
-
-
-&#x20;   Feature scope is explicit. For M4, only the LABEL\_DIFFUSE closure path is in scope. Every other closure type must return a stub (LABEL\_NONE / no-op) with a comment marking it as deferred. Do not implement features beyond the milestone.
-
-
-
-3\. Translation fidelity rules (Cycles → Slang)
-
-
-
-These are the specific things that will go wrong if you don't state them:
-
-
-
-&#x20;   No virtual dispatch. Cycles ShaderClosure arrays and virtual BSDF calls must be flattened into an explicit switch on closure type. No function pointers, no interface types, no dynamic dispatch.
-
-
-
-&#x20;   No general pointers. Do not use pointer parameters. Use inout / out parameters or explicit indices into SSBOs. The only pointers allowed are the buffer handles passed at entry.
-
-
-
-&#x20;   No dynamic allocation. No new, no variable-length arrays, no growable containers. All buffers are host-allocated; size them at compile time or pass counts in a uniform.
-
-
-
-&#x20;   No recursion. Every function must be callable in a straight-line call graph.
-
-
-
-&#x20;   Explicit address spaces. Map Cycles' ccl\_private → function-local or inout, ccl\_global → SSBO, ccl\_constant → uniform/push constant. Do not let the compiler infer storage class silently.
-
-
-
-&#x20;   Float vector alignment. float3 in an SSBO is 16-byte aligned in std430. Do not assume 12-byte packing. When translating a Cycles struct that goes into an SSBO, restate every field with its offset and alignment in a comment above the Slang struct.
-
-
-
-&#x20;   Deterministic RNG only. Use the seeded sampler state passed into the kernel. Do not call any unseeded random function. If Cycles' sampler isn't ported yet, use a placeholder that is a pure function of (pixel, sample\_index, dimension) and mark it TODO: swap for ported sampler.
-
-
-
-&#x20;   Barrier discipline. Any SSBO write that another invocation may read must be followed by an explicit controlBarrier (or a memoryBarrier with the correct scope) before the next dispatch or the next read. Do not assume the driver inserts synchronization.
-
-
-
-&#x20;   Faithful translation, not improvement. Port the Cycles logic as written, even if it looks redundant or awkward. Cycles is the reference implementation; divergence is a correctness bug.
-
-
-
-4\. Verification gates (the AI must run these)
-
-
-
-&#x20;   Compile before declaring done. Every Slang output must pass slangc -target spirv and spirv-val before you report success. If compilation fails, iterate until it passes, and do not report a "working" result on a failing build.
-
-
-
-&#x20;   Behavioral gate per milestone. A passing build is not correctness. For each unit, state the gate explicitly at the start of the task:
-
-
-
-&#x20;       M4: Lambertian sphere, 16 spp, compared pixel-wise against Cycles CPU render. Noise-only differences acceptable; systematic bias is a failure.
-
-
-
-&#x20;       M5: Cornell box with one area light, low resolution, shadow regions and light falloff compared against Cycles CPU.
-
-
-
-&#x20;   If the gate isn't met, report the failure with the diff and stop. Do not declare the milestone complete.
-
-
-
-&#x20;   Do not modify the verification harness. If the harness fails, the harness is right and the code is wrong. Editing tests, tolerances, or reference images to make a gate pass is a hard violation.
-
-
-
-5\. Output discipline
-
-&#x20;   Output only the changed function(s). Do not rewrite whole files. If a file must change in more than one place, list each change as a separate diff block with the enclosing function name.
-
-
-
-&#x20;   No invented APIs. If you're unsure whether a Slang function exists (e.g., a specific dot, normalize, sample\_cosine\_hemisphere), do not invent a name and hope. Flag it as UNVERIFIED: and let the human confirm or provide the signature.
-
-
-
-&#x20;   Stop on unmapped features. If the Cycles code uses a feature with no clear Slang equivalent (subsurface scattering closures, complex IES light sampling, hair BSDF, volume integration), stop and ask. Do not approximate silently—an approximation that looks plausible is worse than a missing feature.
-
-
-
-&#x20;   State assumptions up front. Before writing code, list the assumptions you're making about buffer layout, RNG state, and closure representation in 3–5 bullets. The human reviews these before you proceed.
-
-
-
-6\. Context management rules
-
-
-
-&#x20;   Prompt size limit. Do not accept or request more than one Cycles source function plus one Slang skeleton per prompt. If a task seems to need more context, break it into sub-tasks.
-
-
-
-&#x20;   Restate the invariant each session. Every session begins by re-reading AGENTS.md and the milestone's gate definition. Do not rely on memory from previous sessions; free models don't have it.
-
-
-
-&#x20;   Report token pressure. If you estimate the remaining context is insufficient to complete the task plus compilation iteration, say so before starting. The human can then split the task.
-
-
-
-&#x20;   If session is coming to an end, write a summary in a .md or .txt file explaining what you did this current session
-
-CONTEXT:
-
-
-
-Vulkan backend for Cycles in Blender targeting my RX 570 4GB check https://github.com/tammi3/Vulkan-backend-Blender-CyclesX for further context
-
-
-
-Drop unnecessary tokens from context memory if needed and dynamically re-open needed context, to not exhaust token / context window too fast
-
+# AGENTS.md — Vulkan backend for Cycles (cycles-vulkan-debug)
+
+These rules do not change between sessions. The current milestone, the current task
+and the state of the last session do NOT live here: they live in the task prompt and in
+`lastsession.txt`.
+
+Project: a Vulkan compute backend for Cycles (Blender), written in Slang -> SPIR-V,
+target GPU is an AMD RX 570 4GB. Windows, MSVC, CMake, Vulkan SDK, Slang compiler.
+
+- Working repo (all edits happen here): `C:\dev\cycles-vulkan-debug`
+- Reference repo (READ ONLY, where M0-M2 spikes started): `C:\dev\cycles-vulkan`
+- High-level context: https://github.com/tammi3/Vulkan-backend-Blender-CyclesX
+- `agentreference/` holds files the user copied for you to use as references
+  (for example `bvh_traverse.slang`). Read only. Never edit them.
+
+---
+
+## 0. Start of every session
+
+1. Re-read this file.
+2. Read `lastsession.txt` (the summary of the previous session) in the repo root.
+3. Read the task prompt's gate definition. If the prompt has no gate, ask for one.
+
+You have no memory of earlier sessions. Do not rely on any.
+
+## 1. Who you are working with (and the style that follows)
+
+The user knows GPU theory, shaders and path tracers, but is NEW to writing C++ and to
+building it. She wants to LEARN from this repo, and others may read it later.
+
+- Comment code heavily: say WHAT each block does and WHY. Explain unusual C++ or
+  Slang constructs the first time they appear.
+- Explain your decisions in plain language in your replies.
+- Do NOT run `git add`, `git commit` or `git push`. The user does all git work.
+  You may run read-only git commands (`git status`, `git diff`, `git log`).
+
+## 2. Which files you may edit
+
+**Frozen. Do not edit unless the task prompt names the file as editable:**
+
+- `VulkanDevice` in `src/device/vulkan/device.cpp` and `device_impl.h`
+- `src/kernel/device/vulkan/params.h`
+- Anything under `C:\dev\cycles-vulkan` (the reference repo)
+- The verification harness: tests, tolerances and reference images (see section 6)
+- Any file outside `src/` unless the task says so
+
+**Edit only what the task lists.** A task prompt may list files as editable for that
+task only. Only those files may be touched, and all other rules still apply.
+
+If a task seems to require editing a frozen or unlisted file, STOP and report what is
+blocking you. Do not edit it "just a little".
+
+**Trust level of the existing Slang files.** `vulkan_data.slang`, `bvh2.slang` and
+`path_trace.slang` were written by an earlier session and, as far as we know, were never
+compiled. Their comments ("validated", "as in the spike", "matches the CPU reference")
+are NOT evidence. A Slang file counts as working only when you have just compiled it and
+shown the output. The M2c spike (`agentreference/bvh_traverse.slang`) is the syntax
+reference that is known to compile and run on the RX 570.
+
+## 3. Task types
+
+Every task is one of these. The task prompt says which.
+
+**A. Porting task** (Cycles function -> Slang), for example M4c onward.
+- One Cycles function, or one small cluster of functions it calls, per task.
+- Output only the changed function(s), each as its own diff block labelled with the
+  enclosing function name. Do not rewrite whole files.
+- Do not port, refactor, rename or "clean up" neighbouring code.
+- Scope is the milestone's scope. For M4 only the `LABEL_DIFFUSE` closure path is in
+  scope. Every other closure type returns a stub (`LABEL_NONE` / no-op) with a comment
+  `// DEFERRED: <closure name>`. Do not implement features beyond the milestone.
+- Not more than one Cycles function plus one Slang skeleton per prompt. If the task
+  needs more context, say so and propose how to split it.
+
+**B. ABI / host-binding task** (layouts, pipeline, descriptors, push constants).
+- May touch the files the task lists, across several files.
+- The gate is a probe: the shader reads values through the new layout and the host
+  compares them with what it sent (MATCH / MISMATCH per value).
+- Do not change rendering logic.
+
+## 4. Translation fidelity rules (Cycles -> Slang)
+
+- **Faithful translation, not improvement.** Port the Cycles logic as written, even if it
+  looks redundant or awkward. Cycles is the reference; divergence is a correctness bug.
+  Cite the source: `// source: <cycles path>:<line>` on every non-obvious fact.
+- **No virtual dispatch.** Cycles closure arrays and BSDF calls become an explicit
+  `switch` on closure type. No function pointers, no interface types.
+- **No recursion.** The call graph must be straight-line.
+- **No dynamic allocation.** No growable containers, no variable-length arrays. Buffers
+  are allocated by the host; sizes are compile-time constants or passed as counts.
+- **Pointers.** Raw pointers that come from buffer device addresses (64-bit BDA) are
+  allowed and expected, as in `agentreference/bvh_traverse.slang`. Do NOT create pointers
+  to function-local memory: use `out` / `inout` parameters there.
+- **Address spaces.** Map Cycles `ccl_private` -> function-local or `inout`,
+  `ccl_global` -> data reached through a device pointer, `ccl_constant` -> push constant
+  or constant data. Do not leave the storage class to be guessed.
+- **Layouts come from the real C++.** Never assume a layout (no "float3 is 16 bytes in
+  std430" assumptions). For every struct shared with the host: take the layout from the
+  real C++ header, state each field's offset and size in a comment above the Slang struct,
+  and lock it with `static_assert(offsetof(...))` on the host. Prefer scalar members over
+  `float3` in shared structs so C++ and Slang cannot disagree on padding.
+- **Opaque blobs.** For big nested host structs such as `KernelData`, do not hand-mirror
+  every field. Declare an opaque block of the right size in words and lock only the
+  offsets of the slots you actually read.
+- **Deterministic RNG only.** Use the seeded sampler state passed into the kernel. No
+  unseeded random function. If the Cycles sampler is not ported yet, use a placeholder that
+  is a pure function of (pixel, sample_index, dimension) and mark it
+  `// TODO: swap for ported sampler`.
+- **Synchronization.** Ordering between dispatches is done on the host with
+  `vkCmdPipelineBarrier` (or equivalent), never assumed. For barriers inside a shader, do
+  not guess a function name: flag it `UNVERIFIED:` and ask.
+- **Raw device pointers have no bounds checking.** Check every array index against its
+  count before use, cap every loop, and write an error code instead of reading out of
+  range (see the M2c spike for the pattern). A hung shader can reset the driver.
+
+## 5. No inventing
+
+- Every layout, constant, enum value or struct member must come from a file you have
+  opened. Cite it: `// source: path:line`.
+- If you are not sure a Slang or Vulkan function exists (a specific `normalize`, `dot`,
+  `copysign`, a sampling helper, a barrier), do NOT invent a name. Write `UNVERIFIED:` and
+  let the human confirm or provide the signature. Try compiling a tiny test with `slangc`
+  when that is cheap.
+- If the Cycles code uses a feature with no clear Slang equivalent (subsurface
+  scattering, complex IES light sampling, hair BSDF, volume integration), STOP and ask. A
+  plausible approximation is worse than a missing feature.
+- If something you need is missing or ambiguous, STOP and ask. Do not guess.
+- Do not write comments saying "validated", "verified" or "tested" unless a test actually
+  ran in this session and you have shown its output.
+
+## 6. Verification gates
+
+- **Compile before declaring done.** Every Slang output must pass `slangc -target spirv`
+  and then `spirv-val`. Show the commands and their output. If it fails, iterate; never
+  report a "working" result on a failing build.
+- **A passing build is not correctness.** Each task states its behavioural gate at the
+  start. Current milestone gates:
+  - M4: Lambertian sphere, 16 spp, compared pixel by pixel against the Cycles CPU render.
+    Noise-only differences are acceptable; systematic bias is a failure.
+  - M5: Cornell box with one area light, low resolution; shadow regions and light falloff
+    compared against the Cycles CPU render.
+- **If the gate is not met, report the failure with the diff and stop.** Do not declare
+  the milestone complete.
+- **Never modify the verification harness.** If the harness fails, the harness is right
+  and the code is wrong. Editing tests, tolerances or reference images to make a gate pass
+  is a hard violation.
+- **Check every `VkResult`** in new Vulkan code. The validation layer
+  (`VK_LAYER_KHRONOS_validation`) must report zero errors on gate runs, and the output must
+  show it was actually active.
+
+## 7. Build and run reference
+
+- Build: `cmake --build build --config Release --target cycles -- /m`
+- Run (PowerShell example):
+  `$env:CYCLES_VULKAN_ALLOW_NO_KERNELS='1'; build\bin\Release\cycles.exe --device VULKAN --log-level info --samples 1 --background instance2.xml`
+- Logging macros are `LOG_ERROR`, `LOG_WARNING`, `LOG_INFO` (see `util/log.h`). The
+  `LOG(ERROR)` / `LOG(WARNING)` forms do NOT compile in this codebase.
+- If you must compile a file standalone, the real `cl.exe` flags can be captured with
+  `cmake --build build --config Release -- /clp:ShowCommandLine` (it needs `/std:c++20`
+  and the `CCL_NAMESPACE_BEGIN` defines).
+- Test scene: `instance2.xml` in the repo root.
+
+## 8. Staying out of trouble (context and loops)
+
+The context window is limited (about 200K tokens on the free model) and a session can
+stall for a long time on a bad loop.
+
+- **Read narrowly.** Use grep and line ranges instead of opening whole large files. Do
+  not paste whole files into your replies.
+- **Do one step at a time** when the task prompt has steps. Finish and report a step before
+  starting the next one if the prompt says so.
+- **Three strikes.** If the same command or the same fix fails 3 times, STOP and report
+  what you tried and the exact error. Do not keep retrying variations.
+- **Time limits on runs.** Put a timeout on anything that runs a GPU workload. Renders use
+  a small `--samples` and a small resolution unless the task says otherwise.
+- **Token pressure.** If you think the remaining context is not enough to finish the task
+  plus compile iterations, say so BEFORE starting, so the human can split the task. (Your
+  estimate may be wrong; the narrow-reading rules above matter more.)
+
+## 9. Output discipline
+
+- **State assumptions up front.** Before writing code, list your assumptions about buffer
+  layout, RNG state and closure representation in 3 to 5 bullets, and wait for the human
+  if any of them is a real choice.
+- **Small diffs, existing code style, no reformatting.** Do not touch lines that do not
+  need to change.
+- **Deliverable format** for every task: the diff, then a list titled
+  `UNVERIFIED ASSUMPTIONS`, then the exact commands you ran with their captured output.
+
+## 10. End of every session
+
+Write (or overwrite) `lastsession.txt` in the repo root. Keep it short. Include:
+
+- What you did, file by file, and why
+- Gate results, with the real output you saw (or "gate not run")
+- Anything that diverged from the task prompt, and why
+- What is still open, and the suggested next task
+- Facts the next session must know (commands that worked, traps you hit)

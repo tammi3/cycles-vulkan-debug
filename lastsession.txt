@@ -1,0 +1,74 @@
+Task M4b: make the Slang kernel ABI match the host KernelParamsVulkan (params.h) and prove it
+with a probe dispatch gated on CYCLES_VULKAN_ABI_PROBE=1.
+
+WHAT WAS DONE, FILE BY FILE
+- src/kernel/device/vulkan/vulkan_data.slang: REWROTE (old 224-byte VulkanKernelParams removed).
+  Now mirrors KernelParamsVulkan: opaque KernelDataBlob (640 uint words = 2560 bytes), the 53
+  KERNEL_DATA_ARRAY slots in data_arrays.h order as uint64_t BDAs with per-field byte offsets
+  in comments, and IntegratorStateGPU fully expanded from state.h:140 + state_template.h +
+  shadow_state_template.h (266 pointer members as uint64_t + uint sort_partition_divisor).
+  CRITICAL: slangc 2026.17 does NOT add tail padding to sizeof (observed 2124 / 5108); added
+  explicit `uint pad_tail` in IntegratorStateGPU and `uint pad_params[2]` in
+  KernelParamsVulkan so both sides are 2128 / 5120. Do not remove these pads.
+- src/kernel/device/vulkan/abi_probe.slang: NEW. One-thread compute shader. Push constant =
+  3 device pointers (KernelParamsVulkan* typed view, uint* raw view of the same address,
+  uint* out readback) = 24 bytes, no descriptor sets. Writes sizeof() values, typed-view and
+  raw-view reads of bvh_nodes + integrator_state[0], first KernelData word, and a sentinel
+  (0xAB10E57F) into uint32 out[12].
+- src/device/vulkan/kernels.cpp: added 6 static_asserts locking offsets 0 / 2560 / 2984 and
+  sizes 2560 / 2128 / 5120; added vulkan_abi_probe(VulkanDevice*): one-shot, no-op unless
+  CYCLES_VULKAN_ABI_PROBE=1; loads abi_probe.spv (env CYCLES_VULKAN_ABI_PROBE_SPV or
+  ./abi_probe.spv or src/kernel/device/vulkan/abi_probe.spv), creates pipeline with a 24-byte
+  push-constant range and NO descriptor sets, dispatches 1x1x1 on the device's own queue
+  (own command pool on find_queue_family + vkGetDeviceQueue(family,0), NOT submit_and_wait
+  which frees cmd buffers from the device's private pool), maps readback, logs MATCH/MISMATCH
+  per value. RAII cleanup struct; every VkResult checked.
+- src/device/vulkan/queue.cpp: extern decl + one call vulkan_abi_probe(vulkan_device_) at the
+  top of VulkanQueue::enqueue, before the M4 stub error. Runs once, after scene upload.
+- abi_probe.spv (untracked, repo root): slangc output; the host probe finds it via cwd.
+  Regenerate: slangc src\kernel\device\vulkan\abi_probe.slang -target spirv -o abi_probe.spv
+
+GATES (real output)
+- 4a: slangc exit=0, spirv-val exit=0. spirv-dis shows OpMemberDecorate Offset 2560/2984 and
+  OpConstant 5120/2128, i.e. the SPIR-V itself encodes the C++ offsets.
+- 4b: cmake --build ... --target cycles: OK.
+- 4d: with ALLOW_NO_KERNELS=1 + ABI_PROBE=1 + validation layer (CURRENT-VALIDATION-ENABLED x3,
+  0 VUID/errors): sizeof both MATCH (0x1400/0x850), bvh_nodes typed==raw@2560 (both
+  0x300700000), integrator_state[0] typed==raw@2984 (both 0x301080000), data[0]=0x80000803
+  logged, sentinel MATCH, "ALL VALUES MATCH", then the clean M4 error.
+- 4e: without ABI_PROBE: zero probe lines, same M4 error, same flow as M4a-1.
+
+KNOWN ISSUE (NOT caused by M4b - proven)
+- Every full Vulkan run now exits with heap corruption 0xC0000374 (ntdll, fault offset
+  10d5f9) AFTER "Progress 100.00". Reproduced with the ORIGINAL pre-session kernels.cpp/
+  queue.cpp (git restore test) and after a Win+Ctrl+Shift+B driver reset. M4a-1's exit
+  code 1 is NOT reproducible on this machine anymore. CPU device and --list-devices exit 0.
+  Hypotheses: fallout of this session's first driver fault (bad entry-point name crashed
+  amdxn64 inside vkCreateComputePipelines) that the display-driver reset did not clear
+  (needs reboot?), or a machine change (SuperDisplay virtual adapter present). Next session:
+  ask the user whether a reboot fixed it; if not, debug teardown (VulkanDevice dtor path).
+
+TRAPS HIT (next session must know)
+- slangc renames the Slang entry point to SPIR-V "main" regardless of the function name;
+  host must use pName="main" (or compile with -fvk-use-entrypoint-name). Passing the Slang
+  name crashed the AMD driver outright (0xC0000005) - the validation layer VUID
+  VkPipelineShaderStageCreateInfo-pName-00707 flags it before the crash.
+- slangc static_assert is NOT supported (parse error at sizeof inside it); sizeof() in
+  expressions works. Use host static_asserts + the runtime probe instead.
+- slangc sizeof omits tail padding; mirror structs need explicit pad members (see above).
+- Copy-Item preserves source LastWriteTime -> MSBuild silently skipped recompiling restored
+  files. After restoring file backups, set LastWriteTime=Get-Date or expect stale binaries.
+- Submit probe command buffers on YOUR own pool + vkGetDeviceQueue(family, 0); do not use
+  VulkanDevice::submit_and_wait (frees from the device's private cmd_pool; device_impl.h
+  is frozen so the pool is inaccessible).
+- path_trace.slang + bvh2.slang still do NOT compile (bvh2.slang:123 uint64_t parse error,
+  path_trace.slang:95 `compute void`); left on disk, excluded from build until M4c. The old
+  VulkanKernelParams they used is GONE from vulkan_data.slang.
+
+FILES/FACTS FROM M4a-1 STILL VALID: params.h (KernelParamsVulkan, kernel_params_offset),
+host_params_ private in device_impl.h:81, kernel_params_address() public, 5120-byte buffer
+with BDA|TRANSFER_DST|STORAGE usage, no TRANSFER_SRC (probe cannot copy it to host - the
+typed-vs-raw comparison is the substitute).
+
+NEXT TASK: M4c (first real porting task) - or fix the teardown heap corruption first if a
+reboot does not clear it.
