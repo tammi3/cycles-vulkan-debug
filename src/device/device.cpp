@@ -917,7 +917,22 @@ void GPUDevice::generic_free(device_memory &mem)
   mem.device_pointer = 0;
   mem.device_size = 0;
 
-  device_mem_map.erase(device_mem_map.find(&mem));
+  /* Find + bounds-check BEFORE erasing. Do NOT write
+   * `erase(find(&mem))` here: find() returns end() when the key is absent, and
+   * MSVC's map::erase(iterator) unconditionally extracts and FREES the node it
+   * is handed — when handed end(), that node is the map's own HEADER node
+   * (_Myhead). The map is silently destroyed and every later operation
+   * dereferences freed heap memory (symptom: 0xC0000005 inside generic_alloc
+   * under page heap, or heap corruption / 0xC0000374 at process exit on a
+   * normal heap). A missing key means some code path set mem.device_pointer
+   * without going through generic_alloc(); the DCHECK above catches that in
+   * debug builds, and this check keeps a release build memory-safe regardless.
+   * The other backends (cuda/hip/oneapi device_impl.cpp) have the same
+   * erase(find()) idiom; they were left untouched (small diffs, out of scope). */
+  const MemMap::iterator mem_it = device_mem_map.find(&mem);
+  if (mem_it != device_mem_map.end()) {
+    device_mem_map.erase(mem_it);
+  }
 }
 
 void GPUDevice::generic_copy_to(device_memory &mem)

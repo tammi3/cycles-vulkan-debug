@@ -468,19 +468,27 @@ void VulkanDevice::mem_copy_to(device_memory &mem) {
     // which skips re-uploads when host data "looks" unchanged).
     const size_t size = mem.memory_size();
     if (!mem.device_pointer) {
-      // GPUDevice::alloc_device() takes `void *&` (CUDA/HIP pass real pointers).
-      // We store Buffer Device Address values in device_ptr (uint64_t), so go
-      // through a local void* and copy the address back afterwards.
-      void *device_pointer = nullptr;
-      if (!alloc_device(device_pointer, size)) {
+      // Allocate through generic_alloc() rather than calling alloc_device()
+      // directly. generic_alloc() does everything the raw call did PLUS the
+      // bookkeeping this buffer MUST have to be freeable later:
+      //   - it stores the pointer into mem.device_pointer (device.cpp:848),
+      //     handling the Buffer-Device-Address round-trip (alloc_device()
+      //     takes `void *&` because CUDA/HIP pass real pointers; we pass the
+      //     BDA value through as an integer);
+      //   - it sets mem.device_size and updates stats (device.cpp:849-850);
+      //   - it INSERTS the allocation into device_mem_map (device.cpp:858),
+      //     which GPUDevice::generic_free() relies on to erase the entry at
+      //     free time. The old direct alloc_device() call skipped the insert,
+      //     so the later free missed in find() and erase(end()) freed the
+      //     map's header node -> heap corruption -> 0xC0000374 at exit
+      //     (full root-cause report: lastsession.txt).
+      // generic_alloc() reports OOM via set_error(); the LOG_ERROR below adds
+      // the buffer name for context, and we skip the upload like before.
+      if (generic_alloc(mem) == nullptr) {
         LOG_ERROR << "Vulkan: failed to allocate MEM_GLOBAL '" << mem.name_
                   << "' (" << size << " bytes).";
         return;
       }
-      /* `device_ptr` is a plain integer typedef (util/types_base.h: uint64_t),
-       * so reinterpret_cast (which only works between pointer types) is illegal
-       * here. A void* -> integer conversion needs static_cast instead. */
-      mem.device_pointer = static_cast<device_ptr>(reinterpret_cast<uintptr_t>(device_pointer));
     }
     auto it = address_to_alloc_map.find((uint64_t)mem.device_pointer);
     vector<uint8_t> &last = global_last_uploaded[&mem];
