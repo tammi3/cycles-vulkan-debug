@@ -196,3 +196,12 @@ Write (or overwrite) `lastsession.txt` in the repo root. Keep it short. Include:
 - Anything that diverged from the task prompt, and why
 - What is still open, and the suggested next task
 - Facts the next session must know (commands that worked, traps you hit)
+
+## 11. Added after M4c
+
+- Checkpoint the summary. Update lastsession.txt after EACH completed step, not only at the end. Sessions get interrupted and compacted; a stale summary misleads the next session.
+- Resuming. After a compaction or in a new session, run git status and git diff --stat and read lastsession.txt before acting. If the repo is ahead of the summary, trust the repo and say so.
+- Gate methodology belongs to the user. If a gate fails because two valid algorithms disagree only at float-rounding edges, report the evidence and stop. Never change a tolerance or the reference method on your own. (The reference must be the same algorithm class as the port for a traversal gate; other references may be printed as informational lines.)
+- No elevated actions (UAC prompts, registry, gflags/page heap, admin shells) unless the current task prompt explicitly allows them.
+- No generated artifacts in the repo root. Write dumps, captures and .spv files to the OpenCode temp dir or a git-ignored folder, and list any untracked files left at the end so the user can handle git.
+- Open items go into lastsession.txt with the exact observation (values, file, line), not a paraphrase.
