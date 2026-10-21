@@ -71,4 +71,4 @@ with BDA|TRANSFER_DST|STORAGE usage, no TRANSFER_SRC (probe cannot copy it to ho
 typed-vs-raw comparison is the substitute).
 
 NEXT TASK: M4c (first real porting task) - or fix the teardown heap corruption first if a
-reboot does not clear it.
+reboot does not clear it. [User has rebooted her PC  in since last session]
