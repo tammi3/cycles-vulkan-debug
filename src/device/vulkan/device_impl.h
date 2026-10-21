@@ -7,6 +7,7 @@
 
 #include "device/device.h"
 #include "device/queue.h"
+#include "kernel/device/vulkan/params.h"
 #include <vulkan/vulkan.h>
 #include <unordered_map>
 #include <string>
@@ -57,6 +58,10 @@ class VulkanDevice : public GPUDevice {
   uint32_t find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties);
   void submit_and_wait(VkCommandBuffer cmd);
 
+  /* Buffer Device Address of the fixed kernel params buffer, or 0 if it has
+   * not been created yet (created lazily by const_copy_to). */
+  uint64_t kernel_params_address() const;
+
  private:
   VkInstance instance;
   VkPhysicalDevice physical_device;
@@ -66,12 +71,14 @@ class VulkanDevice : public GPUDevice {
   VkCommandPool cmd_pool;
 
   std::unordered_map<uint64_t, VulkanAlloc> address_to_alloc_map;
-  std::unordered_map<std::string, size_t> const_offsets;
   // Snapshot of the last uploaded contents of each MEM_GLOBAL buffer, so we can
   // detect when the device_ptr values inside it changed and re-upload.
   std::unordered_map<const device_memory *, vector<uint8_t>> global_last_uploaded;
-  
-  size_t const_buffer_size;
+
+  /* Host shadow of the device kernel params buffer (fixed layout, see
+   * kernel/device/vulkan/params.h). const_copy_to() patches one field here and
+   * uploads only that byte range; the rest of the buffer stays zero. */
+  KernelParamsVulkan host_params_;
   VkBuffer const_buffer;
   VkDeviceMemory const_memory;
   uint64_t const_device_address;
