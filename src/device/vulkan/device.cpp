@@ -7,6 +7,7 @@
 #include "device/vulkan/queue.h"
 #include "util/log.h"
 #include <vector>
+#include <algorithm>
 #include <cstring>
 
 CCL_NAMESPACE_BEGIN
@@ -58,6 +59,11 @@ VulkanDevice::VulkanDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
       cmd_pool(VK_NULL_HANDLE), const_buffer_size(0), 
       const_buffer(VK_NULL_HANDLE), const_memory(VK_NULL_HANDLE), const_device_address(0)
 {
+  /* M3 exit criterion is "fails gracefully", so nothing in this constructor may
+   * call LOG_FATAL: Cycles' log implementation calls abort() on a FATAL message
+   * (src/util/log.cpp), which would crash cycles.exe instead of reporting an
+   * error the user/session can act on. */
+
   // 1. Create Instance
   VkApplicationInfo app_info{};
   app_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -67,11 +73,38 @@ VulkanDevice::VulkanDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
   app_info.engineVersion = VK_MAKE_VERSION(1, 0, 0);
   app_info.apiVersion = VK_API_VERSION_1_2;
 
+  /* On Windows the loader only exposes pNext-chained feature structs to
+   * vkGetPhysicalDeviceFeatures2 if the VK_KHR_get_physical_device_properties2
+   * instance extension is enabled (on Vulkan 1.1+ it is implicit in core, but
+   * enabling it explicitly is harmless and keeps behaviour identical across
+   * drivers). Without it, RADV reports bufferDeviceAddress=false even when the
+   * driver supports it, and vkCreateDevice then fails with
+   * VK_ERROR_FEATURE_NOT_PRESENT. */
+  const char *instance_extensions[] = {"VK_KHR_get_physical_device_properties2"};
+  bool has_props2_ext = false;
+  {
+    uint32_t ext_count = 0;
+    vkEnumerateInstanceExtensionProperties(nullptr, &ext_count, nullptr);
+    vector<VkExtensionProperties> extensions(ext_count);
+    vkEnumerateInstanceExtensionProperties(nullptr, &ext_count, extensions.data());
+    for (const auto &ext : extensions) {
+      if (strcmp(ext.extensionName, instance_extensions[0]) == 0) {
+        has_props2_ext = true;
+        break;
+      }
+    }
+  }
+
   VkInstanceCreateInfo create_info{};
   create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   create_info.pApplicationInfo = &app_info;
+  if (has_props2_ext) {
+    create_info.enabledExtensionCount = 1;
+    create_info.ppEnabledExtensionNames = instance_extensions;
+  }
   if (vkCreateInstance(&create_info, nullptr, &instance) != VK_SUCCESS) {
-    LOG_FATAL << "Vulkan: Failed to create instance.";
+    LOG(ERROR) << "Vulkan: Failed to create instance.";
+    return;
   }
 
   // 2. Select Physical Device
@@ -79,20 +112,53 @@ VulkanDevice::VulkanDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
   vkEnumeratePhysicalDevices(instance, &device_count, nullptr);
   std::vector<VkPhysicalDevice> devices(device_count);
   vkEnumeratePhysicalDevices(instance, &device_count, devices.data());
-  if (info.num < device_count) physical_device = devices[info.num];
-  else LOG_FATAL << "Vulkan: Device index out of range.";
+  if (info.num >= device_count) {
+    LOG(ERROR) << "Vulkan: Device index " << info.num << " out of range ("
+               << device_count << " device(s) found).";
+    return;
+  }
+  physical_device = devices[info.num];
 
   queue_family_index = find_queue_family(physical_device);
 
-  // 3. Create Logical Device with required features
+  // 3. Query support BEFORE requesting: requesting an unsupported feature from
+  // vkCreateDevice is a hard failure; we want to degrade gracefully instead.
+  VkPhysicalDeviceFeatures supported_features{};
+  vkGetPhysicalDeviceFeatures(physical_device, &supported_features);
+
+  VkPhysicalDeviceBufferDeviceAddressFeatures supported_bda_features{};
+  supported_bda_features.sType =
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+  VkPhysicalDeviceFeatures2 supported_features2{};
+  supported_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+  supported_features2.pNext = &supported_bda_features;
+  vkGetPhysicalDeviceFeatures2(physical_device, &supported_features2);
+
+  const bool have_shader_int64 = (supported_features.shaderInt64 == VK_TRUE);
+  const bool have_bda = (supported_bda_features.bufferDeviceAddress == VK_TRUE);
+
+  if (!have_shader_int64) {
+    LOG(WARNING) << "Vulkan: device lacks shaderInt64; kernels requiring 64-bit "
+                 << "arithmetic will not be available.";
+  }
+  if (!have_bda) {
+    /* Our entire memory model stores Buffer Device Address values as device_ptr
+     * (uint64_t) and dereferences them in shaders. Without BDA there is no
+     * safe fallback path yet, so report and let Session surface the error. */
+    LOG(ERROR) << "Vulkan: device lacks bufferDeviceAddress support; "
+               << "this backend requires it (see VkPhysicalDeviceBufferDeviceAddressFeatures).";
+    return;
+  }
+
   VkPhysicalDeviceBufferDeviceAddressFeatures buffer_address_features{};
   buffer_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
   buffer_address_features.bufferDeviceAddress = VK_TRUE;
 
   // shaderInt64 lives in the BASE VkPhysicalDeviceFeatures struct (core since Vulkan 1.0),
   // not in an extension struct. There is no VkPhysicalDeviceShaderInt64Features type.
+  // Only request it if the device actually supports it (queried above).
   VkPhysicalDeviceFeatures base_features{};
-  base_features.shaderInt64 = VK_TRUE;
+  base_features.shaderInt64 = have_shader_int64 ? VK_TRUE : VK_FALSE;
 
   // Extension features are chained via the pNext pointer instead.
   float queue_priority = 1.0f;
@@ -115,7 +181,9 @@ VulkanDevice::VulkanDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
   };
 
   if (vkCreateDevice(physical_device, &dev_create_info, nullptr, &device) != VK_SUCCESS) {
-    LOG_FATAL << "Vulkan: Failed to create logical device.";
+    LOG(ERROR) << "Vulkan: Failed to create logical device for '"
+               << info.description << "'.";
+    return;
   }
 
   vkGetDeviceQueue(device, queue_family_index, 0, &queue);
@@ -125,13 +193,16 @@ VulkanDevice::VulkanDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
   pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
   pool_info.queueFamilyIndex = queue_family_index;
   pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-  vkCreateCommandPool(device, &pool_info, nullptr, &cmd_pool);
+  if (vkCreateCommandPool(device, &pool_info, nullptr, &cmd_pool) != VK_SUCCESS) {
+    LOG(ERROR) << "Vulkan: Failed to create command pool.";
+    return;
+  }
 
   init_host_memory();
 }
 
 VulkanDevice::~VulkanDevice() {
-  vkDeviceWaitIdle(device);
+  if (device != VK_NULL_HANDLE) vkDeviceWaitIdle(device);
   
   if (const_buffer != VK_NULL_HANDLE) vkDestroyBuffer(device, const_buffer, nullptr);
   if (const_memory != VK_NULL_HANDLE) vkFreeMemory(device, const_memory, nullptr);
@@ -146,6 +217,10 @@ VulkanDevice::~VulkanDevice() {
 BVHLayoutMask VulkanDevice::get_bvh_layout_mask(const uint) const { return BVH_LAYOUT_BVH2; }
 
 void VulkanDevice::const_copy_to(const char *name, void *host, const size_t size) {
+  if (!is_ready()) {
+    LOG(ERROR) << "Vulkan: device not initialized; ignoring const_copy_to.";
+    return;
+  }
   size_t offset = 0;
   auto it = const_offsets.find(name);
   if (it != const_offsets.end()) {
@@ -223,8 +298,12 @@ void VulkanDevice::const_copy_to(const char *name, void *host, const size_t size
   begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   vkBeginCommandBuffer(cmd, &begin_info);
 
+  /* VkBufferCopy::size must be a multiple of nonCoherentAtomSize (always <= 4
+   * on desktop drivers, 4 in practice). Round up; the constant buffer is far
+   * larger than any single upload so over-copying stays inside bounds. */
+  const size_t copy_size = ((size + 3) / 4) * 4;
   VkBufferCopy copy_region{};
-  copy_region.size = size;
+  copy_region.size = copy_size;
   copy_region.dstOffset = offset;
   vkCmdCopyBuffer(cmd, staging, const_buffer, 1, &copy_region);
 
@@ -235,8 +314,20 @@ void VulkanDevice::const_copy_to(const char *name, void *host, const size_t size
   vkFreeMemory(device, staging_mem, nullptr);
 }
 
+bool VulkanDevice::is_ready() const
+{
+  /* A constructor may have bailed out early (LOG_FATAL was replaced by graceful
+   * LOG(ERROR)+return so M3 never abort()s). Guard every entry point on the
+   * logical device actually existing. */
+  return (device != VK_NULL_HANDLE) && (queue != VK_NULL_HANDLE);
+}
+
 bool VulkanDevice::load_kernels(uint)
 {
+  if (!is_ready()) {
+    set_error("Vulkan: device initialization failed; see log for details.");
+    return false;
+  }
   /* M3 exit criterion: fail gracefully. Cycles has no C++->SPIR-V pipeline
    * yet (the "kernel compilation problem", our M4 work). Returning false
    * makes Session abort cleanly before any task is enqueued, instead of
@@ -256,8 +347,18 @@ unique_ptr<DeviceQueue> VulkanDevice::gpu_queue_create() { return make_unique<Vu
 // =========================================================================
 // HIGH-LEVEL MEMORY OVERRIDES
 // =========================================================================
-void VulkanDevice::mem_alloc(device_memory &mem) { generic_alloc(mem); }
+void VulkanDevice::mem_alloc(device_memory &mem) {
+  if (!is_ready()) {
+    LOG(ERROR) << "Vulkan: device not initialized; ignoring mem_alloc.";
+    return;
+  }
+  generic_alloc(mem);
+}
 void VulkanDevice::mem_copy_to(device_memory &mem) {
+  if (!is_ready()) {
+    LOG(ERROR) << "Vulkan: device not initialized; ignoring mem_copy_to.";
+    return;
+  }
   if (mem.type == MEM_GLOBAL) {
     // A MEM_GLOBAL is a kernel-side global array: the buffer holds an array of
     // device_ptrs, and each element may point to another Vulkan buffer. Upload
@@ -299,30 +400,54 @@ void VulkanDevice::mem_copy_to(device_memory &mem) {
 }
 void VulkanDevice::mem_move_to_host(device_memory &) {}
 void VulkanDevice::mem_copy_from(device_memory &mem, const size_t y, size_t w, const size_t h, size_t elem) {
+  if (!is_ready()) {
+    LOG(ERROR) << "Vulkan: device not initialized; ignoring mem_copy_from.";
+    return;
+  }
   // Cycles' tiling contract (see CUDADevice::mem_copy_from): the tile is a
-  // CONTIGUOUS block of `h` rows of width `w`. The caller keeps host and device
-  // buffers laid out identically for the current region, so a single linear
-  // strided copy at offset = elem*y*w is correct; row-splitting would be WRONG.
+  // CONTIGUOUS block of `h` rows; each device row is (w + padding) elements
+  // wide because the film buffer carries one extra boundary element per row.
   if (!mem.host_pointer) return;
 
-  const size_t size_bytes = mem.memory_elements_size(elem * w) * h;
-  const size_t offset_bytes = mem.memory_elements_size(elem * y * w);
+  /* Tile geometry: derive the padded row stride from the buffer layout instead
+   * of trusting the caller's width alone:
+   *   total_elements = data_size * data_elements
+   *   elements_per_row = w + padding
+   * This also keeps working when elem != data_elements (partial-element reads). */
+  const size_t total_elements = mem.data_size * mem.data_elements;
+  const size_t elements_per_row = (w > 0) ? (total_elements / (w + 1)) : elem;
+  const size_t padding = (elements_per_row > elem) ? (elements_per_row - elem) : 0;
+  const size_t row_stride_elements = elem + padding;
+
+  const size_t size_bytes = mem.memory_elements_size(row_stride_elements) * h;
+  const size_t offset_bytes = mem.memory_elements_size(y * row_stride_elements);
+
+  /* Clamp to the real buffer extent; never read past what was allocated. */
+  const size_t max_bytes = mem.memory_size();
+  if (offset_bytes >= max_bytes) return;
+  const size_t clamped_bytes = std::min(size_bytes, max_bytes - offset_bytes);
 
   if (!mem.device_pointer) {
     // Device never got the data; zero the host tile so the image isn't garbage.
-    memset(static_cast<uint8_t *>(mem.host_pointer) + offset_bytes, 0, size_bytes);
+    memset(static_cast<uint8_t *>(mem.host_pointer) + offset_bytes, 0, clamped_bytes);
     return;
   }
 
   auto it = address_to_alloc_map.find((uint64_t)mem.device_pointer);
   if (it == address_to_alloc_map.end()) return;
-  if (size_bytes == 0) return;
+  if (clamped_bytes == 0) return;
+
+  /* Never copy beyond the actual allocation on the device. */
+  const size_t device_room = (offset_bytes < it->second.size) ?
+                             (it->second.size - offset_bytes) : 0;
+  const size_t copy_bytes = std::min(clamped_bytes, device_room);
+  if (copy_bytes == 0) return;
 
   VkBuffer staging;
   VkDeviceMemory staging_mem;
   VkBufferCreateInfo st_info{};
   st_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-  st_info.size = size_bytes;
+  st_info.size = copy_bytes;
   st_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
   vkCreateBuffer(device, &st_info, nullptr, &staging);
 
@@ -348,9 +473,9 @@ void VulkanDevice::mem_copy_from(device_memory &mem, const size_t y, size_t w, c
   begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
   vkBeginCommandBuffer(cmd, &begin_info);
 
-  // Single linear copy of the tile region.
+  // Single linear copy of the tile region (size rounded to nonCoherentAtomSize).
   VkBufferCopy copy_region{};
-  copy_region.size = size_bytes;
+  copy_region.size = ((copy_bytes + 3) / 4) * 4;
   copy_region.srcOffset = offset_bytes;
   copy_region.dstOffset = 0;
   vkCmdCopyBuffer(cmd, it->second.buffer, staging, 1, &copy_region);
@@ -359,8 +484,8 @@ void VulkanDevice::mem_copy_from(device_memory &mem, const size_t y, size_t w, c
   submit_and_wait(cmd);
 
   void *mapped;
-  vkMapMemory(device, staging_mem, 0, size_bytes, 0, &mapped);
-  memcpy(static_cast<uint8_t *>(mem.host_pointer) + offset_bytes, mapped, size_bytes);
+  vkMapMemory(device, staging_mem, 0, copy_bytes, 0, &mapped);
+  memcpy(static_cast<uint8_t *>(mem.host_pointer) + offset_bytes, mapped, copy_bytes);
   vkUnmapMemory(device, staging_mem);
 
   vkDestroyBuffer(device, staging, nullptr);
@@ -369,6 +494,10 @@ void VulkanDevice::mem_copy_from(device_memory &mem, const size_t y, size_t w, c
 
 
 void VulkanDevice::mem_zero(device_memory &mem) {
+  if (!is_ready()) {
+    LOG(ERROR) << "Vulkan: device not initialized; ignoring mem_zero.";
+    return;
+  }
   // Safety check: allocate if Cycles hasn't allocated it yet
   if (!mem.device_pointer) {
     generic_alloc(mem);
@@ -388,10 +517,47 @@ void VulkanDevice::mem_zero(device_memory &mem) {
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     vkBeginCommandBuffer(cmd, &begin_info);
 
-    vkCmdFillBuffer(cmd, it->second.buffer, 0, VK_WHOLE_SIZE, 0);
+    /* vkCmdFillBuffer requires a 4-byte-aligned fill size and fills uint32
+     * units; buffer sizes from alloc_device are not guaranteed aligned. Copy
+     * zeros from a small host-visible staging buffer instead (always valid). */
+    VkBuffer zero_staging;
+    VkDeviceMemory zero_mem;
+    VkBufferCreateInfo zs_info{};
+    zs_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+    zs_info.size = it->second.size;
+    zs_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    if (vkCreateBuffer(device, &zs_info, nullptr, &zero_staging) == VK_SUCCESS) {
+      VkMemoryRequirements zs_reqs;
+      vkGetBufferMemoryRequirements(device, zero_staging, &zs_reqs);
+      VkMemoryAllocateInfo zs_alloc{};
+      zs_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+      zs_alloc.allocationSize = zs_reqs.size;
+      zs_alloc.memoryTypeIndex = find_memory_type(
+          zs_reqs.memoryTypeBits,
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+      if (vkAllocateMemory(device, &zs_alloc, nullptr, &zero_mem) == VK_SUCCESS) {
+        vkBindBufferMemory(device, zero_staging, zero_mem, 0);
+        void *mapped_zero = nullptr;
+        vkMapMemory(device, zero_mem, 0, zs_reqs.size, 0, &mapped_zero);
+        memset(mapped_zero, 0, zs_reqs.size);
+        vkUnmapMemory(device, zero_mem);
 
-    vkEndCommandBuffer(cmd);
-    submit_and_wait(cmd);
+        VkBufferCopy full{};
+        full.srcOffset = 0;
+        full.dstOffset = 0;
+        full.size = ((it->second.size + 3) / 4) * 4;
+        vkCmdCopyBuffer(cmd, zero_staging, it->second.buffer, 1, &full);
+
+        vkEndCommandBuffer(cmd);
+        submit_and_wait(cmd);
+        vkFreeMemory(device, zero_mem, nullptr);
+      }
+      vkDestroyBuffer(device, zero_staging, nullptr);
+    }
+    else {
+      vkEndCommandBuffer(cmd);
+      vkFreeCommandBuffers(device, cmd_pool, 1, &cmd);
+    }
   }
   
   // Keep the CPU host pointer in sync with the GPU
@@ -399,7 +565,11 @@ void VulkanDevice::mem_zero(device_memory &mem) {
     memset(mem.host_pointer, 0, mem.memory_size());
   }
 }
-void VulkanDevice::mem_free(device_memory &mem) { generic_free(mem); }
+void VulkanDevice::mem_free(device_memory &mem) {
+  if (!is_ready()) {
+    LOG(ERROR) << "Vulkan: device not initialized; ignoring mem_free.";
+    return;
+  } generic_free(mem); }
 
 // =========================================================================
 // SHARED MEMORY OVERRIDES
@@ -412,6 +582,10 @@ void *VulkanDevice::shared_to_device_pointer(const void *) { return nullptr; }
 // LOW-LEVEL VULKAN MEMORY
 // =========================================================================
 bool VulkanDevice::alloc_device(void *&device_pointer, const size_t size) {
+  if (!is_ready()) {
+    LOG(ERROR) << "Vulkan: device not initialized; cannot allocate.";
+    return false;
+  }
   VkBuffer buffer;
   VkBufferCreateInfo buffer_info{};
   buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
@@ -505,7 +679,7 @@ void VulkanDevice::copy_host_to_device(void *device_pointer, void *host_pointer,
   vkBeginCommandBuffer(cmd, &begin_info);
 
   VkBufferCopy copy_region{};
-  copy_region.size = size;
+  copy_region.size = ((size + 3) / 4) * 4; /* nonCoherentAtomSize multiple */
   vkCmdCopyBuffer(cmd, staging, it->second.buffer, 1, &copy_region);
 
   vkEndCommandBuffer(cmd);

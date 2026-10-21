@@ -72,9 +72,15 @@ void device_vulkan_info(vector<DeviceInfo> &devices)
   app_info.pApplicationName = "Cycles Vulkan info";
   app_info.apiVersion = VK_API_VERSION_1_2;
 
+  /* On Windows the loader only exposes pNext-chained feature structs to
+   * vkGetPhysicalDeviceFeatures2 when this instance extension is enabled. */
+  const char *instance_extensions[] = {"VK_KHR_get_physical_device_properties2"};
+
   VkInstanceCreateInfo create_info{};
   create_info.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
   create_info.pApplicationInfo = &app_info;
+  create_info.enabledExtensionCount = 1;
+  create_info.ppEnabledExtensionNames = instance_extensions;
 
   VkInstance instance = VK_NULL_HANDLE;
   if (vkCreateInstance(&create_info, nullptr, &instance) != VK_SUCCESS) {
