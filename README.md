@@ -37,3 +37,4 @@ For the OSL scene you need to enable the OSL shading system:
 For help building or running Cycles, see the channels listed here:
 
 https://www.cycles-renderer.org/development/
+Small change made on 2026-10-21 to create a visible diff so the Publish to GitHub button has something to show.
