@@ -13,6 +13,10 @@ CCL_NAMESPACE_BEGIN
  * a no-op unless CYCLES_VULKAN_ABI_PROBE=1 is set. */
 bool vulkan_abi_probe(VulkanDevice *device);
 
+/* M4c traverse probe hook, implemented in kernels.cpp. Runs at most once
+ * and is a no-op unless CYCLES_VULKAN_TRAVERSE_PROBE=1 is set. */
+bool vulkan_traverse_probe(VulkanDevice *device);
+
 VulkanQueue::VulkanQueue(VulkanDevice *d) : DeviceQueue(d), vulkan_device_(d) {}
 
 int VulkanQueue::num_concurrent_states(const size_t s) const {
@@ -38,6 +42,9 @@ bool VulkanQueue::enqueue(DeviceKernel k, const int n, const DeviceKernelArgumen
    * Cycles actually put in the params buffer. No-op unless the env var is
    * set; the M4 stub error below is emitted either way. */
   vulkan_abi_probe(vulkan_device_);
+  /* M4c: optional one-shot traverse probe (env CYCLES_VULKAN_TRAVERSE_PROBE=1)
+   * with the same no-op-unless-set semantics. */
+  vulkan_traverse_probe(vulkan_device_);
   vulkan_device_->set_error("Vulkan: kernel dispatch not implemented yet (M4)");
   debug_enqueue_end();
   return false;
