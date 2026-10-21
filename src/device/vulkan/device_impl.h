@@ -52,6 +52,7 @@ class VulkanDevice : public GPUDevice {
   // Vulkan specific helpers
   VkDevice vk_device() const { return device; }
   VkPhysicalDevice vk_physical_device() const { return physical_device; }
+  bool is_ready() const;
   uint32_t find_queue_family(VkPhysicalDevice phys_dev);
   uint32_t find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties);
   void submit_and_wait(VkCommandBuffer cmd);

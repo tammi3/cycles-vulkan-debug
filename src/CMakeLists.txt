@@ -405,6 +405,16 @@ add_subdirectory(session)
 add_subdirectory(subd)
 add_subdirectory(util)
 
+# The Vulkan backend sources (device/vulkan/*) and the device-availability
+# check in device/device.cpp are guarded by the WITH_VULKAN preprocessor
+# definition.  cycles_device.vcxproj defines it only for its own target,
+# so standalone executables (cycles.exe) would compile device.cpp without
+# the Vulkan branch and never register/enumerate the device.  Propagate it
+# to every Cycles target here, once, at the top level.
+if(WITH_CYCLES_DEVICE_VULKAN)
+  add_definitions(-DWITH_VULKAN)
+endif()
+
 # TODO(sergey): Make this to work with standalone repository.
 if(WITH_GTESTS)
   add_subdirectory(test)
