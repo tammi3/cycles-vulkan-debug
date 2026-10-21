@@ -12,12 +12,8 @@
 #ifdef WITH_VULKAN
 
 #include <cstdint>
-#include <string>
-#include <vulkan/vulkan.h>
 
 CCL_NAMESPACE_BEGIN
-
-class VulkanDevice;
 
 struct alignas(8) VulkanKernelParams {
   /* --- film --- */
@@ -76,32 +72,6 @@ static_assert(offsetof(VulkanKernelParams, bg_color) == 192, "bg_color offset");
 static_assert(offsetof(VulkanKernelParams, rng_seed) == 208, "rng_seed offset");
 
 constexpr int VULKAN_TILE_SIZE = 64;
-
-/* Vulkan compute pipeline wrapper for the path tracing kernel. */
-class VulkanPipeline {
- public:
-  VulkanPipeline() = default;
-  ~VulkanPipeline() = default;
-
-  bool init(VulkanDevice *d, const std::string &spirv_dir, std::string *error = nullptr);
-  void destroy();
-
-  bool dispatch_tile(VulkanDevice *d,
-                     const VulkanKernelParams &params,
-                     VkCommandBuffer cmd,
-                     std::string *error = nullptr);
-
- private:
-  VulkanDevice *device_ = nullptr;
-  VkShaderModule shader_module = VK_NULL_HANDLE;
-  VkPipelineLayout pipeline_layout = VK_NULL_HANDLE;
-  VkPipeline pipeline = VK_NULL_HANDLE;
-  VkDescriptorSetLayout ds_layout = VK_NULL_HANDLE;
-  VkDescriptorPool ds_pool = VK_NULL_HANDLE;
-  VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
-  VkBuffer params_buffer = VK_NULL_HANDLE;
-  VkDeviceMemory params_memory = VK_NULL_HANDLE;
-};
 
 CCL_NAMESPACE_END
 

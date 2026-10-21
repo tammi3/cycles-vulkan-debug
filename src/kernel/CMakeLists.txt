@@ -426,7 +426,6 @@ add_subdirectory(device/hiprt)
 add_subdirectory(device/metal)
 add_subdirectory(device/oneapi)
 add_subdirectory(device/optix)
-add_subdirectory(device/vulkan)
 
 target_link_libraries(cycles_kernel
   INTERFACE cycles_kernel_cpu

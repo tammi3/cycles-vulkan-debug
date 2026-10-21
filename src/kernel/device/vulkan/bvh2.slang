@@ -52,11 +52,11 @@ struct RayGPU
 static const uint INVALID_PRIM = 0xFFFFFFFFu;
 
 /* Decode a BVH2 node pointer from a raw device address. */
-BVH2NodeGPU fetch_node(ulong bvh_base, uint node_index)
+BVH2NodeGPU fetch_node(uint64_t bvh_base, uint node_index)
 {
     /* Each node is 48 bytes. Pointer arithmetic on PhysicalStorageBuffer must
      * be done in bytes: cast base -> BVH2NodeGPU*, then index. */
-    StructuredBuffer<BVH2NodeGPU> nodes = StructuredBuffer<BVH2NodeGPU>(bvh_base);
+    let nodes = cast<BVH2NodeGPU[]>(bvh_base);
     return nodes[node_index];
 }
 
@@ -78,17 +78,17 @@ bool ray_aabb(RayGPU r, float3 bmin, float3 bmax, float tmax_limit)
 }
 
 /* Möller–Trumbore, UVW-consistent with the CPU reference in the spike. */
-bool intersect_triangle(inout RayGPU io, uint tri_index,
-                        ulong tri_indices_base, ulong vert_co_base,
+bool intersect_triangle(RayGPU io, uint tri_index,
+                        uint64_t tri_indices_base, uint64_t vert_co_base,
                         out float t_out, out float2 uv_out)
 {
-    StructuredBuffer<uint4> tris = StructuredBuffer<uint4>(tri_indices_base);   // packed as (i,j,k,pad) per triangle
-    StructuredBuffer<float4> verts = StructuredBuffer<float4>(vert_co_base);     // stored as float4 (w unused) for alignment
+    let tris = cast<uint4[]>(tri_indices_base);   // packed as (i,j,k,pad) per triangle
+    let verts = cast<float4[]>(vert_co_base);     // stored as float4 (w unused) for alignment
 
     uint4 idx = tris[tri_index];
-    float3 v0 = verts[idx.x].xyz;
-    float3 v1 = verts[idx.y].xyz;
-    float3 v2 = verts[idx.z].xyz;
+    float3 v0 = (verts[idx.x]).xyz;
+    float3 v1 = (verts[idx.y]).xyz;
+    float3 v2 = (verts[idx.z]).xyz;
 
     float3 e1 = v1 - v0;
     float3 e2 = v2 - v0;
@@ -120,9 +120,9 @@ bool intersect_triangle(inout RayGPU io, uint tri_index,
 }
 
 /* Stackless front-to-back BVH2 traversal, matching the CPU reference. */
-void bvh2_intersect(inout RayGPU ray, ulong bvh_base,
-                    ulong prim_offsets_base, ulong prim_counts_base,
-                    ulong tri_indices_base, ulong vert_co_base)
+void bvh2_intersect(ref RayGPU ray, uint64_t bvh_base,
+                    uint64_t prim_offsets_base, uint64_t prim_counts_base,
+                    uint64_t tri_indices_base, uint64_t vert_co_base)
 {
     /* Traversal stack sized for worst-case depth of our scenes (<= 64). */
     uint stack[64];
