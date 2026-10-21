@@ -27,7 +27,7 @@ struct VulkanKernelParams
     uint tile_height;         // current tile height (<= TILE_SIZE)
     uint samples_per_pixel;   // path budget per pixel
     uint max_bounces;         // diffuse-only M4 uses 1..2
-    uint64_t film_buffer;     // float4 accumulation buffer, tile-local layout
+    ulong film_buffer;        // float4 accumulation buffer, tile-local layout
                               // index = (y * tile_width + x)
 
     // --- camera --------------------------------------------------------
@@ -41,15 +41,15 @@ struct VulkanKernelParams
     float  pad_cam;
 
     // --- scene ---------------------------------------------------------
-    uint64_t bvh_nodes;       // BVH2Node array (Cycles layout, see bvh2.slang)
-    uint64_t bvh_prim_offsets;// uint per interior node: first primitive of subtree
-    uint64_t bvh_prim_count;  // uint per interior node: primitive count
-    uint64_t tri_indices;     // make_uint3 per triangle (vertex indices)
-    uint64_t vert_co;         // float3 per vertex
-    uint64_t object_transforms; // float4x4-ish: 12 floats (row-major 3x4) per object
-    uint64_t light_prim_offsets; // uint per light: first primitive
-    uint64_t light_prim_counts;  // uint per light: primitive count
-    uint64_t light_emission;     // float3 per primitive (triangle emission color)
+    ulong bvh_nodes;          // BVH2Node array (Cycles layout, see bvh2.slang)
+    ulong bvh_prim_offsets;   // uint per interior node: first primitive of subtree
+    ulong bvh_prim_count;     // uint per interior node: primitive count
+    ulong tri_indices;        // make_uint3 per triangle (vertex indices)
+    ulong vert_co;            // float3 per vertex
+    ulong object_transforms;  // float4x4-ish: 12 floats (row-major 3x4) per object
+    ulong light_prim_offsets; // uint per light: first primitive
+    ulong light_prim_counts;  // uint per light: primitive count
+    ulong light_emission;     // float3 per primitive (triangle emission color)
 
     uint  num_triangles;
     uint  num_objects;

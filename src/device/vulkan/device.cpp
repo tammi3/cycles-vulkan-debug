@@ -328,16 +328,26 @@ bool VulkanDevice::load_kernels(uint)
     set_error("Vulkan: device initialization failed; see log for details.");
     return false;
   }
-  /* M3 exit criterion: fail gracefully. Cycles has no C++->SPIR-V pipeline
-   * yet (the "kernel compilation problem", our M4 work). Returning false
-   * makes Session abort cleanly before any task is enqueued, instead of
-   * letting a render run into the VulkanQueue::enqueue() stub mid-frame. */
-  const string message =
-      "Vulkan: no kernels compiled yet -- device is enumerated and memory-routed "
-      "only (Milestone 3). Rendering on Vulkan will be implemented in Milestone 4.";
-  LOG(WARNING) << message;
-  set_error(message); /* Scene::load_kernels() surfaces error_message() to the UI/CLI. */
-  return false;
+
+  /* M4: Initialize the compute pipeline with precompiled SPIR-V. */
+  const char *spirv_dir_cstr = getenv("CYCLES_VULKAN_SPIRV_DIR");
+  std::string spirv_dir;
+  if (spirv_dir_cstr) {
+    spirv_dir = spirv_dir_cstr;
+  } else {
+    /* Default to build directory relative to executable. */
+    spirv_dir = "spirv";
+  }
+
+  std::string error;
+  if (!pipeline_.init(this, spirv_dir, &error)) {
+    set_error("Vulkan: failed to initialize pipeline: " + error);
+    LOG(ERROR) << error;
+    return false;
+  }
+
+  LOG(INFO) << "Vulkan: Pipeline initialized from " << spirv_dir;
+  return true;
 }
 unique_ptr<DeviceQueue> VulkanDevice::gpu_queue_create() { return make_unique<VulkanQueue>(this); }
 // NOTE: no build_bvh() override here. Device::build_bvh() in src/device/device.cpp
@@ -354,6 +364,15 @@ void VulkanDevice::mem_alloc(device_memory &mem) {
   }
   generic_alloc(mem);
 }
+uint64_t VulkanDevice::get_buffer_address(const std::string &name) const
+{
+  auto it = buffer_addresses_.find(name);
+  if (it != buffer_addresses_.end()) {
+    return it->second;
+  }
+  return 0;
+}
+
 void VulkanDevice::mem_copy_to(device_memory &mem) {
   if (!is_ready()) {
     LOG(ERROR) << "Vulkan: device not initialized; ignoring mem_copy_to.";
@@ -394,6 +413,15 @@ void VulkanDevice::mem_copy_to(device_memory &mem) {
     // Tell the kernel where this global array lives in VRAM (device_ptr value
     // = BDA address), written into the constant buffer at the symbol's offset.
     const_copy_to(mem.global_name(), &mem.device_pointer, sizeof(device_ptr));
+
+    // M4: Track device addresses for key scene buffers by their global name.
+    buffer_addresses_[mem.global_name()] = (uint64_t)mem.device_pointer;
+    
+    // Track triangle count for tri_vindex buffer
+    if (mem.global_name() == "tri_vindex") {
+      // Each triangle has 4 uints (3 indices + padding)
+      num_triangles_ = static_cast<uint32_t>(mem.data_size);
+    }
   } else {
     generic_copy_to(mem);
   }

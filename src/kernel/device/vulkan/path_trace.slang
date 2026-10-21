@@ -27,10 +27,10 @@ ParameterBlock<VulkanKernelParams> params : register(b0);
 /* PCG32 RNG — same stream layout as the spike so CPU reference matches. */
 struct Pcg32
 {
-    uint64 state;
-    uint64 inc;
+    ulong state;
+    ulong inc;
 
-    void init(uint64 seed, uint64 seq)
+    void init(ulong seed, ulong seq)
     {
         state = 0u;
         inc = (seq << 1u) | 1u;
@@ -41,7 +41,7 @@ struct Pcg32
 
     uint next()
     {
-        uint64 oldstate = state;
+        ulong oldstate = state;
         state = oldstate * 6364136223846793005ULL + inc;
         uint xorshifted = (uint)(((oldstate >> 18u) ^ oldstate) >> 27u);
         uint rot = (uint)(oldstate >> 59u);
@@ -64,9 +64,9 @@ float3 camera_ray_direction(float2 pixel_center)
 
     /* half frame size in mm mapped to world units at focal distance */
     float scale = cam_sensor_half_width();
-    float3 dir = normalize(cam_forward
-                         + ndc_x * scale * params.cam_aspect * cam_right
-                         + ndc_y * scale * cam_up);
+    float3 dir = normalize(params.cam_forward
+                         + ndc_x * scale * params.cam_aspect * params.cam_right
+                         + ndc_y * scale * params.cam_up);
     return dir;
 }
 
@@ -80,8 +80,8 @@ float3 shade_stub(RayGPU ray, uint prim)
 {
     /* M4 stub: hit anything -> flat albedo 0.5 grey lit by a fake hemisphere
      * term from the geometric normal. Replaced by real BSDF sampling in M5. */
-    let tris = cast<uint4[]>(params.tri_indices);
-    let verts = cast<float4[]>(params.vert_co);
+    StructuredBuffer<uint4> tris = StructuredBuffer<uint4>(params.tri_indices);
+    StructuredBuffer<float4> verts = StructuredBuffer<float4>(params.vert_co);
     uint4 idx = tris[prim];
     float3 v0 = verts[idx.x].xyz;
     float3 v1 = verts[idx.y].xyz;
@@ -91,24 +91,25 @@ float3 shade_stub(RayGPU ray, uint prim)
     return float3(0.5f) * hemi;
 }
 
+[shader("compute")]
 [numthreads(8, 8, 1)]
-compute void path_trace_kernel()
+void path_trace_kernel(uint3 dispatchThreadID : SV_DispatchThreadID)
 {
-    uint tx = gl_GlobalInvocationID.x;
-    uint ty = gl_GlobalInvocationID.y;
+    uint tx = dispatchThreadID.x;
+    uint ty = dispatchThreadID.y;
 
     if (tx >= params.tile_width || ty >= params.tile_height)
         return;
 
     uint film_idx = ty * params.tile_width + tx;
-    let film = cast<float4[]>(params.film_buffer);
+    StructuredBuffer<float4> film = StructuredBuffer<float4>(params.film_buffer);
 
     float3 acc = float3(0.0f, 0.0f, 0.0f);
 
     Pcg32 rng;
-    uint64 seed = ((uint64)params.rng_seed << 32u)
-                | (uint64)((ty * params.film_width + tx) * 1973u + 911u);
-    rng.init(seed, ((uint64)tx << 32u) | (uint64)ty);
+    ulong seed = ((ulong)params.rng_seed << 32u)
+               | (ulong)((ty * params.film_width + tx) * 1973u + 911u);
+    rng.init(seed, ((ulong)tx << 32u) | (ulong)ty);
 
     for (uint s = 0; s < params.samples_per_pixel; ++s)
     {
