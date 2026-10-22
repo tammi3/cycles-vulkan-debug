@@ -1,113 +1,68 @@
-M4d DIFFUSE-CLOSURE SESSION (run 1) — 2026-10-22
-=================================================
-STATUS: COMPLETE. GATE MET. The Lambertian closure (bsdf_diffuse_eval +
-bsdf_diffuse_sample) is ported to Slang, compiles + validates clean, and a
-trivial host dispatch runs it on the GPU and matches a same-algorithm CPU
-reference on EVERY value. No rendering logic, tolerance or harness changed.
+M4e SESSION (PLAN + Part 1) — 2026-10-22
+========================================
+STATUS: Part 0 done (M4c confirmed PASSING). Part 1 done + PASSING (real-Cycles
+header reference added, all values match). Part 2 = design report delivered in
+chat only, NO CODE (path_trace.slang left untouched). Stopping for approval per
+task. No git commands run; no frozen harness/tolerance/reference changes.
 
-WHAT I DID, FILE BY FILE (run 1)
---------------------------------
-src/kernel/device/vulkan/bsdf_diffuse.slang  (NEW, functions-only include)
-  - Spectrum=float3 (types_spectrum.h:16,20). DiffuseBsdf = SHADER_CLOSURE_BASE
-    (types.h:868-872); only N is read by eval/sample (bsdf_diffuse.h:44,60).
-  - Helpers ported, each cited: len_squared(f2/f3) (math_float2.h:183,
-    math_float3.h:307), safe_sqrtf (math_base.h:538), polar_to_cartesian
-    (projection.h:30), make_orthonormals (math_float3.h:733; the #if 0 early-outs
-    at :737-748 are compiled out, skipped), sample_uniform_disk (mapping.h:21),
-    sample_cos_hemisphere (mapping.h:71).
-  - bsdf_diffuse_eval   = bsdf_diffuse.h:38-49.  cosNO=max(dot(N,wo),0)/pi; pdf=cosNO.
-  - bsdf_diffuse_sample = bsdf_diffuse.h:51-73.  cos-hemisphere sample; reject to Ng
-    hemisphere; returns LABEL_REFLECT|LABEL_DIFFUSE = 2|4 = 6 (types.h:332-333).
-  - NO Vulkan-specific divergence from Cycles (new AGENTS rule allows it only if it
-    is faster on old hardware; not shown here, so kept faithful).
-src/kernel/device/vulkan/bsdf_probe.slang  (NEW, entry point, 1 thread, fixed hit)
-  - Fixed N=Ng=+Z, wo=normalize(0.3,-0.2,0.9), rand=(0.31,0.62). Push-constant + BDA,
-    no descriptor sets (same proven pattern as abi_probe/traverse_probe).
-  - Writes 15 float words: sentinel, eval.rgb, pdf_eval, wo.rgb, pdf_sample,
-    eval_s.rgb, label, |wo|, dot(N,wo).
-src/device/vulkan/kernels.cpp  (+316)
-  - New vulkan_bsdf_probe(VulkanDevice*) after vulkan_abi_probe. Env-gated
-    CYCLES_VULKAN_BSDF_PROBE=1 (no-op unset -> M4 behaviour unchanged), runs once.
-    Loads bsdf_probe.spv (env CYCLES_VULKAN_BSDF_PROBE_SPV or ./bsdf_probe.spv),
-    one-thread dispatch, reads 15 floats, compares vs an inline CPU reference that
-    reimplements the SAME formulas (same algorithm class). RAII handles, every
-    VkResult checked, validation layer reports 0 errors.
-src/device/vulkan/queue.cpp  (+7)
-  - Declares + calls vulkan_bsdf_probe in VulkanQueue::enqueue, after the M4c hook,
-    same no-op-unless-set semantics.
+PART 0 — M4c final status (traverse gate):
+  M4c PASSES on instance4.xml (run 10). Baseline clean (both missed=11003, same=5381,
+  ties=0, grazing=0, mismatches=0, errors=0, type 0/0). Histogram 0=7676 1=7736 2=972.
+  neg1 DETECTED (bad=972 = exactly the 972 two-visit rays, effect 3193/16384),
+  neg2 DETECTED (errors=8708), neg3 DETECTED (bad=5380, effect 5381). instance3
+  regression matched run 9 exactly. Layer proven (252 loader lines), VUID 0.
+  HOW neg1 WAS RESOLVED: by a SCENE change only — new instance4.xml with a
+  45-degree-rotated near instance (obj1 at 0,-3,1.5); origin obj0 = far instance,
+  collinear behind it. Fault definitions, verdict logic, tolerances and camera all
+  untouched. NOT a fault redesign.
+  Frozen files edited since run 8: NONE that stayed frozen. Run 9 added instrumentation
+  to traverse.slang (+15), traverse_probe.slang (+13), kernels.cpp (+94) — those files
+  were EDITABLE for the M4c measurement task, and run 10 changed only the scene. The
+  only truly frozen items (device.cpp, device_impl.h, params.h, harness, tolerances,
+  reference images, instance2/3.xml) were NOT edited.
 
-GATE RESULTS (real output)
---------------------------
-Compile (AGENTS 6):
-    slangc  bsdf_probe.slang -> bsdf_probe.spv : exit=0 (4308 bytes)
-    spirv-val bsdf_probe.spv                   : exit=0
-Host build:
-    cmake --build build --config Release --target cycles : exit=0 (cycles.exe built)
-Dispatch (VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation, VK_LOADER_DEBUG=layer):
-    Layer active: 252 loader lines, "adding layers VK_LAYER_KHRONOS_validation".
-    VUID / validation errors: 0.
-    MATCH    eval.r gpu=0.29548  cpu=0.29548
-    MATCH    eval.g gpu=0.29548  cpu=0.29548
-    MATCH    eval.b gpu=0.29548  cpu=0.29548
-    MATCH    pdf_eval gpu=0.29548 cpu=0.29548
-    MATCH    wo.x gpu=-0.108428 cpu=-0.108428
-    MATCH    wo.y gpu=0.364202  cpu=0.364202
-    MATCH    wo.z gpu=0.924986  cpu=0.924986
-    MATCH    pdf_sample gpu=0.294432 cpu=0.294432
-    MATCH    eval_s.r gpu=0.294432 cpu=0.294432
-    MATCH    label gpu=6 cpu=6
-    ALL VALUES MATCH.
-  Sanity: eval=cosNO/pi with cosNO=0.9283 (wo tilted from +Z); sampled wo is a unit
-  direction, z=0.925; pdf_sample=0.924986/pi=0.294432; label=6=REFLECT|DIFFUSE.
+PART 1 — Stronger M4d check (DONE, PASSING):
+  Added a SECOND GPU reference: the REAL Cycles header src/kernel/closure/bsdf_diffuse.h
+  compiled on the host, called directly, compared value-by-value. Did NOT copy code.
+  WHY IT IS A ONE-LINE INCLUDE (not large changes):
+    - kernels.cpp already pulls kernel/types.h transitively (device_impl.h:10 ->
+      params.h:26), so the Cycles kernel type system already compiles in this TU.
+    - On host ccl_device = static inline, ccl_private/ccl_global = empty
+      (util/defines.h:25,63,67), so bsdf_diffuse_eval/_sample are directly callable.
+    - Precedent: shader_nodes.cpp:33 and cycles_precompute.cpp:13 already include real
+      closure headers on the host.
+  Edits (both in src/device/vulkan/kernels.cpp):
+    - #include "kernel/closure/bsdf_diffuse.h" at top (with an explanatory comment).
+    - In vulkan_bsdf_probe: a second reference block that builds a ShaderClosure with
+      only N set, calls the real bsdf_diffuse_eval + bsdf_diffuse_sample on the same
+      fixed inputs (N=Ng=+Z, wo=normalize(0.3,-0.2,0.9), rand=(0.31,0.62)), and checks
+      GPU out[] against them as cyc_* values (tol 1e-6, label exact).
+  RESULT (run, VK_LOADER_DEBUG=layer, validation layer active):
+    Build exit=0. Run exit=0. loader lines=252, VUID/validation errors=0.
+    Original reimplementation refs: ALL MATCH (eval=0.29548, wo=(-0.108428,0.364202,
+    0.924986), pdf_sample=0.294432, label=6).
+    NEW cyc_* real-Cycles refs: ALL MATCH (cyc_eval=0.29548, cyc_wo=(-0.108428,0.364202,
+    0.924986), cyc_pdf_sample=0.294432, cyc_label=6). "ALL VALUES MATCH."
+  This closes the shared-misreading gap: GPU now agrees with Cycles' OWN arithmetic,
+  independent of my formula reading.
 
-IMPORTANT FINDING (reported, NOT brute-forced): path_trace.slang is DEAD CODE
-against a FANTASY ABI. It references ParameterBlock<VulkanKernelParams> (wrong name;
-real struct = KernelParamsVulkan) and ~20 fields absent from it (tri_indices,
-vert_co, film_buffer, cam_origin/forward/right/up, cam_sensor_width, cam_focal_length,
-bg_color, tile_*, rng_seed, samples_per_pixel), and calls bvh2_intersect (the
-UNVERIFIED traversal), not traverse(). Making it "compile against the verified
-traversal interface" means REDESIGNING its camera/film/RNG ABI onto the real
-KernelParamsVulkan + push-constant + TraverseHeader + traverse() contract. That is a
-separate DESIGN task. Per the rule "edit to PROGRESS, not to pass a test", I did NOT
-invent fake fields to force it green.
+PART 2 — Design report for the real M4 path: delivered in chat ONLY (7 sections with
+  file:line citations). NO code. path_trace.slang left untouched (dead code on a fantasy
+  ABI). No private path_trace ABI proposed; the plan is generic DeviceQueue::enqueue on
+  the locked KernelParamsVulkan/IntegratorStateGPU.
 
-DIVERGENCE FROM TASK PROMPT: the prompt asked to ALSO make path_trace.slang compile.
-I delivered the closure port + compile + validate + trivial dispatch (the gate), but
-did NOT touch path_trace.slang, because doing so requires the ABI redesign above.
-Reason given; nothing was faked.
+STILL OPEN / NEXT: awaiting approval on the Part 2 plan before implementing any M4
+  wavefront kernel. First proposed step = port DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA
+  only, gated against real Cycles camera code compiled on host.
 
-STILL OPEN (suggested next task)
---------------------------------
-- Design the REAL M4 path-trace dispatch ABI, then rewrite path_trace.slang onto it:
-    * camera: reuse the probe's TraverseHeader cam_l/u/v image-plane model (already
-      proven + CPU-referenced in M4c), NOT path_trace.slang's fantasy sensor model.
-    * film buffer: decide layout (float4 rgb+weight) + how the host allocates/maps it.
-    * traversal: call the VERIFIED traverse() (traverse.slang), not bvh2_intersect.
-    * then bsdf_diffuse.slang plugs in as the shading step after a hit.
-  This is the actual M4 milestone gate (Lambertian sphere, 16 spp, vs Cycles CPU).
-- The ShaderClosure array / ShaderData (and bsdf_diffuse_setup) are DEFERRED; when
-  shader-eval is ported, bsdf_diffuse.slang's DiffuseBsdf head is already the
-  post-cast layout that array will hand in.
-- Instrumentation from M4c (visits buffer + histogram) still in the tree; keep/strip
-  decision still open.
-- Generated artifacts still untracked (recommend git rm --cached or add to
-  .gitignore): abi_probe.spv, traverse_prepare.spv, traverse_probe.spv,
-  m4c_live_kerneldata.bin. New: bsdf_probe.spv is written to the temp dir only.
-
-TRAPS HIT THIS SESSION
-----------------------
-- slangc emits SPIR-V entry point "main" regardless of the Slang function name; the
-  host must use pName="main" (observed M4b note, kernels.cpp). No extra flag needed.
-- Slang reports sizeof WITHOUT MSVC tail padding; vulkan_data.slang spells pads out
-  explicitly and locks them with host static_asserts. Follow that pattern for any
-  NEW shared struct.
-- PowerShell: `Select-String` pattern with a literal quote needs backtick escaping.
-
-UNTRACKED / MODIFIED FILES LEFT FOR THE USER (git)
---------------------------------------------------
-Modified (not staged): kernels.cpp, queue.cpp, lastsession.txt.
-New, intended to commit: src/kernel/device/vulkan/bsdf_diffuse.slang,
-  src/kernel/device/vulkan/bsdf_probe.slang.
-Untracked generated (handle via gitignore/rm --cached): abi_probe.spv,
+FILES MODIFIED THIS SESSION (not staged, no git run):
+  src/device/vulkan/kernels.cpp  (include + cyc_* reference block).
+  lastsession.txt.
+New this session: none (bsdf_diffuse.slang / bsdf_probe.slang already existed from M4d).
+Untracked generated (gitignore/rm --cached recommendation open): abi_probe.spv,
   traverse_prepare.spv, traverse_probe.spv, m4c_live_kerneldata.bin.
-No git state-changing commands were run.
+  bsdf_probe.spv lives in temp dir only.
+
+TRAPS: slangc emits SPIR-V entry "main" regardless of Slang name; MSVC tail padding
+  absent from slangc sizeof (spell pads + host static_assert); PowerShell Select-String
+  literal quotes need backtick escaping.

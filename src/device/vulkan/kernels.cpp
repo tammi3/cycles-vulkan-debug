@@ -12,6 +12,16 @@
 #include "device/vulkan/device.h"
 #include "device/vulkan/device_impl.h"
 
+/* M4e Part 1: the REAL Cycles Lambertian closure, compiled on the host. On
+ * this target ccl_device is `static inline` and ccl_private/ccl_global are
+ * empty (util/defines.h:25,63,67), so bsdf_diffuse_eval/_sample are directly
+ * callable. kernel/types.h is already in this TU via device_impl.h -> params.h,
+ * so this include adds only the closure functions (bsdf_diffuse.h pulls
+ * kernel/closure/alloc.h and kernel/sample/mapping.h). Used as a second,
+ * independent GPU reference below (vulkan_bsdf_probe) so a formula misreading
+ * shared by my Slang port AND the hand re-implementation is still caught. */
+#include "kernel/closure/bsdf_diffuse.h"
+
 #include "util/log.h"
 
 #include <cstdlib>
@@ -807,6 +817,48 @@ bool vulkan_bsdf_probe(VulkanDevice *dev)
   check("pdf_sample", out[8], pdf_s, 1e-6f);
   check("eval_s.r", out[9], eval_s, 1e-6f);
   check("label", out[12], 6.0f /* LABEL_REFLECT|LABEL_DIFFUSE */, 0.0f);
+
+  /* ---- SECOND reference: the REAL Cycles closure, compiled on the host ----
+   * The checks above compare the GPU against a hand reimplementation of the
+   * formulas. If I misread a formula, BOTH the Slang port and that
+   * reimplementation would be wrong the same way and still agree. To catch
+   * that, call the actual Cycles functions (kernel/closure/bsdf_diffuse.h,
+   * included at the top of this file) on the same fixed inputs and compare the
+   * GPU output against THEM. This is independent of my reading of the source:
+   * it is Cycles' own arithmetic. */
+  {
+    /* Build a ShaderClosure with only N set: bsdf_diffuse_eval/_sample read
+     * nothing but bsdf->N (bsdf_diffuse.h:44,60). On host ccl_private is
+     * empty, so these are plain pointers. */
+    ShaderClosure sc = {};
+    sc.N = make_float3(0.0f, 0.0f, 1.0f);
+
+    const float3 wi = make_float3(0.0f, 0.0f, 1.0f); /* unused by diffuse */
+    const float3 wo_cy = normalize(make_float3(0.3f, -0.2f, 0.9f));
+    const float2 rand_cy = make_float2(0.31f, 0.62f);
+    const float3 Ng_cy = make_float3(0.0f, 0.0f, 1.0f);
+
+    /* bsdf_diffuse_eval (real Cycles). */
+    float pdf_cy_eval = 0.0f;
+    const float3 eval_cy = bsdf_diffuse_eval(&sc, wi, wo_cy, &pdf_cy_eval);
+    check("cyc_eval.r", out[1], GET_SPECTRUM_CHANNEL(eval_cy, 0), 1e-6f);
+    check("cyc_eval.g", out[2], GET_SPECTRUM_CHANNEL(eval_cy, 1), 1e-6f);
+    check("cyc_eval.b", out[3], GET_SPECTRUM_CHANNEL(eval_cy, 2), 1e-6f);
+    check("cyc_pdf_eval", out[4], pdf_cy_eval, 1e-6f);
+
+    /* bsdf_diffuse_sample (real Cycles). */
+    float3 wo_cy_s = make_float3(0.0f, 0.0f, 0.0f);
+    float3 eval_cy_s = make_float3(0.0f, 0.0f, 0.0f);
+    float pdf_cy_s = 0.0f;
+    const int label_cy = bsdf_diffuse_sample(
+        &sc, Ng_cy, wi, rand_cy, &eval_cy_s, &wo_cy_s, &pdf_cy_s);
+    check("cyc_wo.x", out[5], wo_cy_s.x, 1e-6f);
+    check("cyc_wo.y", out[6], wo_cy_s.y, 1e-6f);
+    check("cyc_wo.z", out[7], wo_cy_s.z, 1e-6f);
+    check("cyc_pdf_sample", out[8], pdf_cy_s, 1e-6f);
+    check("cyc_eval_s.r", out[9], GET_SPECTRUM_CHANNEL(eval_cy_s, 0), 1e-6f);
+    check("cyc_label", out[12], (float)label_cy, 0.0f);
+  }
 
   if (mismatches == 0) {
     LOG_INFO << "Vulkan: BSDF probe: ALL VALUES MATCH.";
