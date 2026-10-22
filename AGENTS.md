@@ -31,15 +31,9 @@ building it. She wants to LEARN from this repo, and others may read it later.
 - Comment code heavily: say WHAT each block does and WHY. Explain unusual C++ or
   Slang constructs the first time they appear.
 - Explain your decisions in plain language in your replies.
-- Do NOT run `git add`, `git commit` or `git push`. The user does all git work.
-  You may run read-only git commands (`git status`, `git diff`, `git log`).
 
 ## 2. Which files you may edit
 
-**Frozen. Do not edit unless the task prompt names the file as editable:**
-
-- `VulkanDevice` in `src/device/vulkan/device.cpp` and `device_impl.h`
-- `src/kernel/device/vulkan/params.h`
 - Anything under `C:\dev\cycles-vulkan` (the reference repo)
 - The verification harness: tests, tolerances and reference images (see section 6)
 - Any file outside `src/` unless the task says so
@@ -50,12 +44,6 @@ task only. Only those files may be touched, and all other rules still apply.
 If a task seems to require editing a frozen or unlisted file, STOP and report what is
 blocking you. Do not edit it "just a little".
 
-**Trust level of the existing Slang files.** `vulkan_data.slang`, `bvh2.slang` and
-`path_trace.slang` were written by an earlier session and, as far as we know, were never
-compiled. Their comments ("validated", "as in the spike", "matches the CPU reference")
-are NOT evidence. A Slang file counts as working only when you have just compiled it and
-shown the output. The M2c spike (`agentreference/bvh_traverse.slang`) is the syntax
-reference that is known to compile and run on the RX 570.
 
 ## 3. Task types
 
@@ -82,7 +70,10 @@ Every task is one of these. The task prompt says which.
 
 - **Faithful translation, not improvement.** Port the Cycles logic as written, even if it
   looks redundant or awkward. Cycles is the reference; divergence is a correctness bug.
-  Cite the source: `// source: <cycles path>:<line>` on every non-obvious fact.
+  Cite the source: `// source: <cycles path>:<line>` on every non-obvious fact. NOTE on this specific rule,
+  if the file can be optimized in Vulkan at the expense of MINOR divergence in faithfulness, you have permission to do so,
+  HOWEVER, this must be kept to a minimum, this exception is only made due to the philosophy of making old hardware run properly,
+  therefore, if it won't be faster on older hardware, do NOT EDIT ANYTHING unnecessary from Cycles logic while doing the translation.
 - **No virtual dispatch.** Cycles closure arrays and BSDF calls become an explicit
   `switch` on closure type. No function pointers, no interface types.
 - **No recursion.** The call graph must be straight-line.
