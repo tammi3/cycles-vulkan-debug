@@ -205,3 +205,5 @@ Write (or overwrite) `lastsession.txt` in the repo root. Keep it short. Include:
 - No elevated actions (UAC prompts, registry, gflags/page heap, admin shells) unless the current task prompt explicitly allows them.
 - No generated artifacts in the repo root. Write dumps, captures and .spv files to the OpenCode temp dir or a git-ignored folder, and list any untracked files left at the end so the user can handle git.
 - Open items go into lastsession.txt with the exact observation (values, file, line), not a paraphrase.
+
+- Negative tests are only meaningful against a CLEAN baseline. A negative counts as detected only if the fault changes the output relative to the clean run of the same configuration. If the baseline itself fails the gate, no negative result is valid; report that instead of a verdict.
