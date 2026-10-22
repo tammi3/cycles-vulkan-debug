@@ -74,6 +74,15 @@ Every task is one of these. The task prompt says which.
   if the file can be optimized in Vulkan at the expense of MINOR divergence in faithfulness, you have permission to do so,
   HOWEVER, this must be kept to a minimum, this exception is only made due to the philosophy of making old hardware run properly,
   therefore, if it won't be faster on older hardware, do NOT EDIT ANYTHING unnecessary from Cycles logic while doing the translation.
+
+DIVERGENCE POLICY (applies to the exception above)
+1. Port faithfully first. A kernel must pass its gate in faithful form before any divergence is added.
+2. A divergence is allowed only if measured faster on the RX 570. Report the timings (faithful vs divergent, same scene, same run conditions). "Expected to be faster" is not enough.
+3. Every divergence sits behind a specialization constant or macro, with faithful as the default, and gets an entry in DIVERGENCES.md: what changed, why, source citation of the original, measured speedup, and whether it is result-preserving or result-changing.
+4. Gates compare FAITHFUL mode against Cycles CPU at the strict tolerance. Result-changing divergences are compared against faithful GPU mode at a tolerance the user chooses. Never loosen the CPU-comparison tolerance to accommodate a divergence.
+5. Do not start optimizing before the M5 gate passes, unless the user asks.
+
+
 - **No virtual dispatch.** Cycles closure arrays and BSDF calls become an explicit
   `switch` on closure type. No function pointers, no interface types.
 - **No recursion.** The call graph must be straight-line.
