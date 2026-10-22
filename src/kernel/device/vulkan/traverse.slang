@@ -203,10 +203,18 @@ bool ray_triangle_intersect(float3 P, float3 D, float tmin, float tmax,
  * Returns 0 on completion (hit OR miss; inspect the out params), or one of
  * the ERR_* codes for an out-of-range index, stack overflow or iteration
  * cap - all of which the probe reports as FAIL. */
+/* INSTRUMENTATION (M4c run 9, measurement only - not part of any verdict):
+ * `instance_visits` counts how many instance leaves this ray ENTERED. It is
+ * an inout scalar owned by the caller (initialised to 0 there) rather than a
+ * field of TraverseHeader, because the header is ONE struct shared by every
+ * thread in the dispatch - a counter there would be a data race. Using inout
+ * also means the count survives the early `return ERR_*` paths, so error rays
+ * still report how far they got. */
 uint traverse(TraverseHeader* sc,
               float3 P, float3 Din, float tmin, float tmax, uint visibility,
               out float hit_t, out float hit_u, out float hit_v,
-              out uint hit_prim, out uint hit_object, out uint hit_type)
+              out uint hit_prim, out uint hit_object, out uint hit_type,
+              inout uint instance_visits)
 {
     int stack[BVH_STACK_SIZE];
     stack[0] = ENTRYPOINT_SENTINEL;      // traversal.h:37-38
@@ -383,6 +391,11 @@ uint traverse(TraverseHeader* sc,
                 if ((uint)instance_idx >= sc->prim_count) return ERR_BAD_INDEX;
                 uint obj = (sc->prim_object + (uint)instance_idx)[0]; // traversal.h:231
                 if (obj >= sc->object_count) return ERR_BAD_INDEX;
+
+                /* INSTRUMENTATION (run 9): count this instance entry. Placed
+                 * after both bounds checks so we only count instances we
+                 * actually enter, never a corrupt index. */
+                instance_visits++;
 
                 uint obj_node = sc->object_node[obj]; // traversal.h:243
                 /* NEGATIVE TEST 2 (gate): pretend the object_node entry for

@@ -144,13 +144,15 @@ void traverse_prepare_main(uint3 tid : SV_DispatchThreadID)
 }
 
 /* -------------------------------------------------------------------------
- * Ray pass. Push constants (24 bytes): the header, the Intersection
- * output and the per-ray status word. */
+ * Ray pass. Push constants (32 bytes): the header, the Intersection
+ * output, the per-ray status word and - INSTRUMENTATION added for M4c
+ * run 9 - a per-ray instance-visit counter output. */
 struct ProbePush
 {
     TraverseHeader* hdr;
     Intersection* out;
     int* status;
+    uint* visits;   // run 9: one uint per ray = instance leaves entered
 };
 
 [[vk::push_constant]]
@@ -180,13 +182,18 @@ void traverse_probe_main(uint3 tid : SV_DispatchThreadID)
 
     float hit_t, hit_u, hit_v;
     uint hit_prim, hit_object, hit_type;
+    /* INSTRUMENTATION (run 9): per-ray counter, passed inout into traverse()
+     * so the histogram can be built on the host. Zero-initialised here. */
+    uint inst_visits = 0u;
     /* tmin/tmax identical to the CPU reference (raytri_cpu.h:21-22). */
     uint status = traverse(probe_pc.hdr, o, d, 1e-4f, 1e30f,
                            probe_pc.hdr->visibility,
-                           hit_t, hit_u, hit_v, hit_prim, hit_object, hit_type);
+                           hit_t, hit_u, hit_v, hit_prim, hit_object, hit_type,
+                           inst_visits);
 
     uint idx = y * probe_pc.hdr->width + x;
     probe_pc.status[idx] = int(status);
+    probe_pc.visits[idx] = inst_visits;
     /* On an error the intersection words are still written (all-sentinel
      * values) so every output word is initialized and the host's
      * unwritten-word check stays meaningful. The status word - not the

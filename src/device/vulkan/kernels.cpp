@@ -569,7 +569,7 @@ constexpr uint32_t TP_UNWRITTEN_WORD = 0xDEADBEEFu;
 constexpr uint32_t TP_PREPARE_SENTINEL = 0xB10C5EEDu; /* traverse_probe.slang */
 constexpr uint32_t TP_PREPARE_OUT_WORDS = 645; /* 5 header words + whole blob */
 constexpr uint32_t TP_PREPARE_PUSH_BYTES = 56; /* PreparePush (6 ptrs + word) */
-constexpr uint32_t TP_PROBE_PUSH_BYTES = 24;   /* ProbePush (3 ptrs) */
+constexpr uint32_t TP_PROBE_PUSH_BYTES = 32;   /* ProbePush (4 ptrs; +visits run 9) */
 constexpr uint32_t TP_HEADER_BYTES = 192;      /* sizeof(TpHeader)=168, rounded */
 constexpr uint32_t TP_OBJECT_WORDS = 64;       /* traverse.slang OBJECT_WORDS */
 constexpr uint32_t TP_POSITION_OFFSET_WORD = 42;
@@ -626,7 +626,7 @@ struct TpPreparePush {
 };
 static_assert(sizeof(TpPreparePush) == TP_PREPARE_PUSH_BYTES, "push layout");
 struct TpProbePush {
-  uint64_t hdr, out, status;
+  uint64_t hdr, out, status, visits; /* visits: run 9 instrumentation */
 };
 static_assert(sizeof(TpProbePush) == TP_PROBE_PUSH_BYTES, "push layout");
 
@@ -1276,11 +1276,16 @@ struct TpResources {
   VkCommandPool pool = VK_NULL_HANDLE;
   VkBuffer hdr_buf = VK_NULL_HANDLE, out_buf = VK_NULL_HANDLE;
   VkBuffer status_buf = VK_NULL_HANDLE, cksum_buf = VK_NULL_HANDLE;
+  /* run 9: per-pixel instance-visit counter (instrumentation only). */
+  VkBuffer visits_buf = VK_NULL_HANDLE;
   VkDeviceMemory hdr_mem = VK_NULL_HANDLE, out_mem = VK_NULL_HANDLE;
   VkDeviceMemory status_mem = VK_NULL_HANDLE, cksum_mem = VK_NULL_HANDLE;
+  VkDeviceMemory visits_mem = VK_NULL_HANDLE;
   void *hdr_map = nullptr, *out_map = nullptr;
   void *status_map = nullptr, *cksum_map = nullptr;
+  void *visits_map = nullptr;
   uint64_t hdr_addr = 0, out_addr = 0, status_addr = 0, cksum_addr = 0;
+  uint64_t visits_addr = 0;
 
   ~TpResources()
   {
@@ -1290,14 +1295,17 @@ struct TpResources {
     if (out_map) vkUnmapMemory(device, out_mem);
     if (status_map) vkUnmapMemory(device, status_mem);
     if (cksum_map) vkUnmapMemory(device, cksum_mem);
+    if (visits_map) vkUnmapMemory(device, visits_mem);
     if (hdr_buf) vkDestroyBuffer(device, hdr_buf, nullptr);
     if (out_buf) vkDestroyBuffer(device, out_buf, nullptr);
     if (status_buf) vkDestroyBuffer(device, status_buf, nullptr);
     if (cksum_buf) vkDestroyBuffer(device, cksum_buf, nullptr);
+    if (visits_buf) vkDestroyBuffer(device, visits_buf, nullptr);
     if (hdr_mem) vkFreeMemory(device, hdr_mem, nullptr);
     if (out_mem) vkFreeMemory(device, out_mem, nullptr);
     if (status_mem) vkFreeMemory(device, status_mem, nullptr);
     if (cksum_mem) vkFreeMemory(device, cksum_mem, nullptr);
+    if (visits_mem) vkFreeMemory(device, visits_mem, nullptr);
     if (pipe_prepare) vkDestroyPipeline(device, pipe_prepare, nullptr);
     if (pipe_probe) vkDestroyPipeline(device, pipe_probe, nullptr);
     if (layout_prepare) vkDestroyPipelineLayout(device, layout_prepare, nullptr);
@@ -1589,12 +1597,19 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
   const VkDeviceSize out_bytes = out_words * sizeof(uint32_t);
   const VkDeviceSize status_bytes =
       (VkDeviceSize)(TP_MAX_PIXELS + TP_CANARY_RAYS) * sizeof(int32_t);
+  /* run 9: one uint per pixel for the instance-visit histogram. No canary
+   * zone needed - this buffer is informational and never part of a verdict,
+   * so a plain TP_MAX_PIXELS allocation is enough. */
+  const VkDeviceSize visits_bytes =
+      (VkDeviceSize)TP_MAX_PIXELS * sizeof(uint32_t);
   if (!tp_create_mapped_buffer(dev, TP_HEADER_BYTES, res.hdr_buf, res.hdr_mem,
                                &res.hdr_map, &res.hdr_addr) ||
       !tp_create_mapped_buffer(dev, out_bytes, res.out_buf, res.out_mem,
                                &res.out_map, &res.out_addr) ||
       !tp_create_mapped_buffer(dev, status_bytes, res.status_buf, res.status_mem,
                                &res.status_map, &res.status_addr) ||
+      !tp_create_mapped_buffer(dev, visits_bytes, res.visits_buf, res.visits_mem,
+                               &res.visits_map, &res.visits_addr) ||
       !tp_create_mapped_buffer(dev, TP_PREPARE_OUT_WORDS * 4, res.cksum_buf,
                                res.cksum_mem, &res.cksum_map, &res.cksum_addr))
     return fail("buffer creation failed");
@@ -1719,7 +1734,8 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
                        uint32_t h, const TpCam &run_cam,
                        const std::vector<TpHit> &run_ref, TpCmp &cmp,
                        size_t &unwritten, size_t &err_pixels,
-                       bool &canaries_ok, bool details) -> bool {
+                       bool &canaries_ok, bool details,
+                       std::vector<uint32_t> *visits_out = nullptr) -> bool {
     uint32_t *outw = (uint32_t *)res.out_map;
     const size_t real_words = (size_t)w * h * 6; /* Intersection = 6 words */
     const size_t canary_words = (size_t)TP_CANARY_RAYS * 6;
@@ -1733,6 +1749,11 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
     int32_t *statw = (int32_t *)res.status_map;
     for (size_t i = 0; i < TP_MAX_PIXELS; i++)
       statw[i] = (int32_t)TP_UNWRITTEN_WORD;
+    /* run 9: the visits buffer gets the same unwritten sentinel, so a thread
+     * that never ran shows up as 0xFFFFFFFF in the histogram sanity check. */
+    uint32_t *visw = (uint32_t *)res.visits_map;
+    for (size_t i = 0; i < TP_MAX_PIXELS; i++)
+      visw[i] = TP_UNWRITTEN_WORD;
 
     /* Visibility, test_mode, resolution and camera live in the header the
      * host owns; the shader reads width/height/cam from it
@@ -1753,6 +1774,7 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
     pp.hdr = res.hdr_addr;
     pp.out = res.out_addr;
     pp.status = res.status_addr;
+    pp.visits = res.visits_addr; /* run 9 */
     auto no_barrier = [](VkCommandBuffer cmd) { (void)cmd; };
     if (!tp_dispatch(dev, res.pool, res.pipe_probe, res.layout_probe,
                      TP_PROBE_PUSH_BYTES, &pp, (w + 7) / 8, (h + 7) / 8,
@@ -1768,6 +1790,13 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
     std::vector<int32_t> status((size_t)w * h);
     memcpy(gpu.data(), res.out_map, real_words * sizeof(uint32_t));
     memcpy(status.data(), res.status_map, (size_t)w * h * sizeof(int32_t));
+    /* run 9: hand the per-ray instance-visit counts back to the caller (the
+     * gate run builds the histogram from these). */
+    if (visits_out) {
+      visits_out->assign((size_t)w * h, 0u);
+      memcpy(visits_out->data(), res.visits_map,
+             (size_t)w * h * sizeof(uint32_t));
+    }
     unwritten = 0;
     err_pixels = 0;
     for (size_t i = 0; i < (size_t)w * h; i++) {
@@ -1787,8 +1816,11 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
   TpCmp main_cmp;
   size_t unwritten = 0, err_pixels = 0;
   bool canaries_ok = false;
+  /* run 9: the gate run's per-ray instance-visit counts (instrumentation). */
+  std::vector<uint32_t> gate_visits;
   if (!run_probe(0xFFFFFFFFu, 0, TP_MAX_WIDTH, TP_MAX_HEIGHT, cam_gate, ref_gate,
-                 main_cmp, unwritten, err_pixels, canaries_ok, /*details=*/true))
+                 main_cmp, unwritten, err_pixels, canaries_ok, /*details=*/true,
+                 &gate_visits))
     return fail("ray dispatch failed");
   tp_print_cmp("D1 verdict (GATE, 128x128 yawed camera): watertight Pluecker "
                "reference (same test as the GPU) vs GPU (ported traversal)",
@@ -1798,6 +1830,36 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
            << (canaries_ok ? "INTACT" : "OVERWRITTEN !!!")
            << ", pixels never written: " << unwritten
            << ", shader error pixels: " << err_pixels;
+
+  /* 11b. run 9 INSTRUMENTATION (informational only, never a verdict input):
+   *    histogram of rays by how many instance leaves they entered, plus a
+   *    sanity count of visits words the shader never wrote. This answers
+   *    whether the gate camera's rays exercise the instance POP at all. */
+  {
+    size_t hist[5] = {0, 0, 0, 0, 0}; /* index 4 = "4 or more" */
+    size_t vis_unwritten = 0;
+    for (uint32_t v : gate_visits) {
+      if (v == TP_UNWRITTEN_WORD) {
+        vis_unwritten++;
+        continue;
+      }
+      hist[v < 4u ? v : 4]++;
+    }
+    LOG_INFO << string_printf(
+        "Vulkan: traverse probe: INFO ONLY (run 9) instance-visit histogram "
+        "(gate camera): 0=%zu 1=%zu 2=%zu 3=%zu 4+=%zu (visits never written: %zu)",
+        hist[0], hist[1], hist[2], hist[3], hist[4], vis_unwritten);
+  }
+
+  /* 11c. run 9 INSTRUMENTATION: snapshot the CLEAN gate result so each
+   *    negative below can be diffed against it (task step 1b). Copied out of
+   *    the still-mapped buffers; informational only. */
+  std::vector<TpIntersection> clean_gate(TP_MAX_PIXELS);
+  std::vector<int32_t> clean_status(TP_MAX_PIXELS);
+  memcpy(clean_gate.data(), res.out_map,
+         (size_t)TP_MAX_PIXELS * sizeof(TpIntersection));
+  memcpy(clean_status.data(), res.status_map,
+         (size_t)TP_MAX_PIXELS * sizeof(int32_t));
 
   /* D2: Moller-Trumbore kept as an INFORMATIONAL line only. It is a
    * different algorithm class from the port, so it never enters the verdict;
@@ -1872,6 +1934,30 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
         "grazing=%zu type=%zu/%zu)",
         label, detected ? "DETECTED (gate failure, as expected)" : "NOT DETECTED !!!",
         c.bad, c.errors, c.grazing, c.type_bad_hit, c.type_bad_miss);
+
+    /* run 9 INSTRUMENTATION (task step 1b, INFORMATIONAL ONLY - it does not
+     * enter `detected`): count pixels whose (object, prim, t) differ from the
+     * CLEAN gate result of the same run. This is a direct fault-effect
+     * measure: 0 means the fault changed nothing at all, independent of the
+     * reference tolerances. t is compared with a small epsilon so a
+     * sub-ulp wobble does not count as an effect. */
+    {
+      const TpIntersection *faulty = (const TpIntersection *)res.out_map;
+      const int32_t *fstat = (const int32_t *)res.status_map;
+      size_t diff = 0;
+      for (size_t i = 0; i < TP_MAX_PIXELS; i++) {
+        const bool status_diff = (fstat[i] != 0) != (clean_status[i] != 0);
+        const bool obj_diff = faulty[i].object != clean_gate[i].object;
+        const bool prim_diff = faulty[i].prim != clean_gate[i].prim;
+        const bool t_diff = fabsf(faulty[i].t - clean_gate[i].t) > 1e-6f;
+        if (status_diff || obj_diff || prim_diff || t_diff)
+          diff++;
+      }
+      LOG_INFO << string_printf(
+          "Vulkan: traverse probe: INFO ONLY (run 9) NEGATIVE %-28s: "
+          "%zu / %d pixels differ from the clean GPU result",
+          label, diff, (int)TP_MAX_PIXELS);
+    }
     return detected;
   };
   const bool neg1 = run_negative("1 skip instance pop", 0xFFFFFFFFu, 1u /*TEST_MODE_SKIP_POP*/);
