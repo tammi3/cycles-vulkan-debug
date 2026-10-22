@@ -39,3 +39,8 @@ examples/osl/*.oso
 
 # library
 lib/windows_x64/
+# some cache stuff
+abi_probe.spv
+m4c_live_kerneldata.bin
+traverse_prepare.spv
+traverse_probe.spv

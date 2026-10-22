@@ -1,261 +1,113 @@
-M4c SCENE-CHANGE SESSION (run 10) — 2026-10-22
-==============================================
-STATUS: COMPLETE. GATE PASS on instance4.xml — baseline clean AND all three
-negatives DETECTED. Fixed by a SCENE change only (new instance4.xml). No fault
-definition, verdict logic, tolerance, camera or shader was touched.
-kernels.cpp was NOT edited (the gate scene is selected by the command line +
-CYCLES_VULKAN_TRAVERSE_DUMP_DIR, not by source).
-
-WHAT I DID, FILE BY FILE (run 10)
----------------------------------
-instance4.xml  (NEW — the deliverable). Copy of instance3.xml, changed so the
-  skipped instance-pop becomes observable:
-  - obj1 = NEAR instance, ROTATED 45 deg about the vertical axis, at (0,-3,1.5).
-    Syntax cited from src/app/cycles_xml.cpp:613-636 — on one <transform>
-    element xml_read_transform folds translate first (:625) then rotate
-    (:630), so object-to-world = T*R (rotate cube about its own centre, then
-    translate). `rotate="45 0 1 0"` = 45 deg about Y: rotate.x is the angle
-    in degrees, rotate.yzw is the axis (:627-630).
-  - obj0 = the bare <mesh>'s implicit object, kept at the ORIGIN as the FAR
-    instance. camera (0,-6,3) -> obj1 (0,-3,1.5) -> origin are collinear
-    (both segments are the vector (0,3,-1.5)); obj1 is exactly halfway.
-  - obj2/obj3 unchanged side cubes (x = +/-3.5). No two objects coincident.
-  - Resulting itfm: obj1 has a real rotation (itfm_x=(0.7071,0,-0.7071,1.0607),
-    itfm_z=(0.7071,0,0.7071,-1.0607) = -45 deg about Y); obj0 identity;
-    obj2/obj3 pure translations. Rotated AABB half-extent sqrt(2)=1.414 > cube
-    1, so rays enter the box and can miss the cube -> they pop and then test
-    the next top-level AABB with a WRONG (rotated) ray when the fault is on.
-lastsession.txt  (this file).
-m4c_gate_run10.txt  (NEW capture, official gated run with the layer).
-Sidecar regenerated with cycles_bvh_dump to
-  %LOCALAPPDATA%\Temp\opencode\m4c_dump4  (not the repo root; exit 0,
-  4 objects, 20 nodes, 7 leaves, BVH root 0).
-
-STEP 2 — PRECONDITION (PASSED first try, no adjustment needed)
--------------------------------------------------------------
-instance-visit histogram (gate camera, 16384 rays):
-    0=7676  1=7736  2=972  3=0  4+=0   (visits never written: 0)
-    -> 972 rays visit 2+ instances. Target was >=200. PASSED.
-
-STEP 3 — OFFICIAL GATE on instance4.xml, VK_LOADER_DEBUG=layer
---------------------------------------------------------------
-Capture: m4c_gate_run10.txt (86232 bytes, exit 0).
-Layer proof: 252 loader lines; "env var 'VK_INSTANCE_LAYERS' defined and
-  adding layers VK_LAYER_KHRONOS_validation" + "Insert instance layer
-  VK_LAYER_KHRONOS_validation" both present. VUID/validation errors: 0.
-BASELINE (clean): both missed 11003, same (object,prim) same t 5381,
-  edge ties 0, edge-grazing 0, MISMATCHES 0, shader error codes 0,
-  type mismatches 0/0, canaries INTACT, never-written 0, error pixels 0.
-  => CLEAN (ties 0 <= 8, grazing 0, no mismatch, no error).
-Per-cube hit pixels: obj0 0, obj1 3843, obj2 768, obj3 770.
-  (obj0 0 hits = fully occluded by the rotated obj1 from this camera; the
-   972 two-visit rays are miss-rays that traverse BOTH AABBs. Not a problem.)
-NEGATIVES (effect size = pixels whose (object,prim,t) differ from the clean
-  GPU result of the same run):
-    neg1 skip instance pop   : DETECTED, bad=972, effect 3193/16384
-    neg2 corrupt object_node : DETECTED, errors=8708, effect 8708/16384
-    neg3 visibility mask 0   : DETECTED, bad=5380 grazing=1, effect 5381/16384
-  -> All 3 DETECTED + baseline clean = GATE PASS. Final line of the capture:
-     "PASS - gate run matches the reference, all three faults detected".
-KEY MECHANISM CONFIRMED: neg1 bad=972 EXACTLY equals the histogram's
-  two-visit count 972 — the fault now changes precisely the rays that
-  exercise the pop, and none of the others. (Run 9 neg1 effect was 0.)
-
-STEP 3b — instance3.xml INFORMATIONAL REGRESSION (matches run 9 exactly)
------------------------------------------------------------------------
-  both missed 12829, same 3555, ties 0, grazing 0, mismatches 0, errors 0,
-  histogram 0=12829 1=3542 2=13, neg1 still NOT DETECTED.
-  => Identical to run 9. Proves the fix came from the SCENE change alone.
-
-TRAPS HIT THIS SESSION
-----------------------
-- tools/run_bvh_dump.sh does NOT exist in this repo; call
-  build\bin\Release\cycles_bvh_dump.exe <scene.xml> <out_dir> directly, and
-  the out_dir must PRE-EXIST (else exit 1).
-- PowerShell: array subtraction fails on Object[] (use scalar math); format
-  strings need ${i} before ':'. PS arithmetic errors are cosmetic noise, not
-  gate failures — read the numbers by inspection.
-
-STILL OPEN
-----------
-- Instrumentation (visits buffer + histogram + per-negative diff) is still IN
-  the tree. Task said do NOT strip it yet. Next task decides keep/strip.
-- The "INFO ONLY (run 9)" label inside kernels.cpp is a stale cosmetic string
-  from run 9 (this run printed it for run 10). Left untouched: kernels.cpp is
-  editable only for scene selection, which was not needed.
-- Generated artifacts still TRACKED (recommend `git rm --cached`):
-    abi_probe.spv, traverse_prepare.spv, traverse_probe.spv,
-    m4c_live_kerneldata.bin
-- Suggested next task: strip or keep the run-9 instrumentation, then move on
-  (M4 sphere gate / M5) — the M4c traversal probe gate now passes.
-
-UNTRACKED FILES LEFT FOR THE USER (git)
----------------------------------------
-- instance4.xml        (new gate scene — the deliverable, intended to commit)
-- m4c_gate_run10.txt   (official capture — intended to commit)
-Modified (not staged): lastsession.txt only. No git state-changing commands
-were run this session.
-
-==================================================
-BELOW: run 9 (measurement) summary, kept as history.
-==================================================
-
-M4c INSTRUMENTATION SESSION (run 9) — 2026-10-22
+M4d DIFFUSE-CLOSURE SESSION (run 1) — 2026-10-22
 =================================================
+STATUS: COMPLETE. GATE MET. The Lambertian closure (bsdf_diffuse_eval +
+bsdf_diffuse_sample) is ported to Slang, compiles + validates clean, and a
+trivial host dispatch runs it on the GPU and matches a same-algorithm CPU
+reference on EVERY value. No rendering logic, tolerance or harness changed.
 
-STATUS: measurement complete. Step 1 (instrumentation) + Step 2 (compile,
-validate, re-run gate) done. Baseline check PASSED. Step 3 (report) is in
-the chat. The gate is still FAIL (neg1 undetected) — this session only
-MEASURED why, per the task. No verdict logic, tolerance, fault definition
-or scene was changed.
+WHAT I DID, FILE BY FILE (run 1)
+--------------------------------
+src/kernel/device/vulkan/bsdf_diffuse.slang  (NEW, functions-only include)
+  - Spectrum=float3 (types_spectrum.h:16,20). DiffuseBsdf = SHADER_CLOSURE_BASE
+    (types.h:868-872); only N is read by eval/sample (bsdf_diffuse.h:44,60).
+  - Helpers ported, each cited: len_squared(f2/f3) (math_float2.h:183,
+    math_float3.h:307), safe_sqrtf (math_base.h:538), polar_to_cartesian
+    (projection.h:30), make_orthonormals (math_float3.h:733; the #if 0 early-outs
+    at :737-748 are compiled out, skipped), sample_uniform_disk (mapping.h:21),
+    sample_cos_hemisphere (mapping.h:71).
+  - bsdf_diffuse_eval   = bsdf_diffuse.h:38-49.  cosNO=max(dot(N,wo),0)/pi; pdf=cosNO.
+  - bsdf_diffuse_sample = bsdf_diffuse.h:51-73.  cos-hemisphere sample; reject to Ng
+    hemisphere; returns LABEL_REFLECT|LABEL_DIFFUSE = 2|4 = 6 (types.h:332-333).
+  - NO Vulkan-specific divergence from Cycles (new AGENTS rule allows it only if it
+    is faster on old hardware; not shown here, so kept faithful).
+src/kernel/device/vulkan/bsdf_probe.slang  (NEW, entry point, 1 thread, fixed hit)
+  - Fixed N=Ng=+Z, wo=normalize(0.3,-0.2,0.9), rand=(0.31,0.62). Push-constant + BDA,
+    no descriptor sets (same proven pattern as abi_probe/traverse_probe).
+  - Writes 15 float words: sentinel, eval.rgb, pdf_eval, wo.rgb, pdf_sample,
+    eval_s.rgb, label, |wo|, dot(N,wo).
+src/device/vulkan/kernels.cpp  (+316)
+  - New vulkan_bsdf_probe(VulkanDevice*) after vulkan_abi_probe. Env-gated
+    CYCLES_VULKAN_BSDF_PROBE=1 (no-op unset -> M4 behaviour unchanged), runs once.
+    Loads bsdf_probe.spv (env CYCLES_VULKAN_BSDF_PROBE_SPV or ./bsdf_probe.spv),
+    one-thread dispatch, reads 15 floats, compares vs an inline CPU reference that
+    reimplements the SAME formulas (same algorithm class). RAII handles, every
+    VkResult checked, validation layer reports 0 errors.
+src/device/vulkan/queue.cpp  (+7)
+  - Declares + calls vulkan_bsdf_probe in VulkanQueue::enqueue, after the M4c hook,
+    same no-op-unless-set semantics.
 
-BASELINE CHECK (the whole point of Step 2): the six verdict-bearing numbers
-in run 9 are IDENTICAL to run 8, so the instrumentation did NOT change
-behaviour. Both missed 12829, same 3555, ties 0, grazing 0, mismatches 0,
-errors 0. Also identical: type 0/0, canaries INTACT, never-written 0,
-shader error pixels 0, per-cube hits 886/617/1042/1010.
+GATE RESULTS (real output)
+--------------------------
+Compile (AGENTS 6):
+    slangc  bsdf_probe.slang -> bsdf_probe.spv : exit=0 (4308 bytes)
+    spirv-val bsdf_probe.spv                   : exit=0
+Host build:
+    cmake --build build --config Release --target cycles : exit=0 (cycles.exe built)
+Dispatch (VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation, VK_LOADER_DEBUG=layer):
+    Layer active: 252 loader lines, "adding layers VK_LAYER_KHRONOS_validation".
+    VUID / validation errors: 0.
+    MATCH    eval.r gpu=0.29548  cpu=0.29548
+    MATCH    eval.g gpu=0.29548  cpu=0.29548
+    MATCH    eval.b gpu=0.29548  cpu=0.29548
+    MATCH    pdf_eval gpu=0.29548 cpu=0.29548
+    MATCH    wo.x gpu=-0.108428 cpu=-0.108428
+    MATCH    wo.y gpu=0.364202  cpu=0.364202
+    MATCH    wo.z gpu=0.924986  cpu=0.924986
+    MATCH    pdf_sample gpu=0.294432 cpu=0.294432
+    MATCH    eval_s.r gpu=0.294432 cpu=0.294432
+    MATCH    label gpu=6 cpu=6
+    ALL VALUES MATCH.
+  Sanity: eval=cosNO/pi with cosNO=0.9283 (wo tilted from +Z); sampled wo is a unit
+  direction, z=0.925; pdf_sample=0.924986/pi=0.294432; label=6=REFLECT|DIFFUSE.
 
-RUN 9 RESULTS (informational, never part of the verdict)
---------------------------------------------------------
-Instance-visit histogram (gate camera, 128x128 = 16384 rays):
-    0 instances: 12829   (= exactly the "both missed" rays)
-    1 instance :  3542
-    2 instances:    13
-    3 instances:     0
-    4+         :     0
-    (visits never written: 0)
+IMPORTANT FINDING (reported, NOT brute-forced): path_trace.slang is DEAD CODE
+against a FANTASY ABI. It references ParameterBlock<VulkanKernelParams> (wrong name;
+real struct = KernelParamsVulkan) and ~20 fields absent from it (tri_indices,
+vert_co, film_buffer, cam_origin/forward/right/up, cam_sensor_width, cam_focal_length,
+bg_color, tile_*, rng_seed, samples_per_pixel), and calls bvh2_intersect (the
+UNVERIFIED traversal), not traverse(). Making it "compile against the verified
+traversal interface" means REDESIGNING its camera/film/RNG ABI onto the real
+KernelParamsVulkan + push-constant + TraverseHeader + traverse() contract. That is a
+separate DESIGN task. Per the rule "edit to PROGRESS, not to pass a test", I did NOT
+invent fake fields to force it green.
 
-Per-negative effect size = pixels whose (object, prim, t) differ from the
-CLEAN GPU result of the same run (t epsilon 1e-6):
-    neg1 skip instance pop   : 0 / 16384 differ   <- NOT DETECTED
-    neg2 corrupt object_node : 3555 / 16384 differ <- DETECTED
-    neg3 visibility mask 0   : 3555 / 16384 differ <- DETECTED
+DIVERGENCE FROM TASK PROMPT: the prompt asked to ALSO make path_trace.slang compile.
+I delivered the closure port + compile + validate + trivial dispatch (the gate), but
+did NOT touch path_trace.slang, because doing so requires the ABI redesign above.
+Reason given; nothing was faked.
 
-CONCLUSION: we are in CASE (ii). 13 rays DO visit 2 instances, yet the
-fault changes 0 pixels. It is NOT the case that "no ray exercises the pop".
-
-WHY SKIPPING THE RESTORE IS BENIGN HERE (code citations, run-9 traverse.slang)
-------------------------------------------------------------------------------
-The pop block (:445-455) writes back 6 things. Only ONE can ever matter:
-  tmin/tmax (:452-453): DEAD CODE. grep confirms tmin=/tmax= appear ONLY
-      at :452-453 (and the orig_ saves at :230-231). Nothing in the loop
-      ever changes them, so restoring them is always a no-op.
-  dir/idir  (:447-451): DEAD for this scene. dir is only written by the
-      instance push (:416-419). All four itfm are pure TRANSLATIONS
-      (identity rotation - dump-confirmed), so transform_direction leaves
-      dir unchanged -> the restore writes back the same bits.
-  current_object (:454): DEAD at the top level. It is only READ at :336
-      (pobj pick) inside a GEOMETRY leaf. The top level here has ONLY
-      instance leaves (leaves 0-3); the geometry leaves (4-6) live inside
-      the object BVHs. After a pop the next top-level thing is an inner
-      node or an instance leaf, and the instance push (:425) overwrites
-      current_object before any geometry leaf can read it.
-  P         (:446): the ONLY live restore. It matters ONLY IF another
-      top-level node is tested after the pop AND the untranslated P flips
-      that node's AABB verdict (:268-283).
-
-For 12829+3542 = 16371 rays (0 or 1 instance) no node is tested after the
-pop: the object BVH unwinds to the sentinel and the do/while at :465 exits.
-The restore is never observed -> zero effect by construction.
-
-For the 13 two-instance rays a node IS tested after the pop, yet the effect
-is still 0. The reason is scene-specific: obj0 (the CENTRE cube, nearest to
-the camera) has an IDENTITY itfm, so its object space == world space and
-its pop is a bit-exact no-op. obj0 is the nearest child at top-level node 0
-(camera (0,-6,3), obj0 at origin dist 6.7 vs 7.5 for the side cubes), so it
-is always visited FIRST. The 13 two-instance rays therefore enter obj0 first
-(pop = no-op) and then a side cube; when that side cube is popped, the next
-node test happens to miss with the untranslated P too. Measured: 0 pixels.
-
-SO: the fault is structurally unobservable on PURE-TRANSLATION, non-
-OVERLAPPING instances. To make the pop observable the scene needs a
-NON-IDENTITY rotation or scale in some itfm (so dir/idir really change
-during the push) and/or overlapping instances along a ray (so a translated
-instance's pop is followed by a P-sensitive node test). NOT created here.
-
-WHAT I DID, FILE BY FILE
-------------------------
-src/kernel/device/vulkan/traverse.slang (+15/-... )
-  - traverse() gained a final `inout uint instance_visits` parameter. It is
-    inout (not a TraverseHeader field) because the header is ONE struct
-    shared by every thread in the dispatch - a counter there would race.
-    Inout also keeps the count on the early `return ERR_*` paths.
-  - One increment `instance_visits++` in the instance-leaf branch, after
-    both bounds checks (so we count only instances actually entered).
-  - NO traversal logic changed. The restore block and the fault injection
-    are untouched.
-
-src/kernel/device/vulkan/traverse_probe.slang (+13/-...)
-  - ProbePush gained a 4th pointer `uint* visits` (push 24 -> 32 bytes).
-  - traverse_probe_main zeroes a local `inst_visits`, passes it to
-    traverse(), writes it to probe_pc.visits[idx].
-
-src/device/vulkan/kernels.cpp (+94/-...)
-  - TP_PROBE_PUSH_BYTES 24 -> 32; TpProbePush gained `visits`.
-  - TpResources gained visits_buf/visits_mem/visits_map/visits_addr +
-    destructor cleanup; buffer created in step 6 (TP_MAX_PIXELS, no canary
-    zone - informational only).
-  - run_probe gained an optional `std::vector<uint32_t>* visits_out`,
-    fills/dispatches/reads the visits buffer.
-  - Gate run: prints the instance-visit histogram (11b) and snapshots the
-    clean GPU result (11c).
-  - run_negative: prints the per-negative (object,prim,t) diff vs the clean
-    result (informational; does NOT enter `detected`).
-
-VERDICT LOGIC UNTOUCHED: `tp_all_ok`, `tp_cmp_ok`, `main_ok`, `pass`, the
-tolerances, the fault definitions (TEST_MODE_*) and the scene are all
-byte-identical to run 8.
-
-STEP 1c — ENTRYPOINT_SENTINEL CHECK (DONE, no discrepancy)
-----------------------------------------------------------
-The spike comment cites "types.h:17". The real file is the WORKING repo
-(C:\dev\cycles-vulkan holds only spikes/assets, NOT the Cycles tree):
-    src/kernel/bvh/types.h:17   #define ENTRYPOINT_SENTINEL 0x76543210
-This EXACTLY matches traverse.slang:92 (0x76543210). Citation verified.
-Also confirmed types.h:20  #define BVH_STACK_SIZE 192 (matches :93).
-
-FALSE-POSITIVE TRAP (recorded, from run 7)
-------------------------------------------
-In run 7, neg1 printed "bad=0 errors=0 grazing=19" and looked DETECTED.
-It was NOT: 19 was that run's FAILING baseline grazing count (limit 8), so
-the "detection" was the baseline's own noise, not the fault. A negative is
-only meaningful against a CLEAN baseline of the same configuration.
-
-CLEAN-BASELINE RULE (now also in AGENTS.md section 11)
-------------------------------------------------------
-A negative counts as DETECTED only if the fault changes the output relative
-to the CLEAN run of the same configuration. If the baseline itself fails the
-gate, report THAT instead of a verdict - never call a negative detected
-because the number happens to sit above a limit.
+STILL OPEN (suggested next task)
+--------------------------------
+- Design the REAL M4 path-trace dispatch ABI, then rewrite path_trace.slang onto it:
+    * camera: reuse the probe's TraverseHeader cam_l/u/v image-plane model (already
+      proven + CPU-referenced in M4c), NOT path_trace.slang's fantasy sensor model.
+    * film buffer: decide layout (float4 rgb+weight) + how the host allocates/maps it.
+    * traversal: call the VERIFIED traverse() (traverse.slang), not bvh2_intersect.
+    * then bsdf_diffuse.slang plugs in as the shading step after a hit.
+  This is the actual M4 milestone gate (Lambertian sphere, 16 spp, vs Cycles CPU).
+- The ShaderClosure array / ShaderData (and bsdf_diffuse_setup) are DEFERRED; when
+  shader-eval is ported, bsdf_diffuse.slang's DiffuseBsdf head is already the
+  post-cast layout that array will hand in.
+- Instrumentation from M4c (visits buffer + histogram) still in the tree; keep/strip
+  decision still open.
+- Generated artifacts still untracked (recommend git rm --cached or add to
+  .gitignore): abi_probe.spv, traverse_prepare.spv, traverse_probe.spv,
+  m4c_live_kerneldata.bin. New: bsdf_probe.spv is written to the temp dir only.
 
 TRAPS HIT THIS SESSION
 ----------------------
-- The reference repo C:\dev\cycles-vulkan has NO src\ tree; it is spikes +
-  assets. The Cycles kernel headers live in the WORKING repo
-  (src/kernel/bvh/types.h). Read those for source citations.
-- The glob/grep tools errored on the C:\dev\cycles-vulkan path
-  ("Search path does not exist") even though it exists; use shell for it.
-- PowerShell: reading BVH node float4s as [int] after [float] conversion
-  yields NaN for negative leaf addresses. Read the raw int32 bits
-  ([BitConverter]::ToInt32), not float-then-int.
+- slangc emits SPIR-V entry point "main" regardless of the Slang function name; the
+  host must use pName="main" (observed M4b note, kernels.cpp). No extra flag needed.
+- Slang reports sizeof WITHOUT MSVC tail padding; vulkan_data.slang spells pads out
+  explicitly and locks them with host static_asserts. Follow that pattern for any
+  NEW shared struct.
+- PowerShell: `Select-String` pattern with a literal quote needs backtick escaping.
 
-STILL OPEN
-----------
-- The gate is FAIL because neg1 is undetected. This session measured WHY.
-  The next task (yours to choose) is either:
-  (a) accept that this fault is unobservable on pure-translation instances
-      and pick a different M4c negative, or
-  (b) change the scene to make the pop observable (overlapping instances
-      along a ray, at least one ROTATED or SCALED so itfm has a
-      non-identity rotation) - NOT created this session, per the task.
-- Instrumentation (visits buffer + histogram + per-negative diff) is still
-  IN the tree. Decide whether to keep it for M5 or strip it.
-
-UNTRACKED FILES LEFT FOR THE USER TO HANDLE (git)
--------------------------------------------------
-- m4c_gate_run9.txt  (this session's capture - intended to be committed)
-- Generated artifacts previously flagged (recommend `git rm --cached`):
-    abi_probe.spv, traverse_prepare.spv, traverse_probe.spv,
-    m4c_live_kerneldata.bin  (if still tracked)
-Modified (not staged): kernels.cpp, traverse.slang, traverse_probe.slang,
-lastsession.txt. No git state-changing commands were run.
+UNTRACKED / MODIFIED FILES LEFT FOR THE USER (git)
+--------------------------------------------------
+Modified (not staged): kernels.cpp, queue.cpp, lastsession.txt.
+New, intended to commit: src/kernel/device/vulkan/bsdf_diffuse.slang,
+  src/kernel/device/vulkan/bsdf_probe.slang.
+Untracked generated (handle via gitignore/rm --cached): abi_probe.spv,
+  traverse_prepare.spv, traverse_probe.spv, m4c_live_kerneldata.bin.
+No git state-changing commands were run.

@@ -504,6 +504,322 @@ bool vulkan_abi_probe(VulkanDevice *dev)
 }
 
 /* =========================================================================
+ * M4d diffuse-closure probe (optional, env CYCLES_VULKAN_BSDF_PROBE=1)
+ * =========================================================================
+ * Exercises the just-ported Lambertian closure (bsdf_diffuse.slang) on the
+ * GPU with a FIXED hit and FIXED directions, and compares the shader's
+ * arithmetic value-by-value against a CPU reference computed from the same
+ * Cycles formulas. This is the "shade a single hit with a fixed direction"
+ * gate: it checks the BSDF math in isolation. It does NOT traverse the BVH
+ * (traversal is already verified by the M4c traverse probe) and does NOT
+ * change any rendering logic - it is a pure function check.
+ *
+ * The CPU reference reimplements the SAME formulas the shader ports (mapping.h
+ * / projection.h / math_float3.h / bsdf_diffuse.h), so GPU and CPU are the
+ * same algorithm class: any divergence is a real porting bug, not a tolerance
+ * question. Fixed inputs are mirrored exactly from bsdf_probe.slang. */
+
+namespace {
+
+/* Number of float words bsdf_probe.slang writes (see its layout comment). */
+constexpr uint32_t BSDF_PROBE_OUT_WORDS = 15;
+/* BsdfProbePush = one 64-bit device pointer. */
+constexpr uint32_t BSDF_PROBE_PUSH_BYTES = 8;
+
+struct BsdfProbeResources {
+  VkDevice device = VK_NULL_HANDLE;
+  VkShaderModule module = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkBuffer out_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory out_memory = VK_NULL_HANDLE;
+
+  ~BsdfProbeResources()
+  {
+    if (device == VK_NULL_HANDLE) return;
+    if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+    if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+    if (module) vkDestroyShaderModule(device, module, nullptr);
+    if (pool) vkDestroyCommandPool(device, pool, nullptr);
+    if (out_buffer) vkDestroyBuffer(device, out_buffer, nullptr);
+    if (out_memory) vkFreeMemory(device, out_memory, nullptr);
+  }
+};
+
+/* ---- CPU reference: same formulas as bsdf_diffuse.slang ---------------- */
+static const float kM1PI = 0.3183098861837067f;
+static const float kMPI2 = 1.5707963267948966f;
+static const float kMPI4 = 0.7853981633974830f;
+
+struct V3 { float x, y, z; };
+static V3 v3(float x, float y, float z) { return {x, y, z}; }
+static V3 vadd(V3 a, V3 b) { return v3(a.x + b.x, a.y + b.y, a.z + b.z); }
+static V3 vsub(V3 a, V3 b) { return v3(a.x - b.x, a.y - b.y, a.z - b.z); }
+static V3 vscale(V3 a, float s) { return v3(a.x * s, a.y * s, a.z * s); }
+static float vdot(V3 a, V3 b) { return a.x * b.x + a.y * b.y + a.z * b.z; }
+static V3 vcross(V3 a, V3 b)
+{
+  return v3(a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x);
+}
+static V3 vnorm(V3 a)
+{
+  float l = std::sqrt(vdot(a, a));
+  return vscale(a, 1.0f / l);
+}
+
+/* make_orthonormals (math_float3.h:733-759); the #if 0 early-outs are out. */
+static void cpu_make_orthonormals(V3 N, V3 &a, V3 &b)
+{
+  if (N.x != N.y || N.x != N.z)
+    a = v3(N.z - N.y, N.x - N.z, N.y - N.x);
+  else
+    a = v3(N.z - N.y, N.x + N.z, -N.y - N.x);
+  a = vnorm(a);
+  b = vcross(N, a);
+}
+
+/* sample_uniform_disk (mapping.h:21-42). */
+static void cpu_sample_uniform_disk(float rx, float ry, float &ox, float &oy)
+{
+  float a = 2.0f * rx - 1.0f;
+  float b = 2.0f * ry - 1.0f;
+  if (a == 0.0f && b == 0.0f) { ox = 0.0f; oy = 0.0f; return; }
+  float r, phi;
+  if (a * a > b * b) { r = a; phi = kMPI4 * (b / a); }
+  else { r = b; phi = kMPI2 - kMPI4 * (a / b); }
+  ox = r * std::cos(phi);
+  oy = r * std::sin(phi);
+}
+
+/* sample_cos_hemisphere (mapping.h:71-84). */
+static void cpu_sample_cos_hemisphere(V3 N, float rx, float ry, V3 &wo, float &pdf)
+{
+  float dx, dy;
+  cpu_sample_uniform_disk(rx, ry, dx, dy);
+  float len2 = dx * dx + dy * dy;
+  float costheta = std::sqrt(std::max(1.0f - len2, 0.0f));
+  V3 T, B;
+  cpu_make_orthonormals(N, T, B);
+  wo = vadd(vadd(vscale(T, dx), vscale(B, dy)), vscale(N, costheta));
+  pdf = costheta * kM1PI;
+}
+
+} /* namespace */
+
+bool vulkan_bsdf_probe(VulkanDevice *dev)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+  if (getenv("CYCLES_VULKAN_BSDF_PROBE") == nullptr) return true;
+
+  LOG_INFO << "Vulkan: BSDF probe starting (CYCLES_VULKAN_BSDF_PROBE=1).";
+
+  BsdfProbeResources res;
+  const VkDevice vk_dev = dev->vk_device();
+  res.device = vk_dev;
+
+  /* 1. SPIR-V located via env override or repo-relative default. */
+  std::vector<char> spirv;
+  const char *env_path = getenv("CYCLES_VULKAN_BSDF_PROBE_SPV");
+  const char *candidates[2] = {env_path, "bsdf_probe.spv"};
+  const char *found = nullptr;
+  for (const char *c : candidates) {
+    if (c && probe_read_whole_file(c, spirv)) { found = c; break; }
+  }
+  if (!found) {
+    LOG_ERROR << "Vulkan: BSDF probe: cannot find bsdf_probe.spv "
+                 "(compile it with slangc or set CYCLES_VULKAN_BSDF_PROBE_SPV).";
+    return false;
+  }
+  if (spirv.size() % 4 != 0) {
+    LOG_ERROR << "Vulkan: BSDF probe: '" << found << "' is not a valid SPIR-V module.";
+    return false;
+  }
+  LOG_INFO << "Vulkan: BSDF probe: spirv='" << found << "' (" << spirv.size() << " bytes).";
+
+  /* 2. Shader module. */
+  VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = spirv.size();
+  smi.pCode = reinterpret_cast<const uint32_t *>(spirv.data());
+  if (vkCreateShaderModule(vk_dev, &smi, nullptr, &res.module) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: BSDF probe: vkCreateShaderModule failed.";
+    return false;
+  }
+
+  /* 3. Pipeline layout: no descriptor sets; one push-constant range (the
+   *    output buffer device address). */
+  VkPushConstantRange pcr{};
+  pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pcr.offset = 0;
+  pcr.size = BSDF_PROBE_PUSH_BYTES;
+  VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pli.pushConstantRangeCount = 1;
+  pli.pPushConstantRanges = &pcr;
+  if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &res.layout) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: BSDF probe: pipeline layout creation failed.";
+    return false;
+  }
+
+  /* 4. Compute pipeline. slangc emits SPIR-V entry point "main" regardless of
+   *    the Slang function name (observed in the M4b ABI probe; see its note). */
+  VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  cpi.stage.module = res.module;
+  cpi.stage.pName = "main";
+  cpi.layout = res.layout;
+  if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &res.pipeline) !=
+      VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: BSDF probe: compute pipeline creation failed "
+                 "(bad entry point name?).";
+    return false;
+  }
+
+  /* 5. Readback buffer: host-visible + coherent, STORAGE | SHADER_DEVICE_ADDRESS
+   *    (the shader writes through a raw device pointer). */
+  VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bci.size = BSDF_PROBE_OUT_WORDS * sizeof(float);
+  bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (vkCreateBuffer(vk_dev, &bci, nullptr, &res.out_buffer) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: BSDF probe: readback buffer creation failed.";
+    return false;
+  }
+  VkMemoryRequirements reqs;
+  vkGetBufferMemoryRequirements(vk_dev, res.out_buffer, &reqs);
+  VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+  flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+  VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  ai.pNext = &flags_info;
+  ai.allocationSize = reqs.size;
+  ai.memoryTypeIndex = dev->find_memory_type(
+      reqs.memoryTypeBits,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (vkAllocateMemory(vk_dev, &ai, nullptr, &res.out_memory) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: BSDF probe: readback memory allocation failed.";
+    return false;
+  }
+  if (vkBindBufferMemory(vk_dev, res.out_buffer, res.out_memory, 0) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: BSDF probe: readback memory bind failed.";
+    return false;
+  }
+  VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  bai.buffer = res.out_buffer;
+  const uint64_t out_addr = vkGetBufferDeviceAddress(vk_dev, &bai);
+
+  /* 6. Record and submit: our own command pool on the device's queue family. */
+  const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
+  VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  cpci.queueFamilyIndex = family;
+  if (vkCreateCommandPool(vk_dev, &cpci, nullptr, &res.pool) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: BSDF probe: command pool creation failed.";
+    return false;
+  }
+  VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = res.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(vk_dev, &cbai, &cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: BSDF probe: command buffer allocation failed.";
+    return false;
+  }
+  VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  vkBeginCommandBuffer(cmd, &begin_info);
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.pipeline);
+  const uint64_t push_addr = out_addr;
+  vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_addr),
+                     &push_addr);
+  vkCmdDispatch(cmd, 1, 1, 1); /* one workgroup; the shader runs one thread */
+  vkEndCommandBuffer(cmd);
+
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(vk_dev, family, 0, &queue);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VkFence fence = VK_NULL_HANDLE;
+  if (vkCreateFence(vk_dev, &fci, nullptr, &fence) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: BSDF probe: fence creation failed.";
+    return false;
+  }
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd;
+  bool submitted = false;
+  if (vkQueueSubmit(queue, 1, &si, fence) == VK_SUCCESS) {
+    submitted = vkWaitForFences(vk_dev, 1, &fence, VK_TRUE, 10000000000ull) == VK_SUCCESS;
+  }
+  vkDestroyFence(vk_dev, fence, nullptr);
+  if (!submitted) {
+    LOG_ERROR << "Vulkan: BSDF probe: queue submit/wait failed.";
+    return false;
+  }
+
+  /* 7. Read back and compare against the CPU reference. The buffer holds
+   *    float words; the sentinel at [0] is a bit pattern, so reinterpret it. */
+  void *mapped = nullptr;
+  if (vkMapMemory(vk_dev, res.out_memory, 0, bci.size, 0, &mapped) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: BSDF probe: mapping readback buffer failed.";
+    return false;
+  }
+  float out[BSDF_PROBE_OUT_WORDS];
+  memcpy(out, mapped, sizeof(out));
+  vkUnmapMemory(vk_dev, res.out_memory);
+
+  uint32_t sent;
+  memcpy(&sent, &out[0], 4);
+  if (sent != 0xB5DF0001u) {
+    LOG_ERROR << "Vulkan: BSDF probe: sentinel missing (dispatch did not run).";
+    return false;
+  }
+
+  uint32_t mismatches = 0;
+  auto check = [&mismatches](const char *name, float got, float want, float tol) {
+    bool ok = std::fabs(got - want) <= tol;
+    if (!ok) mismatches++;
+    LOG_INFO << "Vulkan: BSDF probe: " << (ok ? "MATCH   " : "MISMATCH") << " " << name
+             << " gpu=" << got << " cpu=" << want;
+  };
+
+  /* CPU reference from the SAME fixed inputs as bsdf_probe.slang. */
+  const V3 N = v3(0.0f, 0.0f, 1.0f);
+  const V3 wo_fixed = vnorm(v3(0.3f, -0.2f, 0.9f));
+  const float r0 = 0.31f, r1 = 0.62f;
+
+  /* bsdf_diffuse_eval: cosNO = max(dot(N,wo),0)/pi. */
+  float cosNO = std::max(vdot(N, wo_fixed), 0.0f) * kM1PI;
+  check("eval.r", out[1], cosNO, 1e-6f);
+  check("eval.g", out[2], cosNO, 1e-6f);
+  check("eval.b", out[3], cosNO, 1e-6f);
+  check("pdf_eval", out[4], cosNO, 1e-6f);
+
+  /* bsdf_diffuse_sample. */
+  V3 wo_s; float pdf_s;
+  cpu_sample_cos_hemisphere(N, r0, r1, wo_s, pdf_s);
+  float eval_s = pdf_s; /* dot(Ng,wo)>0 for N=Ng=+Z and an upper-hemi sample */
+  if (!(vdot(N, wo_s) > 0.0f)) { pdf_s = 0.0f; eval_s = 0.0f; }
+  check("wo.x", out[5], wo_s.x, 1e-5f);
+  check("wo.y", out[6], wo_s.y, 1e-5f);
+  check("wo.z", out[7], wo_s.z, 1e-5f);
+  check("pdf_sample", out[8], pdf_s, 1e-6f);
+  check("eval_s.r", out[9], eval_s, 1e-6f);
+  check("label", out[12], 6.0f /* LABEL_REFLECT|LABEL_DIFFUSE */, 0.0f);
+
+  if (mismatches == 0) {
+    LOG_INFO << "Vulkan: BSDF probe: ALL VALUES MATCH.";
+  }
+  else {
+    LOG_ERROR << "Vulkan: BSDF probe: " << mismatches
+              << " MISMATCH value(s); the ported diffuse closure disagrees with the CPU "
+                 "reference.";
+  }
+  return mismatches == 0;
+}
+
+/* =========================================================================
  * M4c traverse probe (optional, env CYCLES_VULKAN_TRAVERSE_PROBE=1)
  * =========================================================================
  * Traces 64x64 pinhole rays on the GPU through the ported closest-hit
