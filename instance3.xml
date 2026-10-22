@@ -1,0 +1,46 @@
+<cycles>
+    <!-- Camera setup -->
+    <transform translate="0 -6 3">
+        <camera type="perspective" fov="0.8" full_width="800" full_height="600" />
+    </transform>
+
+    <!-- Shared material -->
+    <shader name="grey">
+        <diffuse_bsdf name="grey_bsdf" color="0.8 0.8 0.8" />
+        <connect from="grey_bsdf bsdf" to="output surface" />
+    </shader>
+
+    <!-- 1. Define the shared mesh geometry once -->
+    <mesh name="shared_cube_mesh"
+          P="1 1 1 1 1 -1 1 -1 1 1 -1 -1 -1 1 1 -1 1 -1 -1 -1 1 -1 -1 -1"
+          nverts="3 3 3 3 3 3 3 3 3 3 3 3"
+          verts="0 4 6 0 6 2 3 2 6 3 6 7 7 6 4 7 4 5 5 1 3 5 3 7 1 0 2 1 2 3 5 4 0 5 0 1" />
+
+    <!-- 2. First object referencing the shared mesh.
+         instance3.xml: moved to z = -3.5 so it is NOT coincident with the
+         <mesh> element's own object at the origin. In instance2.xml obj1 sat
+         at the origin on top of that implicit object, and every ray that hit
+         the cube there hit BOTH copies at exactly the same t - the gate
+         counted 220-886 "edge ties" (ref obj 1 vs gpu obj 0, same prim)
+         because which copy wins depends on traversal order. Keeping this
+         translate is what removes the degeneracy; instance2.xml is untouched. -->
+    <transform translate="0 0 -3.5">
+        <state shader="grey">
+            <object name="obj1" mesh="shared_cube_mesh" />
+        </state>
+    </transform>
+
+    <!-- 3. Second object referencing the SAME shared mesh, but with a different transform -->
+    <transform translate="3.5 0.0 0.0">
+        <state shader="grey">
+            <object name="obj2" mesh="shared_cube_mesh" />
+        </state>
+    </transform>
+    
+    <!-- 4. Third object, just to prove it scales to N instances -->
+    <transform translate="-3.5 0.0 0.0">
+        <state shader="grey">
+            <object name="obj3" mesh="shared_cube_mesh" />
+        </state>
+    </transform>
+</cycles>

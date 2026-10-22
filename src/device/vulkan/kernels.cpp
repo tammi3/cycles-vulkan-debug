@@ -1073,11 +1073,25 @@ static TpEdgeProbe tp_probe_edge(const std::vector<TpWorldTri> &tris,
 }
 
 /* ---- comparison (m2c_main.cpp:158-226) -------------------------------- */
+/* Decision 2: a tie is a pixel where the reference and the GPU report the
+ * same distance but a different (object, prim) pair. The breakdown counts
+ * ties per (ref object, gpu object, same prim?) triple, so the report can
+ * NAME the pair that produces them instead of just counting them. Object
+ * indices are a scene detail, so the array is deliberately small: index 0..15
+ * each side, and anything wider is counted in `tie_out_of_range` rather than
+ * being read out of bounds (AGENTS 4: raw indices are never trusted). */
+constexpr uint32_t TP_TIE_OBJS = 16;
 struct TpCmp {
   size_t same = 0, miss = 0, ties = 0, grazing = 0, bad = 0, errors = 0;
   /* Q6: primitive-type disagreements, split by row kind so the report can
    * say which of the two assertions failed. */
   size_t type_bad_hit = 0, type_bad_miss = 0;
+  /* Decision 2 tie breakdown. tie_same[i][j] = ties where the reference said
+   * object i and the GPU said object j with the SAME prim index;
+   * tie_diff[i][j] = same but a DIFFERENT prim index. */
+  size_t tie_same[TP_TIE_OBJS][TP_TIE_OBJS] = {};
+  size_t tie_diff[TP_TIE_OBJS][TP_TIE_OBJS] = {};
+  size_t tie_out_of_range = 0;
   std::vector<size_t> examples;
 };
 
@@ -1119,7 +1133,20 @@ static TpCmp tp_compare(const std::vector<TpHit> &ref,
     }
     else if (!r_miss && !g_miss &&
              std::fabs(g.t - r.t) <= 1e-3f * std::fmax(1.0f, r.t)) {
-      c.ties++; /* different prim, same distance: an edge tie, acceptable */
+      /* different prim, same distance: an edge tie, acceptable.
+       * Decision 2: also tally WHICH pair disagreed, so the report can test
+       * the hypothesis "the ties are the two coincident objects". */
+      c.ties++;
+      if (r.object >= 0 && g.object >= 0 && r.object < (int32_t)TP_TIE_OBJS &&
+          g.object < (int32_t)TP_TIE_OBJS) {
+        if (r.prim == g.prim)
+          c.tie_same[r.object][g.object]++;
+        else
+          c.tie_diff[r.object][g.object]++;
+      }
+      else {
+        c.tie_out_of_range++;
+      }
     }
     else {
       disagree = true;
@@ -1212,6 +1239,29 @@ static void tp_print_cmp(const char *title, const TpCmp &c, size_t n, uint32_t w
     LOG_INFO << "Vulkan: traverse probe:   example pixel (" << (i % w)
              << "," << (i / w) << ")";
   }
+}
+
+/* Decision 2: report WHERE the ties come from. Prints one line per
+ * non-empty (ref object, gpu object) pair, split by same/different prim. */
+static void tp_print_tie_breakdown(const TpCmp &c, const char *label)
+{
+  LOG_INFO << "Vulkan: traverse probe: tie breakdown (" << label << "): "
+           << c.ties << " ties";
+  for (uint32_t r = 0; r < TP_TIE_OBJS; r++) {
+    for (uint32_t g = 0; g < TP_TIE_OBJS; g++) {
+      const size_t same = c.tie_same[r][g];
+      const size_t diff = c.tie_diff[r][g];
+      if (same == 0 && diff == 0)
+        continue;
+      LOG_INFO << string_printf(
+          "Vulkan: traverse probe:   ref obj %u vs gpu obj %u: %zu ties "
+          "(%zu same prim, %zu different prim)",
+          r, g, same + diff, same, diff);
+    }
+  }
+  if (c.tie_out_of_range)
+    LOG_INFO << "Vulkan: traverse probe:   ties with an object index outside "
+             << (TP_TIE_OBJS - 1) << ": " << c.tie_out_of_range;
 }
 
 /* ---- Vulkan resources (RAII, pattern: AbiProbeResources above) -------- */
@@ -1398,33 +1448,60 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
   const uint32_t fnv_nodes = tp_fnv1a(dump.bvh_nodes.data(), dump.node_count * 16);
   const uint32_t fnv_verts = tp_fnv1a(dump.tri_verts.data(), dump.vert_count * 12);
 
-  /* 3. Reference world triangles + camera + the two CPU references. */
+  /* 3. Reference world triangles + camera + the CPU references.
+   *
+   * DECISION 1: the GATE camera is the yawed one (128x128, 7 degrees about
+   * the vertical axis). The un-yawed 64x64 camera is kept but is now only an
+   * INFORMATIONAL run: with the camera aimed straight down a cube's edges,
+   * every silhouette pixel puts the ray exactly on a triangle edge, so the
+   * two triangle tests legitimately disagree there (run 7: 19 grazing,
+   * bad=0; the yawed run: 0 grazing, bad=0). A gate should not sit on a
+   * degenerate configuration, so the verdict moved to the yawed run. */
   std::vector<TpWorldTri> world_tris;
   if (!tp_build_world_tris(dump, world_tris, err))
     return fail(err.c_str());
-  TpCam cam;
-  tp_build_camera(cam, 0.0); /* 0 yaw = the 64x64 gate camera */
+  TpCam cam;             /* informational only (decision 1) */
+  TpCam cam_gate;        /* the verdict camera */
+  tp_build_camera(cam, 0.0);
+  tp_build_camera(cam_gate, TP_D3_YAW_DEG);
   const float fov_deg = (float)(2.0 * std::atan(TP_PLANE_HALF) * 180.0 / 3.14159265358979323846);
   LOG_INFO << string_printf(
-      "Vulkan: traverse probe: camera origin (%.9g, %.9g, %.9g), plane half-extent %.9g at depth 1, FOV %.4f deg",
-      cam.o[0], cam.o[1], cam.o[2], TP_PLANE_HALF, fov_deg);
+      "Vulkan: traverse probe: GATE camera: origin (%.9g, %.9g, %.9g), yaw %.4g deg, "
+      "128x128 rays, plane half-extent %.9g at depth 1, FOV %.4f deg",
+      cam_gate.o[0], cam_gate.o[1], cam_gate.o[2], TP_D3_YAW_DEG, TP_PLANE_HALF,
+      fov_deg);
   LOG_INFO << string_printf(
       "Vulkan: traverse probe:   plane lower-left (%.9g, %.9g, %.9g), width vec (%.9g, %.9g, %.9g), height vec (%.9g, %.9g, %.9g)",
-      cam.l[0], cam.l[1], cam.l[2], cam.u[0], cam.u[1], cam.u[2], cam.v[0],
-      cam.v[1], cam.v[2]);
+      cam_gate.l[0], cam_gate.l[1], cam_gate.l[2], cam_gate.u[0], cam_gate.u[1],
+      cam_gate.u[2], cam_gate.v[0], cam_gate.v[1], cam_gate.v[2]);
+  LOG_INFO << string_printf(
+      "Vulkan: traverse probe: INFO ONLY: aligned 64x64 camera kept as a "
+      "degenerate-config run (origin %.9g, %.9g, %.9g, no yaw)",
+      cam.o[0], cam.o[1], cam.o[2]);
 
-  /* Two CPU references over the very same rays:
-   *  ref    - watertight Pluecker, the SAME test the GPU runs: the D1 verdict
-   *           reference;
-   *  ref_mt - Moller-Trumbore: D2 says informational only, never verdict. */
-  std::vector<TpHit> ref(TP_PIXELS), ref_mt(TP_PIXELS);
+  /* Gate references over the yawed 128x128 grid:
+   *  ref_gate    - watertight Pluecker, the SAME test the GPU runs: the D1
+   *                verdict reference;
+   *  ref_gate_mt - Moller-Trumbore: D2 says informational only, never verdict.
+   * ref_aligned  - Pluecker over the un-yawed 64x64 grid, informational only. */
+  std::vector<TpHit> ref_gate((size_t)TP_MAX_PIXELS);
+  std::vector<TpHit> ref_gate_mt((size_t)TP_MAX_PIXELS);
+  for (uint32_t y = 0; y < TP_MAX_HEIGHT; y++) {
+    for (uint32_t x = 0; x < TP_MAX_WIDTH; x++) {
+      float d[3];
+      tp_pixel_dir(cam_gate, x, y, TP_MAX_WIDTH, TP_MAX_HEIGHT, d);
+      const size_t i = (size_t)y * TP_MAX_WIDTH + x;
+      ref_gate[i] = tp_trace_cpu_plucker(world_tris, cam_gate.o, d);
+      ref_gate_mt[i] = tp_trace_cpu(world_tris, cam_gate.o, d);
+    }
+  }
+  std::vector<TpHit> ref_aligned(TP_PIXELS);
   for (uint32_t y = 0; y < TP_HEIGHT; y++) {
     for (uint32_t x = 0; x < TP_WIDTH; x++) {
       float d[3];
       tp_pixel_dir(cam, x, y, TP_WIDTH, TP_HEIGHT, d);
-      const size_t i = (size_t)y * TP_WIDTH + x;
-      ref[i] = tp_trace_cpu_plucker(world_tris, cam.o, d);
-      ref_mt[i] = tp_trace_cpu(world_tris, cam.o, d);
+      ref_aligned[(size_t)y * TP_WIDTH + x] =
+          tp_trace_cpu_plucker(world_tris, cam.o, d);
     }
   }
 
@@ -1705,17 +1782,18 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
     return true;
   };
 
-  /* 11. Main run: visibility 0xFFFFFFFF, no faults (Q5). 64x64 rays, the
-   *    camera as proposed in Q4. */
+  /* 11. GATE run: visibility 0xFFFFFFFF, no faults (Q5), 128x128 rays from
+   *    the YAWED camera (decision 1). */
   TpCmp main_cmp;
   size_t unwritten = 0, err_pixels = 0;
   bool canaries_ok = false;
-  if (!run_probe(0xFFFFFFFFu, 0, TP_WIDTH, TP_HEIGHT, cam, ref, main_cmp,
-                 unwritten, err_pixels, canaries_ok, /*details=*/true))
+  if (!run_probe(0xFFFFFFFFu, 0, TP_MAX_WIDTH, TP_MAX_HEIGHT, cam_gate, ref_gate,
+                 main_cmp, unwritten, err_pixels, canaries_ok, /*details=*/true))
     return fail("ray dispatch failed");
-  tp_print_cmp("D1 verdict: watertight Pluecker reference (same test as the "
-               "GPU) vs GPU (ported traversal)",
-               main_cmp, TP_PIXELS, TP_WIDTH);
+  tp_print_cmp("D1 verdict (GATE, 128x128 yawed camera): watertight Pluecker "
+               "reference (same test as the GPU) vs GPU (ported traversal)",
+               main_cmp, TP_MAX_PIXELS, TP_MAX_WIDTH);
+  tp_print_tie_breakdown(main_cmp, "gate run");
   LOG_INFO << "Vulkan: traverse probe: canaries: "
            << (canaries_ok ? "INTACT" : "OVERWRITTEN !!!")
            << ", pixels never written: " << unwritten
@@ -1725,28 +1803,32 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
    * different algorithm class from the port, so it never enters the verdict;
    * its `bad` count must stay 0, because a non-zero `bad` would mean the two
    * triangle tests disagree somewhere that is not near an edge. The output
-   * buffer still holds the main run's result (the negatives below overwrite
-   * it), so the MT comparison is read straight out of the mapped buffers. */
+   * buffer still holds the gate run's result (the aligned run and the
+   * negatives below overwrite it), so the MT comparison is read straight out
+   * of the mapped buffers. */
   {
-    std::vector<TpIntersection> gpu(TP_PIXELS);
-    std::vector<int32_t> status(TP_PIXELS);
-    memcpy(gpu.data(), res.out_map, (size_t)TP_PIXELS * sizeof(TpIntersection));
-    memcpy(status.data(), res.status_map, (size_t)TP_PIXELS * sizeof(int32_t));
-    const TpCmp mt = tp_compare(ref_mt, gpu, status, world_tris, cam,
-                                /*details=*/false, TP_WIDTH, TP_HEIGHT);
+    std::vector<TpIntersection> gpu((size_t)TP_MAX_PIXELS);
+    std::vector<int32_t> status((size_t)TP_MAX_PIXELS);
+    memcpy(gpu.data(), res.out_map,
+           (size_t)TP_MAX_PIXELS * sizeof(TpIntersection));
+    memcpy(status.data(), res.status_map,
+           (size_t)TP_MAX_PIXELS * sizeof(int32_t));
+    const TpCmp mt = tp_compare(ref_gate_mt, gpu, status, world_tris, cam_gate,
+                                /*details=*/false, TP_MAX_WIDTH, TP_MAX_HEIGHT);
     LOG_INFO << string_printf(
         "Vulkan: traverse probe: INFO ONLY (D2, not part of the verdict) "
-        "Moller-Trumbore vs GPU: same=%zu grazing=%zu bad=%zu errors=%zu",
+        "Moller-Trumbore vs GPU (gate rays): same=%zu grazing=%zu bad=%zu errors=%zu",
         mt.same, mt.grazing, mt.bad, mt.errors);
   }
 
   /* Per-cube hit counts (gate requirement): GPU hits grouped by object,
-   * labelled with each object's world-space x centre. */
+   * labelled with each object's world-space x centre. Reads the GATE run's
+   * output still sitting in the mapped buffer. */
   {
     std::vector<size_t> hits((size_t)dump.object_count, 0);
     const TpIntersection *gpu = (const TpIntersection *)res.out_map;
     const int32_t *status = (const int32_t *)res.status_map;
-    for (size_t i = 0; i < TP_PIXELS; i++) {
+    for (size_t i = 0; i < TP_MAX_PIXELS; i++) {
       if (status[i] == 0 && gpu[i].prim >= 0 && gpu[i].object >= 0 &&
           (uint32_t)gpu[i].object < dump.object_count)
         hits[(size_t)gpu[i].object]++;
@@ -1775,8 +1857,8 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
     TpCmp c;
     size_t uw = 0, ep = 0;
     bool ck = false;
-    if (!run_probe(visibility, test_mode, TP_WIDTH, TP_HEIGHT, cam, ref, c,
-                   uw, ep, ck, /*details=*/false)) {
+    if (!run_probe(visibility, test_mode, TP_MAX_WIDTH, TP_MAX_HEIGHT, cam_gate,
+                   ref_gate, c, uw, ep, ck, /*details=*/false)) {
       LOG_ERROR << "Vulkan: traverse probe: NEGATIVE TEST " << label
                 << ": dispatch failed";
       return false;
@@ -1784,7 +1866,7 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
     /* tp_all_ok = the unchanged tolerances (tp_cmp_ok) + the Q6 type
      * assertion, so a fault that only shows up as a wrong primitive type
      * still counts as detected. */
-    const bool detected = !tp_all_ok(c, TP_PIXELS);
+    const bool detected = !tp_all_ok(c, TP_MAX_PIXELS);
     LOG_INFO << string_printf(
         "Vulkan: traverse probe: NEGATIVE TEST %-28s: %s (bad=%zu errors=%zu "
         "grazing=%zu type=%zu/%zu)",
@@ -1796,50 +1878,41 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
   const bool neg2 = run_negative("2 corrupt object_node", 0xFFFFFFFFu, 2u /*TEST_MODE_CORRUPT_OBJECT_NODE*/);
   const bool neg3 = run_negative("3 visibility mask 0", 0u, 0u);
 
-  /* 12b. D3: ONE extra INFORMATIONAL run - same origin, camera yawed 7
-   *    degrees about the vertical axis, 128x128 rays, same plane half-extent
-   *    (0.8). Reported as same/grazing/bad/errors and NOT part of the
-   *    verdict. Per D3, if grazing exceeds max(8, n/50000) here it is
-   *    reported and nothing is changed. */
-  TpCmp d3_cmp;
-  bool d3_infra_ok = false;
+  /* 12b. INFORMATIONAL ONLY (decision 1): the un-yawed 64x64 run, kept
+   *    because it is the configuration that EXPOSED the degeneracy. It is a
+   *    known degenerate: the camera looks straight down the cube edges, so
+   *    the silhouette rays lie exactly on triangle edges and the two triangle
+   *    tests legitimately disagree there. Never part of the verdict. */
+  TpCmp aligned_cmp;
   {
-    TpCam cam3;
-    tp_build_camera(cam3, TP_D3_YAW_DEG);
-    std::vector<TpHit> ref3((size_t)TP_MAX_PIXELS);
-    for (uint32_t y = 0; y < TP_MAX_HEIGHT; y++) {
-      for (uint32_t x = 0; x < TP_MAX_WIDTH; x++) {
-        float d[3];
-        tp_pixel_dir(cam3, x, y, TP_MAX_WIDTH, TP_MAX_HEIGHT, d);
-        ref3[(size_t)y * TP_MAX_WIDTH + x] =
-            tp_trace_cpu_plucker(world_tris, cam3.o, d);
-      }
-    }
-    size_t uw3 = 0, ep3 = 0;
-    bool ck3 = false;
-    d3_infra_ok = run_probe(0xFFFFFFFFu, 0, TP_MAX_WIDTH, TP_MAX_HEIGHT, cam3,
-                            ref3, d3_cmp, uw3, ep3, ck3, /*details=*/false);
-    if (d3_infra_ok)
-      d3_infra_ok = (uw3 == 0 && ep3 == 0 && ck3);
-    tp_print_cmp("D3 INFORMATIONAL ONLY (128x128, camera yawed 7 deg) - not "
-                 "part of the verdict: Pluecker reference vs GPU",
-                 d3_cmp, TP_MAX_PIXELS, TP_MAX_WIDTH);
-    const size_t d3_limit = std::max<size_t>(8, (size_t)TP_MAX_PIXELS / 50000);
-    if (d3_infra_ok && d3_cmp.grazing > d3_limit)
-      LOG_WARNING << "Vulkan: traverse probe: D3 grazing " << d3_cmp.grazing
-                  << " exceeds the " << d3_limit
-                  << " limit - REPORTED PER D3, no code or tolerance changed";
-    else if (!d3_infra_ok)
-      LOG_ERROR << "Vulkan: traverse probe: D3 run did not complete cleanly";
+    size_t uw2 = 0, ep2 = 0;
+    bool ck2 = false;
+    const bool ok = run_probe(0xFFFFFFFFu, 0, TP_WIDTH, TP_HEIGHT, cam,
+                              ref_aligned, aligned_cmp, uw2, ep2, ck2,
+                              /*details=*/false);
+    tp_print_cmp("INFO ONLY, KNOWN DEGENERATE (rays lie on cube edges): "
+                 "un-yawed 64x64 run, Pluecker reference vs GPU",
+                 aligned_cmp, TP_PIXELS, TP_WIDTH);
+    tp_print_tie_breakdown(aligned_cmp, "aligned 64x64 run");
+    if (!ok || uw2 != 0 || ep2 != 0 || !ck2)
+      LOG_ERROR << "Vulkan: traverse probe: aligned run did not complete cleanly";
   }
 
-  /* 13. Verdict: main run (Pluecker reference) + the three negatives only.
-   *    D3 and the Moller-Trumbore line are informational and never decide it. */
-  const bool main_ok = tp_all_ok(main_cmp, TP_PIXELS) && canaries_ok &&
+  /* 13. Verdict: the GATE run (128x128 yawed, Pluecker reference) + the three
+   *    negatives only. The aligned 64x64 run and the Moller-Trumbore line are
+   *    informational and never decide it.
+   *    The tie count is reported and, per decision 3, ties above the same
+   *    max(8, n/50000) limit mean STOP and report the breakdown. */
+  const bool main_ok = tp_all_ok(main_cmp, TP_MAX_PIXELS) && canaries_ok &&
                        unwritten == 0 && err_pixels == 0;
-  const bool pass = main_ok && neg1 && neg2 && neg3 && infra_ok && d3_infra_ok;
+  const size_t ties_limit = std::max<size_t>(8, (size_t)TP_MAX_PIXELS / 50000);
+  if (main_cmp.ties > ties_limit)
+    LOG_WARNING << "Vulkan: traverse probe: TIES " << main_cmp.ties
+                << " exceed the " << ties_limit
+                << " limit - STOP AND REPORT THE BREAKDOWN (decision 3)";
+  const bool pass = main_ok && neg1 && neg2 && neg3 && infra_ok;
   LOG_INFO << "Vulkan: traverse probe: "
-           << (pass ? "PASS - main run matches the reference, all three faults detected"
+           << (pass ? "PASS - gate run matches the reference, all three faults detected"
                     : "FAIL - see the numbers above");
   return pass;
 }
