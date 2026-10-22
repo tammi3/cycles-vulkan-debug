@@ -1,3 +1,105 @@
+M4c SCENE-CHANGE SESSION (run 10) — 2026-10-22
+==============================================
+STATUS: COMPLETE. GATE PASS on instance4.xml — baseline clean AND all three
+negatives DETECTED. Fixed by a SCENE change only (new instance4.xml). No fault
+definition, verdict logic, tolerance, camera or shader was touched.
+kernels.cpp was NOT edited (the gate scene is selected by the command line +
+CYCLES_VULKAN_TRAVERSE_DUMP_DIR, not by source).
+
+WHAT I DID, FILE BY FILE (run 10)
+---------------------------------
+instance4.xml  (NEW — the deliverable). Copy of instance3.xml, changed so the
+  skipped instance-pop becomes observable:
+  - obj1 = NEAR instance, ROTATED 45 deg about the vertical axis, at (0,-3,1.5).
+    Syntax cited from src/app/cycles_xml.cpp:613-636 — on one <transform>
+    element xml_read_transform folds translate first (:625) then rotate
+    (:630), so object-to-world = T*R (rotate cube about its own centre, then
+    translate). `rotate="45 0 1 0"` = 45 deg about Y: rotate.x is the angle
+    in degrees, rotate.yzw is the axis (:627-630).
+  - obj0 = the bare <mesh>'s implicit object, kept at the ORIGIN as the FAR
+    instance. camera (0,-6,3) -> obj1 (0,-3,1.5) -> origin are collinear
+    (both segments are the vector (0,3,-1.5)); obj1 is exactly halfway.
+  - obj2/obj3 unchanged side cubes (x = +/-3.5). No two objects coincident.
+  - Resulting itfm: obj1 has a real rotation (itfm_x=(0.7071,0,-0.7071,1.0607),
+    itfm_z=(0.7071,0,0.7071,-1.0607) = -45 deg about Y); obj0 identity;
+    obj2/obj3 pure translations. Rotated AABB half-extent sqrt(2)=1.414 > cube
+    1, so rays enter the box and can miss the cube -> they pop and then test
+    the next top-level AABB with a WRONG (rotated) ray when the fault is on.
+lastsession.txt  (this file).
+m4c_gate_run10.txt  (NEW capture, official gated run with the layer).
+Sidecar regenerated with cycles_bvh_dump to
+  %LOCALAPPDATA%\Temp\opencode\m4c_dump4  (not the repo root; exit 0,
+  4 objects, 20 nodes, 7 leaves, BVH root 0).
+
+STEP 2 — PRECONDITION (PASSED first try, no adjustment needed)
+-------------------------------------------------------------
+instance-visit histogram (gate camera, 16384 rays):
+    0=7676  1=7736  2=972  3=0  4+=0   (visits never written: 0)
+    -> 972 rays visit 2+ instances. Target was >=200. PASSED.
+
+STEP 3 — OFFICIAL GATE on instance4.xml, VK_LOADER_DEBUG=layer
+--------------------------------------------------------------
+Capture: m4c_gate_run10.txt (86232 bytes, exit 0).
+Layer proof: 252 loader lines; "env var 'VK_INSTANCE_LAYERS' defined and
+  adding layers VK_LAYER_KHRONOS_validation" + "Insert instance layer
+  VK_LAYER_KHRONOS_validation" both present. VUID/validation errors: 0.
+BASELINE (clean): both missed 11003, same (object,prim) same t 5381,
+  edge ties 0, edge-grazing 0, MISMATCHES 0, shader error codes 0,
+  type mismatches 0/0, canaries INTACT, never-written 0, error pixels 0.
+  => CLEAN (ties 0 <= 8, grazing 0, no mismatch, no error).
+Per-cube hit pixels: obj0 0, obj1 3843, obj2 768, obj3 770.
+  (obj0 0 hits = fully occluded by the rotated obj1 from this camera; the
+   972 two-visit rays are miss-rays that traverse BOTH AABBs. Not a problem.)
+NEGATIVES (effect size = pixels whose (object,prim,t) differ from the clean
+  GPU result of the same run):
+    neg1 skip instance pop   : DETECTED, bad=972, effect 3193/16384
+    neg2 corrupt object_node : DETECTED, errors=8708, effect 8708/16384
+    neg3 visibility mask 0   : DETECTED, bad=5380 grazing=1, effect 5381/16384
+  -> All 3 DETECTED + baseline clean = GATE PASS. Final line of the capture:
+     "PASS - gate run matches the reference, all three faults detected".
+KEY MECHANISM CONFIRMED: neg1 bad=972 EXACTLY equals the histogram's
+  two-visit count 972 — the fault now changes precisely the rays that
+  exercise the pop, and none of the others. (Run 9 neg1 effect was 0.)
+
+STEP 3b — instance3.xml INFORMATIONAL REGRESSION (matches run 9 exactly)
+-----------------------------------------------------------------------
+  both missed 12829, same 3555, ties 0, grazing 0, mismatches 0, errors 0,
+  histogram 0=12829 1=3542 2=13, neg1 still NOT DETECTED.
+  => Identical to run 9. Proves the fix came from the SCENE change alone.
+
+TRAPS HIT THIS SESSION
+----------------------
+- tools/run_bvh_dump.sh does NOT exist in this repo; call
+  build\bin\Release\cycles_bvh_dump.exe <scene.xml> <out_dir> directly, and
+  the out_dir must PRE-EXIST (else exit 1).
+- PowerShell: array subtraction fails on Object[] (use scalar math); format
+  strings need ${i} before ':'. PS arithmetic errors are cosmetic noise, not
+  gate failures — read the numbers by inspection.
+
+STILL OPEN
+----------
+- Instrumentation (visits buffer + histogram + per-negative diff) is still IN
+  the tree. Task said do NOT strip it yet. Next task decides keep/strip.
+- The "INFO ONLY (run 9)" label inside kernels.cpp is a stale cosmetic string
+  from run 9 (this run printed it for run 10). Left untouched: kernels.cpp is
+  editable only for scene selection, which was not needed.
+- Generated artifacts still TRACKED (recommend `git rm --cached`):
+    abi_probe.spv, traverse_prepare.spv, traverse_probe.spv,
+    m4c_live_kerneldata.bin
+- Suggested next task: strip or keep the run-9 instrumentation, then move on
+  (M4 sphere gate / M5) — the M4c traversal probe gate now passes.
+
+UNTRACKED FILES LEFT FOR THE USER (git)
+---------------------------------------
+- instance4.xml        (new gate scene — the deliverable, intended to commit)
+- m4c_gate_run10.txt   (official capture — intended to commit)
+Modified (not staged): lastsession.txt only. No git state-changing commands
+were run this session.
+
+==================================================
+BELOW: run 9 (measurement) summary, kept as history.
+==================================================
+
 M4c INSTRUMENTATION SESSION (run 9) — 2026-10-22
 =================================================
 

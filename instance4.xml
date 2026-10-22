@@ -1,0 +1,90 @@
+<cycles>
+    <!-- =====================================================================
+         instance4.xml — M4c run 10. Copy of instance3.xml, changed so that
+         NEGATIVE TEST 1 (skip instance pop) becomes OBSERVABLE.
+
+         WHY instance3.xml could not detect it (run 9, measured):
+           - The pop restore only changes the result if, after popping an
+             instance, the traversal tests ANOTHER top-level node with the
+             restored ray.
+           - In instance3 all four objects had PURE-TRANSLATION itfm, so
+             `dir`/`idir` never changed during the instance push -> skipping
+             the dir restore was a no-op. Only P could matter, and P only
+             mattered when a second instance was tested after the pop.
+           - The nearest cube (obj0 at the origin) had an IDENTITY itfm, so
+             its own pop was a bit-expect no-op. Only 13 of 16384 rays ever
+             visited 2 instances, and none of those pops was observable.
+
+         THE FIX (scene only, no fault/logic/tolerance/camera change):
+           1. obj1 is now the NEAR instance and is ROTATED 45 degrees about
+              the vertical axis. A rotation gives itfm a non-identity
+              rotation, so entering obj1 genuinely changes P, dir and idir.
+              Its bounding box (half-extent sqrt(2) ~= 1.414 in X/Z) is now
+              LARGER than the cube, so a ray can enter the box and MISS the
+              cube.
+           2. obj0 (the bare <mesh>'s implicit object) stays at the ORIGIN,
+              which lies EXACTLY behind obj1 along the camera line of sight
+              (camera (0,-6,3) -> obj1 (0,-3,1.5) -> obj0 (0,0,0) are
+              collinear). A ray that enters obj1's box, misses the cube,
+              pops, and then tests obj0's box is a 2-visit ray — and because
+              obj1 is ROTATED, skipping the pop leaves a rotated ray for
+              obj0's AABB test, which is exactly what the fault must corrupt.
+           3. obj2/obj3 stay as the side cubes from instance3 (x = +/-3.5);
+              they add BVH depth and are kept unchanged so the tie count
+              stays 0 as in instance3.
+         No two objects are coincident: obj1 (0,-3,1.5), obj0 (0,0,0),
+         obj2 (3.5,0,0), obj3 (-3.5,0,0). VERDICT camera is NOT this XML
+         camera — the probe uses its own fixed yawed 128x128 gate camera.
+         ===================================================================== -->
+
+    <!-- Camera setup (identical to instance3.xml; informational only — the
+         M4c gate camera lives in kernels.cpp, not here). -->
+    <transform translate="0 -6 3">
+        <camera type="perspective" fov="0.8" full_width="800" full_height="600" />
+    </transform>
+
+    <!-- Shared material -->
+    <shader name="grey">
+        <diffuse_bsdf name="grey_bsdf" color="0.8 0.8 0.8" />
+        <connect from="grey_bsdf bsdf" to="output surface" />
+    </shader>
+
+    <!-- 1. Define the shared mesh geometry once. A bare <mesh> ALSO creates
+         an implicit object (obj0) at the CURRENT transform, which here is
+         the identity — so obj0 sits at the ORIGIN. We keep that and use obj0
+         as the FAR instance (see the header). -->
+    <mesh name="shared_cube_mesh"
+          P="1 1 1 1 1 -1 1 -1 1 1 -1 -1 -1 1 1 -1 1 -1 -1 -1 1 -1 -1 -1"
+          nverts="3 3 3 3 3 3 3 3 3 3 3 3"
+          verts="0 4 6 0 6 2 3 2 6 3 6 7 7 6 4 7 4 5 5 1 3 5 3 7 1 0 2 1 2 3 5 4 0 5 0 1" />
+
+    <!-- 2. obj1 = the NEAR, ROTATED instance (the run-10 fix).
+         Attribute order does not matter: xml_read_transform always folds
+         translate first (cycles_xml.cpp:625) then rotate (:630), giving
+         object-to-world = T * R — rotate the cube 45 deg about Y about its
+         own centre, then translate it to (0,-3,1.5).
+           rotate="45 0 1 0"  ->  angle 45 deg, axis (0,1,0) = vertical
+                                 (cycles_xml.cpp:627-630: rotate.x is the
+                                  angle in degrees, rotate.yzw is the axis)
+           translate="0 -3 1.5" -> halfway from the camera (0,-6,3) to the
+                                 origin along the line of sight. -->
+    <transform translate="0 -3 1.5" rotate="45 0 1 0">
+        <state shader="grey">
+            <object name="obj1" mesh="shared_cube_mesh" />
+        </state>
+    </transform>
+
+    <!-- 3. obj2 — unchanged side cube (adds BVH depth). -->
+    <transform translate="3.5 0.0 0.0">
+        <state shader="grey">
+            <object name="obj2" mesh="shared_cube_mesh" />
+        </state>
+    </transform>
+
+    <!-- 4. obj3 — unchanged side cube (adds BVH depth). -->
+    <transform translate="-3.5 0.0 0.0">
+        <state shader="grey">
+            <object name="obj3" mesh="shared_cube_mesh" />
+        </state>
+    </transform>
+</cycles>
