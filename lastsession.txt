@@ -1,68 +1,84 @@
-M4e SESSION (PLAN + Part 1) — 2026-10-22
-========================================
-STATUS: Part 0 done (M4c confirmed PASSING). Part 1 done + PASSING (real-Cycles
-header reference added, all values match). Part 2 = design report delivered in
-chat only, NO CODE (path_trace.slang left untouched). Stopping for approval per
-task. No git commands run; no frozen harness/tolerance/reference changes.
+M4e SESSION (STEP 1 kickoff: research + decisions COMPLETE, CODE NOT STARTED) — 2026-10-22
+==========================================================================================
+STATUS: M4e STEP 1 approved by user. This session completed the RESEARCH and DECISION
+answers (all "no code" deliverables, fully cited) and read ALL source needed for the port.
+NO STEP-1 code was written. Reason: context budget — the implementation (Slang port of
+~12 functions + sobol table, VulkanQueue::enqueue pipeline, gate probe allocating
+IntegratorStateGPU with Cycles' own sizing, per-pixel host reference, 3 negative tests)
+is ~2000+ lines with many compile iterations and does not fit the remaining context
+without risking a broken half-written state. Reported to user with a proposed 3-way split.
+No git commands run; no frozen harness/tolerance/reference changes; path_trace.slang
+untouched.
 
-PART 0 — M4c final status (traverse gate):
-  M4c PASSES on instance4.xml (run 10). Baseline clean (both missed=11003, same=5381,
-  ties=0, grazing=0, mismatches=0, errors=0, type 0/0). Histogram 0=7676 1=7736 2=972.
-  neg1 DETECTED (bad=972 = exactly the 972 two-visit rays, effect 3193/16384),
-  neg2 DETECTED (errors=8708), neg3 DETECTED (bad=5380, effect 5381). instance3
-  regression matched run 9 exactly. Layer proven (252 loader lines), VUID 0.
-  HOW neg1 WAS RESOLVED: by a SCENE change only — new instance4.xml with a
-  45-degree-rotated near instance (obj1 at 0,-3,1.5); origin obj0 = far instance,
-  collinear behind it. Fault definitions, verdict logic, tolerances and camera all
-  untouched. NOT a fault redesign.
-  Frozen files edited since run 8: NONE that stayed frozen. Run 9 added instrumentation
-  to traverse.slang (+15), traverse_probe.slang (+13), kernels.cpp (+94) — those files
-  were EDITABLE for the M4c measurement task, and run 10 changed only the scene. The
-  only truly frozen items (device.cpp, device_impl.h, params.h, harness, tolerances,
-  reference images, instance2/3.xml) were NOT edited.
+DECISIONS (answered for the report, from tree citations):
+  1. ENV-LIGHT-ONLY scene: NO Cycles logic change needed. Constant-colour world ->
+     not spatially varying -> no NEE/MIS. Cites: shader_graph.h:196-199 +
+     shader_nodes.h:1173-1184 (ColorNode does not override has_spatial_varying);
+     light.cpp:548 (light->is_enabled = has_portal || (use_mis && spatial_varying) = FALSE);
+     light.cpp:556 (background MIS disabled); light.cpp:1229-1235 (device_update_background
+     early-out, use_mis = portal_weight>0 = false); light.cpp:1091 + :727 (no emitters ->
+     use_direct_light=false); light.h:177-180 (BackgroundLight::is_traceable()=false ->
+     use_light_mis false); intersect_closest.h:424 (lights_intersect skipped);
+     shade_surface.h:325 (kernel NEE short-circuit); light/sample.h:582-584 (bg MIS weight=1).
+     Constraints for the gate scene: (a) background graph contains NO spatially-varying node,
+     (b) NO portal lights. Constant-colour background may bypass SVM via SD_HAS_CONSTANT_EMISSION
+     (shade_background.h:57-60, surface_shader.h:1169-1187).
+  2. SORTING CANNOT be skipped for M4. kernel_uses_sorting(k) true iff SHADE_SURFACE or
+     SHADE_SURFACE_RAYTRACE (path_trace_work_gpu.cpp:1308-1312); sort branch runs
+     unconditionally for those (:529-535). No use_sorting flag. Vulkan does NOT override
+     supports_local_atomic_sort() (base queue.h:120-123 -> false), so the reachable variant
+     is PREFIX_SUM + SORTED_PATHS_ARRAY (path_trace_work_gpu.cpp:618,647,672), NOT bucket/write.
+  3. FINAL GATE = per-pixel vs Cycles CPU (same sobol_burley seeds). Assistant PROPOSED
+     tolerance/metric (NOT chosen silently) — see report. User decides.
 
-PART 1 — Stronger M4d check (DONE, PASSING):
-  Added a SECOND GPU reference: the REAL Cycles header src/kernel/closure/bsdf_diffuse.h
-  compiled on the host, called directly, compared value-by-value. Did NOT copy code.
-  WHY IT IS A ONE-LINE INCLUDE (not large changes):
-    - kernels.cpp already pulls kernel/types.h transitively (device_impl.h:10 ->
-      params.h:26), so the Cycles kernel type system already compiles in this TU.
-    - On host ccl_device = static inline, ccl_private/ccl_global = empty
-      (util/defines.h:25,63,67), so bsdf_diffuse_eval/_sample are directly callable.
-    - Precedent: shader_nodes.cpp:33 and cycles_precompute.cpp:13 already include real
-      closure headers on the host.
-  Edits (both in src/device/vulkan/kernels.cpp):
-    - #include "kernel/closure/bsdf_diffuse.h" at top (with an explanatory comment).
-    - In vulkan_bsdf_probe: a second reference block that builds a ShaderClosure with
-      only N set, calls the real bsdf_diffuse_eval + bsdf_diffuse_sample on the same
-      fixed inputs (N=Ng=+Z, wo=normalize(0.3,-0.2,0.9), rand=(0.31,0.62)), and checks
-      GPU out[] against them as cyc_* values (tol 1e-6, label exact).
-  RESULT (run, VK_LOADER_DEBUG=layer, validation layer active):
-    Build exit=0. Run exit=0. loader lines=252, VUID/validation errors=0.
-    Original reimplementation refs: ALL MATCH (eval=0.29548, wo=(-0.108428,0.364202,
-    0.924986), pdf_sample=0.294432, label=6).
-    NEW cyc_* real-Cycles refs: ALL MATCH (cyc_eval=0.29548, cyc_wo=(-0.108428,0.364202,
-    0.924986), cyc_pdf_sample=0.294432, cyc_label=6). "ALL VALUES MATCH."
-  This closes the shared-misreading gap: GPU now agrees with Cycles' OWN arithmetic,
-  independent of my formula reading.
+RESEARCH (answered for the report, from tree citations):
+  A. SHADE_SURFACE prereqs + SVM subset interpreter -> see report (shader_data.h:47-134;
+     svm.h:101-622; diffuse graph = 4 opcodes; unhandled opcode -> error flag at svm.h:617-619).
+  B. Wave64: no hardcoded 32 in src/kernel/device/gpu/; use WaveActiveBallot(uint64)/
+     WavePrefixCountBits, never 32-bit mask/32-lane assumption. HIP compat already Wave64-clean;
+     CUDA compat is not. -> see report for per-file table.
+  C. IntegratorStateGPU: alloc'd in PathTraceWorkGPU (path_trace_work_gpu.cpp:104,127-137,
+     143-199) with num_concurrent_states (Vulkan queue.cpp:26-28 = min(1<<20,512MB/state));
+     uploaded via const_copy_to("integrator_state",...) at :319-321; Vulkan device routes it
+     (device.cpp:221-248 -> params.h:60-74 entry :70 -> offset 2984, size-checked).
 
-PART 2 — Design report for the real M4 path: delivered in chat ONLY (7 sections with
-  file:line citations). NO code. path_trace.slang left untouched (dead code on a fantasy
-  ABI). No private path_trace ABI proposed; the plan is generic DeviceQueue::enqueue on
-  the locked KernelParamsVulkan/IntegratorStateGPU.
+STEP-1 SOURCE READ (ready for the port, with line anchors):
+  init_from_camera.h (1-145): integrate_camera_sample (:19-52), integrator_init_from_camera
+    (:57-143; tile!=null path :76-90, tile==null restart path :69-75, queue push :134-139).
+  camera.h: camera_sample (:449-527), camera_sample_perspective (:43-170).
+  pattern.h (34-188): blue_noise_indexing (:34-64), path_rng_1D/2D/3D (:66-115),
+    path_rng_pixel_init (:134-157).
+  sobol_burley.h (1-203): sobol_burley (:37-67), sample_1D/2D/3D (:99-171). Needs sobol_burley_table.
+  sample/util.h: reversed_bit_owen (:18), reversed_bit_owen_base4 (:35), nested_uniform_scramble_base4
+    (:59), morton2d (:74), expand_bits (:64).
+  util/hash.h: uint_to_float_excl (:14), hash_hp_uint (:511), hash_iqnt2d (:625).
+  util/math_base.h: count_leading_zeros (:718), reverse_integer_bits (:813).
+  path_state.h (1-431): path_state_init (:27), path_state_init_integrator (:40-108),
+    RNGState (:329).
+  state_flow.h (1-304): integrator_path_init (:71), integrator_path_next (:78), GPU atomic
+    queue push (:74,:82-85).
+  state_util.h: integrator_state_write_ray (:25-61).
+  film/adaptive_sampling.h: film_need_sample_pixel (:13-25). film/light_passes.h:
+    film_write_sample (:158-173, early-out returns sample when pass_sample_count==PASS_UNUSED).
+  gpu/kernel.h (:72-116): GPU entry integrator_init_from_camera — tiles path derives
+    x/y/sample via get_work_pixel (work_stealing.h:14-41); state = tile->path_index_offset + tile_work_index.
+  path_trace_work_gpu.cpp: enqueue_work_tiles (:907-948) tile path args; (:555-568) restart path args.
 
-STILL OPEN / NEXT: awaiting approval on the Part 2 plan before implementing any M4
-  wavefront kernel. First proposed step = port DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA
-  only, gated against real Cycles camera code compiled on host.
+PROPOSED SPLIT OF STEP 1 (for user decision):
+  S1a: Port the pure math core to Slang (bit/hash utils, sobol_burley+table, pattern.h,
+       camera math) as a standalone .slang; compile with slangc + spirv-val; bit-exactness
+       vs host Cycles headers checked by a tiny 1-thread probe. No state/queue.
+  S1b: Port state-flow (path_state_init/_integrator, write_ray, queue push) +
+       init_from_camera orchestration on KernelParamsVulkan; implement VulkanQueue::enqueue
+       pipeline for DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA only.
+  S1c: Gate probe (env CYCLES_VULKAN_INIT_CAMERA_PROBE=1) allocating IntegratorStateGPU with
+       Cycles' own sizing, 64x48 tile, samples 0 and 5, per-pixel host reference, 3 negative
+       tests, layer/canary/checksum. Full report.
 
-FILES MODIFIED THIS SESSION (not staged, no git run):
-  src/device/vulkan/kernels.cpp  (include + cyc_* reference block).
-  lastsession.txt.
-New this session: none (bsdf_diffuse.slang / bsdf_probe.slang already existed from M4d).
+FILES MODIFIED THIS SESSION: lastsession.txt only.
 Untracked generated (gitignore/rm --cached recommendation open): abi_probe.spv,
-  traverse_prepare.spv, traverse_probe.spv, m4c_live_kerneldata.bin.
-  bsdf_probe.spv lives in temp dir only.
+  traverse_prepare.spv, traverse_probe.spv, m4c_live_kerneldata.bin. bsdf_probe.spv in temp only.
 
-TRAPS: slangc emits SPIR-V entry "main" regardless of Slang name; MSVC tail padding
-  absent from slangc sizeof (spell pads + host static_assert); PowerShell Select-String
-  literal quotes need backtick escaping.
+TRAPS: slangc emits SPIR-V entry "main" regardless of Slang name; MSVC tail padding absent
+  from slangc sizeof (spell pads + host static_assert); PowerShell Select-String literal
+  quotes need backtick escaping; array subtraction fails on Object[] (use scalar math).
