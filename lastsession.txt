@@ -1,87 +1,160 @@
-lastsession.txt — M4c STEP 1 DONE (evidence report delivered, NO code). Awaiting user.
+lastsession.txt — M4c STEP 1 + STEP 2 DONE this session. GATE RUN 7 = FAIL.
+Diffs applied (D1-D4 + Q6), host builds, Slang compiles + spirv-val clean,
+gate executed with the validation layer proven active. Gate NOT met: reported
+the failure and stopped, per AGENTS 6 and 11. No tolerance or method changed.
 
-PRIOR WORK IN THIS SESSION (before M4c prompt arrived)
-------------------------------------------------------
-- Heap corruption Fix A+B landed and gated (see previous lastsession content
-  summarized): device.cpp:920 safe erase; vulkan/device.cpp MEM_GLOBAL lazy
-  alloc now via generic_alloc. Gate: exit 0 under full page heap AND normal
-  heap, ABI probe ALL VALUES MATCH, validation layer loaded (loader log) with
-  0 VUID lines. Page heap DISABLED (user-approved UAC).
-
-M4c STEP 1 — EVIDENCE REPORT (delivered in chat, <=50 lines, path:line cited)
-------------------------------------------------------------------------------
-Key facts the next steps rely on (all verified by reading the files):
-
-1. Spike = agentreference/bvh_traverse.slang: ports traversal.h:24-261 +
-   object.h bvh_instance_push/pop (:464-477/:502-510). Own slab test
-   (spike:151-174), own Plucker triangle test (spike:93-117 mirrors
-   ray_triangle_intersect sig at geom/triangle_intersect.h:44), visibility
-   inline (spike:232-233 vs Cycles triangle_intersect.h:49). DEFERRED cases
-   return ERR_INSTANCE (spike:239-241): motion/curves/points/unaligned/
-   self-shadow-skip/shadow-link/shadow-early-exit.
-2. Gate output struct Intersection{t,u,v,prim,object,type} 24B = types.h:614-619;
-   spike Hit is 12B -> STEP 2 adds u,v,type (PRIMITIVE_TRIANGLE types.h:687).
-3. Layout checks (counted): Transform=3xfloat4=48B (transform.h:52-53) =>
-   KernelObject tfm words 0-11, itfm 12-23, position_offset word 42 (byte 168,
-   counted types.h:1412-1435). sizeof(KernelObject)=256 computed (alignof 16,
-   types.h:1460) — LOCK with host static_assert in STEP 2. root =
-   KernelData.bvh.root, first int of KernelBVH (data_template.h:51-52).
-4. All 9 arrays have params slots (data_arrays.h:15-37; offsets frozen in
-   vulkan_data.slang:256-308): bvh_nodes@2560, bvh_leaf_nodes@2568,
-   prim_visibility@2584, prim_index@2592, prim_object@2600, object_node@2608,
-   objects@2624, tri_vindex@2680, tri_verts@2688. tri_vindex packed_uint3,
-   tri_verts packed_float3 (12B stride each — shader reads as uint*/float*).
-   NO COUNT SLOTS anywhere. root not a slot (blob KernelDataBlob 2560B).
-5. Frozen-file reality: VulkanDevice public = vk_device(),
-   vk_physical_device(), kernel_params_address() only (device_impl.h:24-65;
-   used kernels.cpp:277-315). PRIVATE: host_params_, address_to_alloc_map,
-   global_last_uploaded (device_impl.h:65-81). global_last_uploaded only
-   snapshots MEM_GLOBAL (vulkan device.cpp:486) — not BVH arrays.
-   queue.cpp enqueue has only vulkan_device_ (queue.cpp:16,34-44).
-6. cycles_bvh_dump EXISTS as standalone exe: src/app/cycles_bvh_dump.cpp:20
-   "cycles_bvh_dump <scene.xml> <out_dir>", dumps all DeviceScene arrays +
-   kernel_bvh struct (:164-170), CMake target CMakeLists.txt:149. This is the
-   SAME dump format agentreference m2c_main.cpp loads (bvh_dump.h loader).
-   Recommended reference-data + counts source (option 3a in the report).
-
-OPEN QUESTIONS ASKED (user must answer before STEP 2)
------------------------------------------------------
-Q1 reference data source: (a) cycles_bvh_dump sidecar run [recommended],
-   (b) GPU echoes contents, (c) approve frozen accessor.
-Q2 counts for bounds checks (AGENTS 4) from dump meta? (with (a): yes)
-Q3 root passed via push constant (host offsetof) vs shader blob read?
-Q4 exact camera numbers (proposal: 64x64, o=(0,-6,3), plane spans x in [-5,5]
-   at depth 1; printed at run time).
-Q5 main-pass visibility mask 0xFFFFFFFF?
-Q6 miss rows: ignore isect.type (Cycles leaves it untouched, traversal.h:51-55)?
-Q7 negative test 2 semantics: corrupt object_node[obj] -> shader ERR_BAD_INDEX
-   -> probe reports FAIL (detection = gate failure), confirm.
-
-FILES EDITABLE FOR M4c (per task prompt)
+SESSION START: THE OLD SUMMARY WAS STALE
 ----------------------------------------
-NEW: src/kernel/device/vulkan/traverse.slang, NEW:
-src/kernel/device/vulkan/traverse_probe.slang; EDIT: src/device/vulkan/
-kernels.cpp (add vulkan_traverse_probe() modelled on vulkan_abi_probe(),
-kernels.cpp:265+), src/device/vulkan/queue.cpp (one call, like :40).
-FROZEN: src/device/device.cpp, vulkan/device.cpp + device_impl.h, params.h,
-vulkan_data.slang (read-only slots). If an accessor is needed there: STOP ASK.
+It said "STEP 1 evidence report, NO code". The repo was ahead: traverse.slang +
+traverse_probe.slang committed (ea2af0890), vulkan_traverse_probe() at
+kernels.cpp:1165, queue.cpp:18/47 hook, 3 negative tests (kernels.cpp:1539-
+1541), static_assert(sizeof(KernelObject)==256) (kernels.cpp:541), and gate
+runs m4c_gate_run1..6.txt already in the temp dir (run6 = FAIL, 17 grazing vs
+limit 8, verdict reference still the brute-force one, i.e. D1 not applied).
 
-NEXT SESSION
-------------
-1. Get answers Q1-Q7 from user.
-2. STEP 2: write traverse.slang (port spike -> Intersection, u,v,type added,
-   DEFERRED comments), traverse_probe.slang (64x64 grid, push constants:
-   params/out/w/h/visibility/camera + root + counts per Q2/Q3), host
-   vulkan_traverse_probe() in kernels.cpp (+ one call queue.cpp): compile
-   shaders with slangc -target spirv + spirv-val (SHOW OUTPUT), run gate:
-   CYCLES_VULKAN_ALLOW_NO_KERNELS=1 CYCLES_VULKAN_TRAVERSE_PROBE=1 (+VK_INSTANCE_
-   LAYERS=VK_LAYER_KHRONOS_validation) on instance2.xml; PASS criteria per
-   prompt (hit/miss+object+prim agree, t 1e-4 rel, grazing <= max(8,n/50000),
-   0 VUID, per-cube hit counts printed, 3 negative tests must FAIL).
-3. Update lastsession.txt.
-Build: cmake --build build --config Release --target cycles -- /m.
-Page heap is OFF (enable_pageheap.ps1 to re-arm; gflags needs elevation).
-cdb/gflags at "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64";
-symcache C:\Users\santi\AppData\Local\Temp\opencode\symcache.
-Traps: single-quoted -c or -cf for cdb; `r` one register; `ba w8 reg+imm`
-parses; hardware watches per-thread; !heap -p -a @$ea; bu cycles.exe+RVA.
+WHAT WAS CHANGED (only editable files; queue.cpp needed no change)
+------------------------------------------------------------------
+src/device/vulkan/kernels.cpp (51 hunks, +414/-... total across the task):
+  * D1 -> NEW tp_plucker_test() + tp_trace_cpu_plucker(): CPU port of the
+    watertight Pluecker test at agentreference/bvh_traverse.slang:93-117.
+    That is now the verdict reference (`ref`). tp_trace_cpu (Moller-Trumbore,
+    raytri_cpu.h:95-124) is kept as `ref_mt`.
+  * D2 -> one INFO ONLY line, never used by the verdict.
+  * D3 -> TP_MAX_WIDTH/HEIGHT=128 (TP_MAX_PIXELS=16384), TP_D3_YAW_DEG=7;
+    tp_build_camera(cam, yaw_deg) yaws the view dir about +Y, origin fixed;
+    buffers sized once for the largest run, canary zone at that fixed offset;
+    run_probe() gained (w, h, run_cam, run_ref). D3 run prints a WARNING and
+    changes nothing if its grazing > max(8, n/50000).
+  * D4 -> the live KernelData blob is written only when
+    CYCLES_VULKAN_TRAVERSE_DUMP_DIR is set, into that directory (temp).
+  * Q6 -> TpHit gained `type`; TpCmp gained type_bad_hit/type_bad_miss (both
+    printed); tp_all_ok() = tp_cmp_ok() && type counts == 0, used for the main
+    run AND for negative detection. Tolerances unchanged: bad==0, errors==0,
+    grazing <= max(8, n/50000).
+src/kernel/device/vulkan/traverse.slang, traverse_probe.slang: comment-only
+(traverse.slang:229-235 miss-init now cites the real sources;
+traverse_probe.slang:12-17 grid is hdr.width/height, not always 64x64).
+
+Q6 SOURCES (opened, not remembered)
+-----------------------------------
+- src/kernel/bvh/traversal.h:51-55 sets t, u, v, prim, object; does NOT write type.
+- src/kernel/integrator/intersect_closest.h:379-391: `Intersection isect
+  ccl_optional_struct_init;` + object/prim = NONE; on !hit only prim=PRIM_NONE.
+  type read only when prim != PRIM_NONE (intersect_closest.h:309).
+- ccl_optional_struct_init is EMPTY at src/util/defines.h:71 (CPU device) and
+  `= {}` only at src/kernel/device/optix/compat.h:57 => on the CPU device the
+  miss `type` is UNINITIALISED in Cycles. PRIMITIVE_NONE = 0
+  (src/kernel/types.h:686), PRIMITIVE_TRIANGLE = 1<<0 (types.h:687), written by
+  src/kernel/geom/triangle_intersect.h:109.
+  => The gate asserts type == 0 on miss rows because that IS PRIMITIVE_NONE and
+  what traverse.slang:237 writes. Do NOT claim Cycles writes 0.
+
+GATE RUN 7 - m4c_gate_run7.txt (temp dir; copy at repo root, 89672 bytes)
+-------------------------------------------------------------------------
+VERDICT: "Vulkan: traverse probe: FAIL - see the numbers above", process exit 0.
+D1 verdict block (4096 px): both missed 3315, same (object,prim)+same t 542,
+edge ties 220, edge-grazing 19, MISMATCHES(bad) 0, shader errors 0, type
+mismatches 0/0. Grazing limit = max(8, 4096/50000) = 8.  19 > 8 => FAIL.
+Evidence, all 19 grazing rows: hit<->miss flips on cube silhouette pixels of
+image row y=24 (x = 7..13, 27,29,34,36,47,48,51..56), one side t=1e+30 (miss),
+the other a real hit, edge margin 5.11e-08 .. 1.82e-07 (TP_EDGE_TOL = 1e-5).
+bad = 0 means no disagreement away from an edge; errors 0; type 0/0; canaries
+INTACT; pixels never written 0.
+D2 line: "INFO ONLY (D2, not part of the verdict) Moller-Trumbore vs GPU:
+same=761 grazing=17 bad=0 errors=0" => D2's bad==0 requirement holds.
+D3 line: "D3 INFORMATIONAL ONLY (128x128, camera yawed 7 deg) ... 16384 pixels"
+both missed 13446, same 2052, ties 886, grazing 0, bad 0, errors 0, type 0/0
+=> grazing 0 <= max(8,16384/50000)=8, so D3's STOP condition did NOT trigger.
+Negatives: 1 skip instance pop DETECTED (bad0/errors0/grazing19/type0/0);
+2 corrupt object_node DETECTED (bad0/errors777/grazing4/type0/0);
+3 visibility mask 0 DETECTED (bad756/errors0/grazing10/type0/0).
+Per-cube hit pixels: obj0 224, obj1 0, obj2 277, obj3 276.
+Validation layer PROOF: capture contains
+  '[Vulkan Loader] INFO | LAYER:   Insert instance layer "VK_LAYER_KHRONOS_validation"'
+  x3 (needs VK_LOADER_DEBUG=layer, see below); VUID- lines in capture: 0.
+Data path proven live (Q1): prepare reads the nine array addresses from the
+LIVE params buffer (traverse_probe.slang:94-102) and checksums the live arrays;
+host log 'root: live blob=0x00000000 dump=0x00000000 | bvh_nodes checksum:
+live=0xa20ba56f dump=0xa20ba56f | tri_verts: live=0x99439285 dump=0x99439285'
+=> live == dump, so the probe continued and the GPU traversed the LIVE arrays.
+Counts came from the sidecar dump (Q2); there are no live count slots.
+
+COMMANDS RUN THIS SESSION (all exit 0)
+--------------------------------------
+  cmake --build build --config Release --target cycles -- /m    -> cycles.exe linked
+  C:\VulkanSDK\1.4.363.0\Bin\slangc.exe src\kernel\device\vulkan\traverse_probe.slang
+      -target spirv -entry traverse_prepare_main -stage compute -o <TEMP>\traverse_prepare.spv
+  ... -entry traverse_probe_main ... -o <TEMP>\traverse_probe.spv
+  C:\VulkanSDK\1.4.363.0\Bin\spirv-val.exe <each .spv>           -> exit 0, no output
+  gate: CYCLES_VULKAN_ALLOW_NO_KERNELS=1 CYCLES_VULKAN_TRAVERSE_PROBE=1
+        CYCLES_VULKAN_TRAVERSE_DUMP_DIR=<TEMP>\m4c_dump
+        CYCLES_VULKAN_TRAVERSE_PREPARE_SPV=<TEMP>\traverse_prepare.spv
+        CYCLES_VULKAN_TRAVERSE_PROBE_SPV=<TEMP>\traverse_probe.spv
+        VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LOADER_DEBUG=layer
+        build\bin\Release\cycles.exe --device VULKAN --log-level info
+        --samples 1 --background instance2.xml   -> exit 0, capture run7
+  <TEMP> = C:\Users\santi\AppData\Local\Temp\opencode
+TRAP: without VK_LOADER_DEBUG=layer the capture shows NO loader lines, so "0
+VUID" cannot be shown as "layer was active". Run6 had the same hole.
+
+WHY THE GATE FAILED - report only, nothing changed (AGENTS 6 and 11)
+---------------------------------------------------------------------
+The two algorithms agree everywhere except 19 silhouette pixels, and every one
+of them sits within 1.8e-07 of a triangle edge (bad = 0 away from edges). This
+is the "two valid algorithms disagree only at float-rounding edges" case: the
+CPU reference runs the Pluecker test on WORLD-SPACE vertices/ray, the GPU runs
+it in OBJECT SPACE after the instance push (traverse.slang instance push), so
+the side-test eps (1.1920929e-07*|UVW|, spike:101, depends on coordinate
+magnitude) flips at shared edges. Do NOT change the tolerance or the reference
+method on your own - it is the user's call.
+
+OPEN ITEMS (exact observations, AGENTS 11)
+------------------------------------------
+- Q3 DIVERGENCE, needs a user decision. Your Q3 answer: "root via push
+  constant, not read from the KernelData blob". The code does the opposite:
+  traverse_probe.slang:63-66 (comment says "M4c decision Q3: root is read from
+  the blob exactly where production kernels read it") and
+  traverse_probe.slang:104-116 (`*prepare_pc.hdr_root =
+  int(prepare_pc.params_raw[prepare_pc.blob_root_word])`, blob_root_word =
+  offsetof(KernelData,bvh)/4 = 356, host side kernels.cpp
+  TpPreparePush.blob_root_word). The traversal then starts at that hdr.root.
+  For instance2.xml live blob word 356 = 0x00000000 and dump root = 0x00000000
+  (they match, root 0 is correct for BVH2 root-first storage), so this cannot
+  explain the grazing failure. Changing it also changes what is tested (the
+  root upload would stop being tested), so it was left as-is this session.
+- D5 typed-vs-raw KernelData, NOT investigated on purpose. Exact observation:
+  word 356 (offsetof(KernelData,bvh) = 1424) read through the TYPED view =
+  0x80000803, read through the RAW uint32 view = 0x00000000 - same word, same
+  buffer (also written in traverse_probe.slang:108-114). Proposed next task: a
+  small ABI probe comparing typed vs raw over ALL 640 words of the blob,
+  MATCH/MISMATCH per word. Needs device.cpp/device_impl.h/params.h unfrozen -
+  decide that then. MUST run before M4d (M4d needs camera + film from the blob).
+- Q2 counts: hdr counts come from the dump only; there are no live count slots.
+  Deriving counts from device_memory sizes needs VulkanDevice changes - OPEN.
+- Q5: 0xFFFFFFFF is for THIS gate only; it must not be called the integrator's
+  camera-ray visibility mask. M4d must find the real value in Cycles and cite
+  file:line.
+
+SUGGESTED NEXT TASK
+-------------------
+User decides the gate methodology question the 19 grazing pixels raise
+(reference in world space vs matching the GPU's object space, or the tolerance
+staying as-is with the disagreement documented). THEN: the D5 640-word
+typed-vs-raw ABI probe (unfreezes device.cpp/device_impl.h/params.h), then M4d.
+
+FACTS THE NEXT SESSION MUST KNOW
+--------------------------------
+- Build: cmake --build build --config Release --target cycles -- /m
+- slangc/spirv-val live at C:\VulkanSDK\1.4.363.0\Bin\ (not on PATH).
+- Two entries from one file: -entry traverse_prepare_main | traverse_probe_main.
+- .spv go to <TEMP>, run with CYCLES_VULKAN_TRAVERSE_PREPARE_SPV/PROBE_SPV.
+- Gate runs: <TEMP>\m4c_gate_run1..7.txt (run7 = FAIL); final capture also at
+  repo root m4c_gate_run7.txt (untracked).
+- TRACKED generated artifacts in the repo root (committed earlier, untouched
+  this session): abi_probe.spv, traverse_prepare.spv, traverse_probe.spv,
+  m4c_live_kerneldata.bin. The user handles all git.
+- Page heap OFF; re-arming needs elevation, forbidden by AGENTS 11 unless the
+  task allows it. cdb/gflags at "C:\Program Files (x86)\Windows Kits\10\Debuggers\x64";
+  symcache C:\Users\santi\AppData\Local\Temp\opencode\symcache.
+- Traps: single-quoted -c or -cf for cdb; `r` one register; `ba w8 reg+imm`
+  parses; hardware watches per-thread; !heap -p -a @$ea; bu cycles.exe+RVA.

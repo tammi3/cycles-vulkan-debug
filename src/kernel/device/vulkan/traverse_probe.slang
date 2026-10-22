@@ -10,8 +10,11 @@
 //     sidecar (M4c decision Q1: mismatch => INCONCLUSIVE, not FAIL).
 //
 //   traverse_probe_main -> traverse_probe.spv
-//     64x64 threads (8x8 workgroups). One pinhole ray per thread through
-//     the ported traverse(); writes the Intersection (types.h:614) and a
+//     width x height threads (8x8 workgroups; 64x64 for the gate run,
+//     128x128 for the D3 informational run - the grid size and the ray
+//     layout come from hdr.width / hdr.height, filled by the host's
+//     run_probe in kernels.cpp). One pinhole ray per thread through the
+//     ported traverse(); writes the Intersection (types.h:614) and a
 //     per-ray status word.
 //
 // Syntax follows the M4b ABI probe (abi_probe.slang), the only in-tree

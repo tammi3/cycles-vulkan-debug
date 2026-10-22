@@ -226,9 +226,13 @@ uint traverse(TraverseHeader* sc,
     float3 dir = float3(clamp_component(Din.x), clamp_component(Din.y), clamp_component(Din.z));
     float3 idir = float3(1.0f / dir.x, 1.0f / dir.y, 1.0f / dir.z);
 
-    /* isect init, traversal.h:51-55: t = tmax, u = v = 0, prim/object =
-     * NONE. `type` is NOT set on a miss (Cycles does not either); the probe
-     * writes 0 and the host comparison ignores type on misses (Q6). */
+    /* isect init, src/kernel/bvh/traversal.h:51-55: t = tmax, u = v = 0,
+     * prim/object = NONE. That code never writes `type` and the caller keeps
+     * prim = PRIM_NONE on a miss (src/kernel/integrator/intersect_closest.h:
+     * 379-391), so the value a miss row must show is PRIMITIVE_NONE = 0
+     * (src/kernel/types.h:686) - exactly what this writes and what the host
+     * asserts on miss rows (Q6). Hit rows must show PRIMITIVE_TRIANGLE
+     * (types.h:687), written below at the triangle hit. */
     hit_t = tmax;
     hit_u = 0.0f;
     hit_v = 0.0f;
