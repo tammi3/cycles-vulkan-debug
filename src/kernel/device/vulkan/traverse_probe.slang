@@ -106,12 +106,17 @@ void traverse_prepare_main(uint3 tid : SV_DispatchThreadID)
      * the host-computed word index also tests the blob upload.
      *
      * We read through the RAW uint32 view, not the typed
-     * `params->data.words[]` view: Slang laid out the `uint words[640]`
-     * member of KernelDataBlob with a stride that does not match the
-     * host's flat uint32 array (the typed read returned 0x80000803 at
-     * word 356, while the raw echo at the SAME index returned the dump's
-     * 0x00000000). The raw view matched the dump byte-for-byte, so it is
-     * the view that agrees with the C++ layout. */
+     * `params->data.words[]` view. The blob LAYOUT is byte-correct (the
+     * raw view at word 356 returned the host's 0x00000000 and matched the
+     * dump byte-for-byte); the fault is a Slang SPIR-V CODEGEN bug: an
+     * INLINE DYNAMIC index on a fixed-array member reached through a
+     * device pointer (`params->data.words[i]`) is miscompiled and always
+     * returns element 0 (0x80000803 = kernel_features at every index).
+     * A base-ptr index `(&params->data.words[0])[i]` or the raw view
+     * `params_raw[i]` both compile to OpPtrAccessChain on a flat uint*
+     * and are correct (see kdata_probe). Rule: take a base pointer once
+     * and index through it; never inline-dynamic-index an array member
+     * behind a device pointer. */
     *prepare_pc.hdr_root = int(prepare_pc.params_raw[prepare_pc.blob_root_word]);
     prepare_pc.out[3] = uint(*prepare_pc.hdr_root);
 

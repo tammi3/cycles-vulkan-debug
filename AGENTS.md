@@ -207,3 +207,5 @@ Write (or overwrite) `lastsession.txt` in the repo root. Keep it short. Include:
 - Open items go into lastsession.txt with the exact observation (values, file, line), not a paraphrase.
 
 - Negative tests are only meaningful against a CLEAN baseline. A negative counts as detected only if the fault changes the output relative to the clean run of the same configuration. If the baseline itself fails the gate, no negative result is valid; report that instead of a verdict.
+
+SLANG RULE (found in M4e S1b-0): never use inline dynamic indexing on a fixed array member reached through a device pointer (e.g. params->data.words[i]); it has been observed to always return element 0. Take a base pointer once (uint* base = &params->data.words[0];) and index through it, or use the raw uint* view. Any new Slang code that indexes arrays inside BDA structs must be covered by a probe that uses a non-constant index.

@@ -2014,6 +2014,333 @@ bool vulkan_kdata_probe(VulkanDevice *dev)
 }
 
 /* =========================================================================
+ * M4e S1b-1 minimal dynamic-index repro probe (optional, env
+ * CYCLES_VULKAN_DYNINDEX_REPRO=1)
+ * =========================================================================
+ * Dispatches dynindex_repro.slang, the SMALLEST shader that reproduces the
+ * Slang miscompile kdata_probe root-caused (M4e S1b-0): an inline DYNAMIC
+ * index on a fixed-array member behind a device pointer (`p->data.words[i]`)
+ * reads back WRONG elements (the index is not applied correctly). The
+ * shader reads the same 8-word pattern {10..17} three ways plus a
+ * constant-index control:
+ *   out[0..7]   (a) p->data.words[i]        inline dynamic  -> WRONG (all 10)
+ *   out[8..15]  (c) (&p->data.words[0])[i]  base-ptr dynamic -> correct
+ *   out[16..23] (b) raw[i]                  raw dynamic     -> correct
+ *   out[24]     p->data.words[3]            const index     -> correct (13)
+ *   out[25]     raw[3]                      const index     -> correct (13)
+ * The host allocates a 32-byte Params buffer holding {10..17}, pushes its
+ * device address as BOTH the typed `p` and the raw view, dispatches one
+ * thread, and compares each region against the known pattern. No
+ * KernelData, no scene: isolates the codegen fault to a 2-struct shader. */
+
+namespace {
+
+constexpr uint32_t DYNI_WORDS = 8;
+/* out layout: a(8) + c(8) + b(8) + const-a + const-b = 26 words. */
+constexpr uint32_t DYNI_OUT_WORDS = 3 * DYNI_WORDS + 2; /* 26 */
+constexpr uint32_t DYNI_PARAMS_WORDS = DYNI_WORDS;      /* 8  */
+constexpr uint32_t DYNI_PUSH_BYTES = 24;                /* ReproPush = 3 pointers */
+constexpr uint32_t DYNI_PREFILL = 0xA5A5A5A5u;          /* unwritten sentinel */
+
+struct DyniResources {
+  VkDevice device = VK_NULL_HANDLE;
+  VkShaderModule module = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkBuffer params_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory params_memory = VK_NULL_HANDLE;
+  VkBuffer out_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory out_memory = VK_NULL_HANDLE;
+
+  ~DyniResources()
+  {
+    if (device == VK_NULL_HANDLE) return;
+    if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+    if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+    if (module) vkDestroyShaderModule(device, module, nullptr);
+    if (pool) vkDestroyCommandPool(device, pool, nullptr);
+    if (params_buffer) vkDestroyBuffer(device, params_buffer, nullptr);
+    if (params_memory) vkFreeMemory(device, params_memory, nullptr);
+    if (out_buffer) vkDestroyBuffer(device, out_buffer, nullptr);
+    if (out_memory) vkFreeMemory(device, out_memory, nullptr);
+  }
+};
+
+} /* namespace */
+
+bool vulkan_dynindex_repro(VulkanDevice *dev)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+  if (getenv("CYCLES_VULKAN_DYNINDEX_REPRO") == nullptr) return true;
+
+  LOG_INFO << "Vulkan: DynIndex repro starting (CYCLES_VULKAN_DYNINDEX_REPRO=1).";
+
+  DyniResources res;
+  const VkDevice vk_dev = dev->vk_device();
+  res.device = vk_dev;
+
+  /* 1. SPIR-V (env override or repo-relative default). */
+  std::vector<char> spirv;
+  const char *env_path = getenv("CYCLES_VULKAN_DYNINDEX_REPRO_SPV");
+  const char *candidates[2] = {env_path, "dynindex_repro.spv"};
+  const char *found = nullptr;
+  for (const char *c : candidates) {
+    if (c && probe_read_whole_file(c, spirv)) {
+      found = c;
+      break;
+    }
+  }
+  if (!found) {
+    LOG_ERROR << "Vulkan: DynIndex repro: cannot find dynindex_repro.spv "
+                 "(compile it with slangc or set CYCLES_VULKAN_DYNINDEX_REPRO_SPV).";
+    return false;
+  }
+  if (spirv.size() % 4 != 0) {
+    LOG_ERROR << "Vulkan: DynIndex repro: '" << found << "' is not a valid SPIR-V module.";
+    return false;
+  }
+  LOG_INFO << "Vulkan: DynIndex repro: spirv='" << found << "' (" << spirv.size() << " bytes).";
+
+  /* 2. Shader module. */
+  VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = spirv.size();
+  smi.pCode = reinterpret_cast<const uint32_t *>(spirv.data());
+  if (vkCreateShaderModule(vk_dev, &smi, nullptr, &res.module) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: DynIndex repro: vkCreateShaderModule failed.";
+    return false;
+  }
+
+  /* 3. Pipeline layout: no descriptor sets, one 24-byte push range. */
+  VkPushConstantRange pcr{};
+  pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pcr.offset = 0;
+  pcr.size = DYNI_PUSH_BYTES;
+  VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pli.pushConstantRangeCount = 1;
+  pli.pPushConstantRanges = &pcr;
+  if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &res.layout) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: DynIndex repro: pipeline layout creation failed.";
+    return false;
+  }
+
+  /* 4. Compute pipeline (entry "main"; slangc renames). */
+  VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  cpi.stage.module = res.module;
+  cpi.stage.pName = "main";
+  cpi.layout = res.layout;
+  if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &res.pipeline) !=
+      VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: DynIndex repro: compute pipeline creation failed.";
+    return false;
+  }
+
+  /* 5. Two host-visible + coherent + device-address buffers: Params (the
+   *    8-word pattern the shader reads) and out (the readback). A small
+   *    lambda keeps the identical allocation boilerplate in one place. */
+  auto make_bda_buffer = [&](VkDeviceSize size, VkBuffer &buf, VkDeviceMemory &mem) -> bool {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(vk_dev, &bci, nullptr, &buf) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: DynIndex repro: buffer creation failed.";
+      return false;
+    }
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(vk_dev, buf, &reqs);
+    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &flags_info;
+    ai.allocationSize = reqs.size;
+    ai.memoryTypeIndex = dev->find_memory_type(
+        reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vkAllocateMemory(vk_dev, &ai, nullptr, &mem) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: DynIndex repro: memory allocation failed.";
+      return false;
+    }
+    if (vkBindBufferMemory(vk_dev, buf, mem, 0) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: DynIndex repro: memory bind failed.";
+      return false;
+    }
+    return true;
+  };
+
+  if (!make_bda_buffer(DYNI_PARAMS_WORDS * sizeof(uint32_t), res.params_buffer,
+                       res.params_memory))
+    return false;
+  if (!make_bda_buffer(DYNI_OUT_WORDS * sizeof(uint32_t), res.out_buffer, res.out_memory))
+    return false;
+
+  /* Fill the params pattern {10..17} and prefill the out buffer with the
+   * unwritten sentinel. Host-coherent memory: the queue submit makes the
+   * host writes visible to the device, so no explicit barrier is needed. */
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.params_memory, 0, DYNI_PARAMS_WORDS * 4, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: DynIndex repro: mapping params buffer failed.";
+      return false;
+    }
+    uint32_t *w = static_cast<uint32_t *>(m);
+    for (uint32_t i = 0; i < DYNI_PARAMS_WORDS; i++) w[i] = 10u + i;
+    vkUnmapMemory(vk_dev, res.params_memory);
+  }
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.out_memory, 0, DYNI_OUT_WORDS * 4, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: DynIndex repro: mapping out buffer failed.";
+      return false;
+    }
+    uint32_t *w = static_cast<uint32_t *>(m);
+    for (uint32_t i = 0; i < DYNI_OUT_WORDS; i++) w[i] = DYNI_PREFILL;
+    vkUnmapMemory(vk_dev, res.out_memory);
+  }
+
+  VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  bai.buffer = res.params_buffer;
+  const uint64_t params_addr = vkGetBufferDeviceAddress(vk_dev, &bai);
+  bai.buffer = res.out_buffer;
+  const uint64_t out_addr = vkGetBufferDeviceAddress(vk_dev, &bai);
+
+  /* 6. Record + submit one workgroup of one thread. */
+  const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
+  VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  cpci.queueFamilyIndex = family;
+  if (vkCreateCommandPool(vk_dev, &cpci, nullptr, &res.pool) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: DynIndex repro: command pool creation failed.";
+    return false;
+  }
+  VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = res.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(vk_dev, &cbai, &cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: DynIndex repro: command buffer allocation failed.";
+    return false;
+  }
+  VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: DynIndex repro: vkBeginCommandBuffer failed.";
+    return false;
+  }
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.pipeline);
+  /* p = typed params pointer, raw = SAME address as a flat uint32 view,
+   * out = readback. The two params forms point at identical bytes. */
+  const uint64_t push[3] = {params_addr, params_addr, out_addr};
+  vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+  vkCmdDispatch(cmd, 1, 1, 1);
+  if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: DynIndex repro: vkEndCommandBuffer failed.";
+    return false;
+  }
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(vk_dev, family, 0, &queue);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VkFence fence = VK_NULL_HANDLE;
+  if (vkCreateFence(vk_dev, &fci, nullptr, &fence) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: DynIndex repro: fence creation failed.";
+    return false;
+  }
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd;
+  bool submitted = false;
+  if (vkQueueSubmit(queue, 1, &si, fence) == VK_SUCCESS) {
+    submitted = vkWaitForFences(vk_dev, 1, &fence, VK_TRUE, 10000000000ull) == VK_SUCCESS;
+  }
+  vkDestroyFence(vk_dev, fence, nullptr);
+  if (!submitted) {
+    LOG_ERROR << "Vulkan: DynIndex repro: queue submit/wait failed.";
+    return false;
+  }
+
+  /* 7. Read back. */
+  uint32_t out[DYNI_OUT_WORDS];
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.out_memory, 0, DYNI_OUT_WORDS * 4, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: DynIndex repro: mapping readback buffer failed.";
+      return false;
+    }
+    memcpy(out, m, sizeof(out));
+    vkUnmapMemory(vk_dev, res.out_memory);
+  }
+
+  /* 8. Compare each region against the known pattern {10..17}. */
+  uint32_t a_bad = 0, c_bad = 0, b_bad = 0, unwritten = 0;
+  for (uint32_t i = 0; i < DYNI_WORDS; i++) {
+    const uint32_t expect = 10u + i;
+    if (out[i] == DYNI_PREFILL) unwritten++;
+    if (out[DYNI_WORDS + i] == DYNI_PREFILL) unwritten++;
+    if (out[2 * DYNI_WORDS + i] == DYNI_PREFILL) unwritten++;
+    if (out[i] != expect) a_bad++;
+    if (out[DYNI_WORDS + i] != expect) c_bad++;
+    if (out[2 * DYNI_WORDS + i] != expect) b_bad++;
+  }
+  const uint32_t const_a = out[2 * DYNI_WORDS + DYNI_WORDS];      /* out[24] */
+  const uint32_t const_b = out[2 * DYNI_WORDS + DYNI_WORDS + 1];  /* out[25] */
+  LOG_INFO << string_printf(
+      "Vulkan: DynIndex repro: (a) inline-dynamic wrong=%u/%u  (c) base-ptr wrong=%u/%u  "
+      "(b) raw wrong=%u/%u  const-index a=%u b=%u (expect 13)  unwritten=%u",
+      a_bad, DYNI_WORDS, c_bad, DYNI_WORDS, b_bad, DYNI_WORDS, const_a, const_b, unwritten);
+
+  /* 9. Verdict.
+   *    layout_ok : the base-ptr and raw dynamic views are correct -> the
+   *                buffer contents + layout are fine.
+   *    repro     : the inline-dynamic view reads back WRONG values while
+   *                base-ptr + raw are correct and constant index works.
+   *                That is the exact bug: only the inline DYNAMIC index on
+   *                the fixed-array member behind a device pointer is broken.
+   *                (It is NOT simply words[0] for every i -- the distortion
+   *                is context-dependent; over 8 words it came back ~i>>2.) */
+  const bool layout_ok = (c_bad == 0) && (b_bad == 0);
+  const bool const_ok = (const_a == 13u) && (const_b == 13u);
+  const bool repro = (a_bad > 0u) && layout_ok && const_ok;
+
+  if (repro)
+    LOG_ERROR << "Vulkan: DynIndex repro: BUG REPRODUCED - inline `p->data.words[i]` dynamic "
+                 "index read back WRONG values (wrong=" << a_bad << "/" << DYNI_WORDS
+              << "), while base-ptr and raw dynamic views and the constant index are all correct. "
+                 "Isolates the Slang miscompile with no KernelData (see the out(a) dump on stderr).";
+  else if (layout_ok && a_bad == 0)
+    LOG_INFO << "Vulkan: DynIndex repro: BUG NOT REPRODUCED - the inline-dynamic view is correct "
+                "here (toolchain may differ from the one that showed the fault).";
+  else
+    LOG_ERROR << "Vulkan: DynIndex repro: UNEXPECTED - see the counts above.";
+  /* Mirror the verdict to unbuffered stderr: the Cycles progress bar can
+   * overwrite a same-timestamp LOG line on the console, and this verdict is
+   * the probe's whole point (AGENTS.md debug trap: use stderr for probes). */
+  fprintf(stderr,
+          "[dynindex-repro] inline-dynamic wrong=%u/%u base-ptr wrong=%u/%u raw wrong=%u/%u "
+          "const a=%u b=%u -> %s\n",
+          a_bad, DYNI_WORDS, c_bad, DYNI_WORDS, b_bad, DYNI_WORDS, const_a, const_b,
+          repro ? "BUG REPRODUCED" : (layout_ok && a_bad == 0 ? "not reproduced" : "UNEXPECTED"));
+  /* Dump the actual inline-dynamic words so the exact fault value is on the
+   * record (is it words[0], or something else?). */
+  fprintf(stderr, "[dynindex-repro] out(a)= ");
+  for (uint32_t i = 0; i < DYNI_WORDS; i++)
+    fprintf(stderr, "%u ", out[i]);
+  fprintf(stderr, " | out(c)= ");
+  for (uint32_t i = 0; i < DYNI_WORDS; i++)
+    fprintf(stderr, "%u ", out[DYNI_WORDS + i]);
+  fprintf(stderr, " | out(b)= ");
+  for (uint32_t i = 0; i < DYNI_WORDS; i++)
+    fprintf(stderr, "%u ", out[2 * DYNI_WORDS + i]);
+  fprintf(stderr, "\n");
+
+  return repro;
+}
+
+/* =========================================================================
  * M4c traverse probe (optional, env CYCLES_VULKAN_TRAVERSE_PROBE=1)
  * =========================================================================
  * Traces 64x64 pinhole rays on the GPU through the ported closest-hit
