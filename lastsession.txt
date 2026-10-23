@@ -1,8 +1,92 @@
+M4e S1b-3 SESSION (state accessors + stride verification) — 2026-10-22
+================================================================================
+STATUS: STEPS 1 AND 2 COMPLETE (stride table + GPU stride check, both verified on
+RX 570 AND SwiftShader, 0 VUID, all OK). Steps 3-5 (accessors, gate, negative)
+NOT started — handed off (see STILL OPEN). NEG1 waiver (from S1b-2) still below.
+
+STEP 1 RESULT — IntegratorStateGPU STRIDE TABLE (env CYCLES_VULKAN_STATE_STRIDE_TABLE=1)
+ ---------------------------------------------------------------------------
+ Probe `vulkan_state_stride_table()` (kernels.cpp, wired queue.cpp) expands
+ state_template.h + shadow_state_template.h with the SAME macros as the SoA
+ allocator (path_trace_work_gpu.cpp:143-201) but prints a row per member.
+ Allocator element size == sizeof(type): device_only_memory<type>.alloc_to_device
+ (path_trace_work_gpu.cpp:151-152 member / 180-181 array member). So accessor
+ stride MUST equal sizeof(type).
+   PACKED3 (12B, NOT Slang float3 16B; use float* base + 3*i):
+     ray.P, ray.D, path.mis_origin_n, path.throughput, path.pass_diffuse_weight,
+     path.pass_glossy_weight, path.denoising_feature_throughput,
+     subsurface.albedo/.radius/.N, shadow_path.throughput/.unshadowed_throughput/
+     .pass_diffuse_weight/.pass_glossy_weight/.unlit_throughput, shadow_ray.P/.D.
+   SUB4 (<4B, exact-width view, NOT uint): all uint16_t bounce fields,
+     path.queued_kernel, path.rng_offset, path.visibility(uint8), path.mnee(uint8),
+     shadow_path.packed_num_hits(uint16)/.lightgroup(uint8), guiding.use_surface_
+     guiding/.use_volume_guiding(bool).
+   ARRAY-OF-STRUCTS (allocator loop = separate device_only_memory per slot):
+     volume_stack[ai].object at ai*16+0 (shader ai*16+8), int elem_size=4;
+     shadow_isect[ai].t at ai*48+0 (u +4,v +8,prim +12,object +16,type +20);
+     shadow_volume_stack[ai].object at ai*16+0.
+   => CONFIRMS the packed_float3=12 blocker from S1b-2, AND reveals the carried-
+     over vulkan_data.slang IntegratorStateGPU mirror decomposes the array members
+     as struct-of-arrays (object[32], t[4]) which is the WRONG layout vs the C++
+     array-of-structs. Accessors must use AoS (base ptr to the slot struct).
+ OTHER STEP-1 FACTS: build succeeds; run on RX 570 exit 0, VUID=0. packed_float3=12
+ (types_float3.h:198), PackedSpectrum=packed_float3 (types_spectrum.h:14). Path
+ guiding OFF in this build (no PATH_GUIDING in CMakeCache; state_template.h uses
+ uint64_t for path_segment, state_template.h:129) => templates safe in kernels.cpp.
+
+STEP 2 RESULT — GPU SLANG STRIDE CHECK (env CYCLES_VULKAN_SLANG_STRIDE_PROBE=1 / ..._SPV)
+ ---------------------------------------------------------------------------
+ Probe `vulkan_stride_check()` (kernels.cpp, wired queue.cpp) dispatches
+ stride_check.slang: 6 typed region pointers pushed; 3 threads write element
+ k=tid.x (NON-constant index); host reads raw bytes, reports each type's actual
+ element stride. BOTH devices (RX 570 and SwiftShader) AGREE -> ALL OK, exit 0,
+ VUID=0:
+   float3* stride        = 12 bytes (off 0,12,24). SPIR-V ArrayStride=12; BOTH
+                           drivers honor 12 => Slang standalone float3* DOES use
+                           stride 12, which MATCHES packed_float3 (12B). So a
+                           ray.P/throughput accessor MAY use float3* directly.
+   packed3 via float*+3i = OK @12B (k=0,1,2). Robust alternative (float stride 4).
+   float*/uint*/int*     = 4 ; float4* = 16 ; canary intact.
+   => ANSWERS: (1) Slang float3* stride = 12 on this compiler, honored by both
+     devices. (2) packed_float3 read/write = EITHER float3* (stride 12, confirmed)
+     OR float* base + 3*i (confirmed). Both viable; float3* is cleaner.
+ DEVICE RULE note: RX570==SwiftShader on every value => logic result real.
+ SWIFTSHADER TRAP: a uint64_t DATA-array test (OpTypeInt 64) needs Int64
+   capability (SPIR-V cap 11) which SwiftShader Subzero CRASHES on (exit
+   0xC00000FD, "UNSUPPORTED capability 11"). Accessors must avoid strided uint64
+   DATA arrays; pointer MEMBERS (BDA loads at constant offset) are fine on both.
+ STEP 2 files: src/kernel/device/vulkan/stride_check.slang (new); host
+   vulkan_stride_check() in kernels.cpp; wired in queue.cpp. slangc=0, val=0.
+
+S1b-3 STEPS 3-5 HANDOFF (NOT started; context ran short after 1-2)
+ ---------------------------------------------------------------------------
+ STEP 3 = integrator_state.slang: INTEGRATOR_STATE / INTEGRATOR_STATE_WRITE
+   equivalents for the members INIT_FROM_CAMERA + INTERSECT_CLOSEST +
+   SHADE_SURFACE(diffuse) touch. GPU accessor form (state.h:273-276):
+   `kernel_integrator_state.<ns>.<mem>[state]` = load the pointer member at a
+   CONSTANT offset in IntegratorStateGPU (BDA pointer load, safe on both dev),
+   then `[state]` on the flat typed data pointer (OpPtrAccessChain, safe).
+   Strides: use float3* for packed_float3 (12, confirmed) or float*+3i;
+   exact-width view for SUB4 (uint16/uint8/bool — do NOT use uint); float/uint/
+   int=4, float4=16. Array members are ARRAY-OF-STRUCTS: base ptr to the slot
+   struct (volume_stack[ai] is 16B: object@0, shader@8), NOT the SoA object[32]
+   in the carried-over vulkan_data.slang (that mirror's array layout is WRONG —
+   flag/fix or bypass). Do NOT make strided uint64 data arrays (SwiftShader cap
+   11 crash). Read WHICH members those 3 kernels touch from init_from_camera.h /
+   intersect_closest / shade_surface before writing; list unverified ones "not done."
+ STEP 4 = gate probe: write known values via every accessor (incl. NON-constant
+   index into fixed arrays) for several state indices; host verifies each landed
+   at the exact byte offset from the step-1 table + canaries around/between.
+   NEGATIVE that MUST be detected: use the WRONG 16-byte stride for one packed
+   member -> probe must catch the corruption (if not detected, report+stop).
+   Allocate state with Cycles' own sizing (path_trace_work_gpu.cpp estimate +
+   alloc_integrator_soa logic). Requires reading init_from_camera + path_rng.
+ STEP 5 = layer proven 0 VUID, every VkResult checked, slangc+spirv-val exit 0.
+ Reusable: stride-table + stride-check probes (env gated) already prove the
+ patterns; run ALL new probes on RX 570 AND SwiftShader (VK_ICD_FILENAMES=...\json).
+
 M4e S1b-2 SESSION (Stage 0: dynindex experiment) — 2026-10-22
 ================================================================================
-STATUS: Stage 0 COMPLETE (report-only experiment). NEG1 WAIVED by the user for
-M4/M5 (text below). S1b(a) items 1-7 NOT started: assessed as too large to do
-faithfully + compile + report within remaining context; left for its own session.
 
 NEG1 WAIVER (verbatim, as instructed)
  ---------------------------------------------------------------------------

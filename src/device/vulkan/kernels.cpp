@@ -2014,6 +2014,423 @@ bool vulkan_kdata_probe(VulkanDevice *dev)
 }
 
 /* =========================================================================
+ * M4e S1b-3 step 1: IntegratorStateGPU STRIDE TABLE (host, no GPU; optional,
+ * env CYCLES_VULKAN_STATE_STRIDE_TABLE=1).
+ *
+ * Expands state_template.h + shadow_state_template.h with the SAME macros the
+ * real SoA allocator uses (path_trace_work_gpu.cpp:143-201), but PRINTS one
+ * row per member instead of allocating. The allocator's element size for a
+ * member is sizeof(type): it builds `device_only_memory<type>` and calls
+ * `alloc_to_device(max_num_paths_)` (path_trace_work_gpu.cpp:151-152 for
+ * KERNEL_STRUCT_MEMBER, 180-181 for KERNEL_STRUCT_ARRAY_MEMBER), so the SoA
+ * element stride a Slang accessor MUST use equals sizeof(type).
+ *
+ * Two hazard classes are flagged, because the natural Slang type for those
+ * members has a DIFFERENT size than the allocator element (a silent stride
+ * corruption if the accessor uses the natural type):
+ *   PACKED3  sizeof==12 : packed_float3 / PackedSpectrum (types_float3.h:198
+ *            static_assert 12; types_spectrum.h:14 PackedSpectrum=packed_float3).
+ *            NOT 16-byte Slang float3. Read via a float* base + 3*i (see step 2).
+ *   SUB4     sizeof<4   : uint16_t (2) / uint8_t (1). Not 4-byte uint/int; use
+ *            an exact-width view (a uint16 or uint8 pointer, or raw bytes),
+ *            never uint.
+ * Array members (volume_stack, shadow_isect, shadow_volume_stack) are
+ * ARRAY-OF-STRUCTS in the allocator (a `for (array_index...)` loop emits a
+ * separate device_only_memory per slot), so `vs[ai].object` is at ai*16 + 0,
+ * NOT ai*8. The base pointer must therefore be to the whole slot struct.
+ *
+ * This function never touches the GPU: it only sizeof()/prints, so it is safe
+ * to call on any device (or before one exists). ========================================================================= */
+
+bool vulkan_state_stride_table(VulkanDevice *dev)
+{
+  (void)dev;
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+  if (getenv("CYCLES_VULKAN_STATE_STRIDE_TABLE") == nullptr) return true;
+
+  fprintf(stderr,
+          "\n=== M4e S1b-3 IntegratorStateGPU STRIDE TABLE ===\n"
+          "allocator element size == sizeof(type)  [device_only_memory<type>.alloc_to_device("
+          "max_num_paths_), path_trace_work_gpu.cpp:151-152 / 180-181]\n"
+          "flags: PACKED3 = packed_float3/PackedSpectrum (12B; Slang float3 is 16B -> use float* "
+          "base+3*i);  SUB4 = uint16_t/uint8_t (<4B; use exact-width view, not uint*)\n\n");
+
+  /* Same macro skeleton as path_trace_work_gpu.cpp:143-196, but printing a
+   * table row per member. `feature` is unused so KernelFeatureRequest(...) is
+   * discarded by the preprocessor (need not be defined here). The shadow
+   * template's struct names already carry the "shadow_" prefix, so no extra
+   * label is required. */
+#define KERNEL_STRUCT_BEGIN(name) \
+  fprintf(stderr, "STRUCT %s\n", #name); \
+  for (int _ai = 0;; _ai++) {
+#define STRIDE_FLAG(type) (sizeof(type) == 12 ? "PACKED3" : (sizeof(type) < 4 ? "SUB4" : "ok"))
+#define KERNEL_STRUCT_MEMBER(parent_struct, type, name, feature) \
+  fprintf(stderr, "  %s.%-26s type=%-16s elem_size=%-3zu %s\n", \
+          #parent_struct, #name, #type, sizeof(type), STRIDE_FLAG(type));
+#define KERNEL_STRUCT_MEMBER_PACKED KERNEL_STRUCT_MEMBER
+#define KERNEL_STRUCT_BEGIN_PACKED(parent_struct, feature) KERNEL_STRUCT_BEGIN(parent_struct)
+#define KERNEL_STRUCT_ARRAY_MEMBER(parent_struct, type, name, feature) \
+  fprintf(stderr, "  %s[%d].%-22s type=%-16s elem_size=%-3zu %s\n", \
+          #parent_struct, _ai, #name, #type, sizeof(type), STRIDE_FLAG(type));
+#define KERNEL_STRUCT_END(name) \
+  (void)_ai; \
+  break; \
+  }
+#define KERNEL_STRUCT_END_ARRAY(name, cpu_size, gpu_size) \
+  if (_ai >= (int)(gpu_size)-1) break; \
+  }
+#define KERNEL_STRUCT_VOLUME_STACK_SIZE MAX_VOLUME_STACK_SIZE
+
+#include "kernel/integrator/state_template.h"
+#include "kernel/integrator/shadow_state_template.h"
+
+#undef KERNEL_STRUCT_BEGIN
+#undef KERNEL_STRUCT_BEGIN_PACKED
+#undef KERNEL_STRUCT_MEMBER
+#undef KERNEL_STRUCT_MEMBER_PACKED
+#undef KERNEL_STRUCT_ARRAY_MEMBER
+#undef KERNEL_STRUCT_END
+#undef KERNEL_STRUCT_END_ARRAY
+#undef KERNEL_STRUCT_VOLUME_STACK_SIZE
+#undef STRIDE_FLAG
+
+  fprintf(stderr, "=== end stride table ===\n\n");
+  return true;
+}
+
+/* =========================================================================
+ * M4e S1b-3 step 2: GPU SLANG STRIDE CHECK (optional, env
+ * CYCLES_VULKAN_SLANG_STRIDE_PROBE=1 / ..._SPV).
+ *
+ * Dispatches stride_check.slang: 6 typed pointers (one per 64-byte region of a
+ * 512-byte buffer) are pushed; 3 threads write element k = tid.x (a NON-constant
+ * index) via each accessor pattern; the host reads the raw bytes back and
+ * reports where each value landed, i.e. the actual element STRIDE for that type
+ * on this compiler+driver. Compared against the step-1 table (sizeof(type)).
+ *
+ * The two questions it answers:
+ *   (1) what stride does a Slang float3* use? (region r0) -- SPIR-V ArrayStride says
+ *       12; runtime confirms whether the driver honors 12 (usable for packed_float3)
+ *       or aligns to 16 (would silently corrupt packed data).
+ *   (2) how to read/write a 12-byte packed_float3: via a float* base + 3*i (region
+ *       r1), which only depends on float stride 4 and is therefore robust either way.
+ * Run on BOTH the RX 570 and SwiftShader (DEVICE RULE). ========================================================================= */
+
+namespace {
+
+constexpr uint32_t STRIDE_BUF_BYTES = 512;
+constexpr uint32_t STRIDE_CANARY = 0xDEADBEEFu;
+/* 6 typed region pointers, 64 bytes apart (matches stride_check.slang). */
+constexpr uint32_t STRIDE_PUSH_BYTES = 6 * 8; /* 48 */
+struct StridePushHost {
+  uint64_t r0, r1, r2, r3, r4, r5;
+};
+
+struct StrideResources {
+  VkDevice device = VK_NULL_HANDLE;
+  VkShaderModule module = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkBuffer buf = VK_NULL_HANDLE;
+  VkDeviceMemory mem = VK_NULL_HANDLE;
+
+  ~StrideResources()
+  {
+    if (device == VK_NULL_HANDLE) return;
+    if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+    if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+    if (module) vkDestroyShaderModule(device, module, nullptr);
+    if (pool) vkDestroyCommandPool(device, pool, nullptr);
+    if (buf) vkDestroyBuffer(device, buf, nullptr);
+    if (mem) vkFreeMemory(device, mem, nullptr);
+  }
+};
+
+} /* namespace */
+
+bool vulkan_stride_check(VulkanDevice *dev)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+  if (getenv("CYCLES_VULKAN_SLANG_STRIDE_PROBE") == nullptr) return true;
+
+  LOG_INFO << "Vulkan: Slang stride check starting (CYCLES_VULKAN_SLANG_STRIDE_PROBE=1).";
+
+  StrideResources res;
+  const VkDevice vk_dev = dev->vk_device();
+  res.device = vk_dev;
+
+  /* 1. SPIR-V. */
+  std::vector<char> spirv;
+  const char *env_path = getenv("CYCLES_VULKAN_SLANG_STRIDE_PROBE_SPV");
+  const char *candidates[2] = {env_path, "stride_check.spv"};
+  const char *found = nullptr;
+  for (const char *c : candidates) {
+    if (c && probe_read_whole_file(c, spirv)) {
+      found = c;
+      break;
+    }
+  }
+  if (!found) {
+    LOG_ERROR << "Vulkan: Slang stride check: cannot find stride_check.spv "
+                 "(compile with slangc or set CYCLES_VULKAN_SLANG_STRIDE_PROBE_SPV).";
+    return false;
+  }
+  if (spirv.size() % 4 != 0) {
+    LOG_ERROR << "Vulkan: Slang stride check: '" << found << "' not a valid SPIR-V module.";
+    return false;
+  }
+  LOG_INFO << "Vulkan: Slang stride check: spirv='" << found << "' (" << spirv.size() << " bytes).";
+
+  /* 2. Module. */
+  VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = spirv.size();
+  smi.pCode = reinterpret_cast<const uint32_t *>(spirv.data());
+  if (vkCreateShaderModule(vk_dev, &smi, nullptr, &res.module) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Slang stride check: vkCreateShaderModule failed.";
+    return false;
+  }
+
+  /* 3. Pipeline layout: one 48-byte push range. */
+  VkPushConstantRange pcr{};
+  pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pcr.offset = 0;
+  pcr.size = STRIDE_PUSH_BYTES;
+  VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pli.pushConstantRangeCount = 1;
+  pli.pPushConstantRanges = &pcr;
+  if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &res.layout) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Slang stride check: pipeline layout creation failed.";
+    return false;
+  }
+
+  /* 4. Compute pipeline (entry "main"). */
+  VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  cpi.stage.module = res.module;
+  cpi.stage.pName = "main";
+  cpi.layout = res.layout;
+  if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &res.pipeline) !=
+      VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Slang stride check: compute pipeline creation failed.";
+    return false;
+  }
+
+  /* 5. One 512-byte host-visible+coherent+device-address buffer. */
+  auto make_bda_buffer = [&](VkDeviceSize size, VkBuffer &buf, VkDeviceMemory &mem) -> bool {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(vk_dev, &bci, nullptr, &buf) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Slang stride check: buffer creation failed.";
+      return false;
+    }
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(vk_dev, buf, &reqs);
+    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &flags_info;
+    ai.allocationSize = reqs.size;
+    ai.memoryTypeIndex = dev->find_memory_type(
+        reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vkAllocateMemory(vk_dev, &ai, nullptr, &mem) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Slang stride check: memory allocation failed.";
+      return false;
+    }
+    if (vkBindBufferMemory(vk_dev, buf, mem, 0) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Slang stride check: memory bind failed.";
+      return false;
+    }
+    return true;
+  };
+  if (!make_bda_buffer(STRIDE_BUF_BYTES, res.buf, res.mem)) return false;
+
+  /* Prefill with the canary so unwritten slots are detectable. */
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.mem, 0, STRIDE_BUF_BYTES, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Slang stride check: mapping buffer failed.";
+      return false;
+    }
+    uint32_t *w = static_cast<uint32_t *>(m);
+    for (uint32_t i = 0; i < STRIDE_BUF_BYTES / 4; i++) w[i] = STRIDE_CANARY;
+    vkUnmapMemory(vk_dev, res.mem);
+  }
+
+  VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  bai.buffer = res.buf;
+  const uint64_t base = vkGetBufferDeviceAddress(vk_dev, &bai);
+
+  StridePushHost push{};
+  push.r0 = base + 0;
+  push.r1 = base + 64;
+  push.r2 = base + 128;
+  push.r3 = base + 192;
+  push.r4 = base + 256;
+  push.r5 = base + 320;
+
+  /* 6. Record + submit one workgroup of 3 threads (numthreads(3,1,1)). */
+  const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
+  VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  cpci.queueFamilyIndex = family;
+  if (vkCreateCommandPool(vk_dev, &cpci, nullptr, &res.pool) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Slang stride check: command pool creation failed.";
+    return false;
+  }
+  VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = res.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(vk_dev, &cbai, &cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Slang stride check: command buffer allocation failed.";
+    return false;
+  }
+  VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Slang stride check: vkBeginCommandBuffer failed.";
+    return false;
+  }
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.pipeline);
+  vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, STRIDE_PUSH_BYTES, &push);
+  vkCmdDispatch(cmd, 1, 1, 1);
+  if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Slang stride check: vkEndCommandBuffer failed.";
+    return false;
+  }
+
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VkFence fence_real = VK_NULL_HANDLE;
+  if (vkCreateFence(vk_dev, &fci, nullptr, &fence_real) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Slang stride check: fence creation failed.";
+    return false;
+  }
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd;
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(vk_dev, family, 0, &queue);
+  if (vkQueueSubmit(queue, 1, &si, fence_real) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Slang stride check: queue submit failed.";
+    vkDestroyFence(vk_dev, fence_real, nullptr);
+    return false;
+  }
+  if (vkWaitForFences(vk_dev, 1, &fence_real, VK_TRUE, 5000000000ull) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Slang stride check: fence wait failed (shader hung?).";
+    vkDestroyFence(vk_dev, fence_real, nullptr);
+    return false;
+  }
+  vkDestroyFence(vk_dev, fence_real, nullptr);
+
+  /* 7. Read back and measure strides. */
+  std::vector<uint8_t> raw(STRIDE_BUF_BYTES);
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.mem, 0, STRIDE_BUF_BYTES, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Slang stride check: readback map failed.";
+      return false;
+    }
+    memcpy(raw.data(), m, STRIDE_BUF_BYTES);
+    vkUnmapMemory(vk_dev, res.mem);
+  }
+
+  auto rf = [&](int off) -> float {
+    float f;
+    memcpy(&f, raw.data() + off, 4);
+    return f;
+  };
+  auto ru32 = [&](int off) -> uint32_t {
+    uint32_t v;
+    memcpy(&v, raw.data() + off, 4);
+    return v;
+  };
+  auto ri32 = [&](int off) -> int32_t {
+    int32_t v;
+    memcpy(&v, raw.data() + off, 4);
+    return v;
+  };
+  /* Find where a given float value landed inside [start,end). */
+  auto find_f = [&](int start, int end, float want) -> int {
+    for (int o = start; o < end; o += 4) {
+      if (rf(o) == want) return o;
+    }
+    return -1;
+  };
+
+  bool all_ok = true;
+  auto expect = [&](const char *name, bool ok) {
+    if (!ok) all_ok = false;
+    fprintf(stderr, "  %-28s %s\n", name, ok ? "OK" : "MISMATCH");
+  };
+
+  fprintf(stderr, "\n=== M4e S1b-3 SLANG STRIDE CHECK (RX570 vs SwiftShader reported per run) ===\n");
+
+  /* R0: float3* stride (measured, not assumed). */
+  int o0 = find_f(0, 64, 1000.0f);
+  int o1 = find_f(0, 64, 1001.0f);
+  int o2 = find_f(0, 64, 1002.0f);
+  int stride_f3 = (o0 >= 0 && o1 >= 0) ? (o1 - o0) : -1;
+  fprintf(stderr,
+          "  float3* stride (region r0): off(0)=%d off(1)=%d off(2)=%d => stride=%d "
+          "(SPIR-V ArrayStride=12; 12 matches packed_float3, 16 would NOT)\n",
+          o0, o1, o2, stride_f3);
+  /* The packed_float3 accessor must land elements 12 bytes apart. */
+  expect("float3* stride == 12 (packed_float3-safe)", stride_f3 == 12);
+
+  /* R1: packed3 via float* base + 3*i -> element k at 64 + k*12. */
+  bool r1_ok = true;
+  for (int k = 0; k < 3; k++) {
+    int eb = 64 + k * 12;
+    if (rf(eb) != 100.0f + k || rf(eb + 4) != 200.0f + k || rf(eb + 8) != 300.0f + k)
+      r1_ok = false;
+  }
+  expect("packed3 via float*+3i @12B (k=0,1,2)", r1_ok);
+
+  /* R2: float* -> 128 + k*4. */
+  bool r2_ok = true;
+  for (int k = 0; k < 3; k++)
+    if (rf(128 + k * 4) != 10.0f + k) r2_ok = false;
+  expect("float* stride == 4", r2_ok);
+
+  /* R3: uint* -> 192 + k*4. */
+  bool r3_ok = true;
+  for (int k = 0; k < 3; k++)
+    if (ru32(192 + k * 4) != 7000u + k) r3_ok = false;
+  expect("uint* stride == 4", r3_ok);
+
+  /* R4: int* -> 256 + k*4. */
+  bool r4_ok = true;
+  for (int k = 0; k < 3; k++)
+    if (ri32(256 + k * 4) != -100 - k) r4_ok = false;
+  expect("int* stride == 4", r4_ok);
+
+  /* R5: float4* -> 320 + k*stride (measure). */
+  int f4o0 = find_f(320, 384, 50.0f);
+  int f4o1 = find_f(320, 384, 51.0f);
+  int stride_f4 = (f4o0 >= 320 && f4o1 >= 320) ? (f4o1 - f4o0) : -1;
+  fprintf(stderr, "  float4* stride (region r5): off(0)=%d off(1)=%d => stride=%d (expect 16)\n",
+          f4o0, f4o1, stride_f4);
+  expect("float4* stride == 16", stride_f4 == 16);
+
+  /* Canary: a spot in region 0 past the writes (byte 60) should be untouched. */
+  bool canary_ok = (ru32(60) == STRIDE_CANARY);
+  expect("canary at byte 60 intact", canary_ok);
+
+  fprintf(stderr, "=== Slang stride check: %s ===\n\n", all_ok ? "ALL OK" : "MISMATCHES PRESENT");
+  return all_ok;
+}
+
+/* =========================================================================
  * M4e S1b-1 minimal dynamic-index repro probe (optional, env
  * CYCLES_VULKAN_DYNINDEX_REPRO=1)
  * =========================================================================
