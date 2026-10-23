@@ -131,17 +131,34 @@ VulkanDevice::VulkanDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
   VkPhysicalDeviceBufferDeviceAddressFeatures supported_bda_features{};
   supported_bda_features.sType =
       VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
+  // shaderInt8 lives in VkPhysicalDeviceVulkan12Features (core 1.2, from
+  // VK_KHR_8bit_storage / VK_KHR_shader_float16_int8); chain it after the BDA struct so
+  // one vkGetPhysicalDeviceFeatures2 call reports BDA + shaderInt8 together.
+  VkPhysicalDeviceVulkan12Features supported_v12_features{};
+  supported_v12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
   VkPhysicalDeviceFeatures2 supported_features2{};
   supported_features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
   supported_features2.pNext = &supported_bda_features;
+  supported_bda_features.pNext = &supported_v12_features;
   vkGetPhysicalDeviceFeatures2(physical_device, &supported_features2);
 
   const bool have_shader_int64 = (supported_features.shaderInt64 == VK_TRUE);
   const bool have_bda = (supported_bda_features.bufferDeviceAddress == VK_TRUE);
+  // Sub-word SoA fields (uint16_t bounce/queued_kernel/rng_offset, uint8_t
+  // visibility/mnee -- S1b-4 Stage A) are written with TRUE narrow stores through
+  // PhysicalStorageBuffer. Those declare SPIR-V Int16/Int8, which the validation layer
+  // gates on shaderInt16 (base features) / shaderInt8 (Vulkan12), per the probe's
+  // VUID-VkShaderModuleCreateInfo-pCode-08740. Enable them when the device reports them.
+  const bool have_shader_int16 = (supported_features.shaderInt16 == VK_TRUE);
+  const bool have_shader_int8 = (supported_v12_features.shaderInt8 == VK_TRUE);
 
   if (!have_shader_int64) {
     LOG_WARNING << "Vulkan: device lacks shaderInt64; kernels requiring 64-bit "
                  << "arithmetic will not be available.";
+  }
+  if (!have_shader_int16 || !have_shader_int8) {
+    LOG_WARNING << "Vulkan: device lacks shaderInt16 and/or shaderInt8; sub-word "
+                 << "(uint16/uint8) SoA fields will need the atomic fallback.";
   }
   if (!have_bda) {
     /* Our entire memory model stores Buffer Device Address values as device_ptr
@@ -152,15 +169,25 @@ VulkanDevice::VulkanDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
     return;
   }
 
-  VkPhysicalDeviceBufferDeviceAddressFeatures buffer_address_features{};
-  buffer_address_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES;
-  buffer_address_features.bufferDeviceAddress = VK_TRUE;
+  // bufferDeviceAddress was promoted into VkPhysicalDeviceVulkan12Features (core 1.2).
+  // The spec forbids having BOTH VkPhysicalDeviceBufferDeviceAddressFeatures and
+  // VkPhysicalDeviceVulkan12Features in the device-create pNext chain (VUID
+  // -VkDeviceCreateInfo-pNext-02830: a feature set VK_TRUE in one struct and VK_FALSE in
+  // the other would be ambiguous), so we enable bufferDeviceAddress + shaderInt8 in a
+  // SINGLE Vulkan12Features struct. Only request features the device supports (queried
+  // above); a Vulkan 1.2 device is required for this struct to be valid, which the
+  // successful shaderInt8 query already implies.
+  VkPhysicalDeviceVulkan12Features device_v12_features{};
+  device_v12_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES;
+  device_v12_features.bufferDeviceAddress = VK_TRUE;
+  device_v12_features.shaderInt8 = have_shader_int8 ? VK_TRUE : VK_FALSE;
 
-  // shaderInt64 lives in the BASE VkPhysicalDeviceFeatures struct (core since Vulkan 1.0),
-  // not in an extension struct. There is no VkPhysicalDeviceShaderInt64Features type.
-  // Only request it if the device actually supports it (queried above).
+  // shaderInt64 / shaderInt16 live in the BASE VkPhysicalDeviceFeatures struct (core
+  // since Vulkan 1.0), not in an extension struct. There is no
+  // VkPhysicalDeviceShaderInt64Features type. Only request what the device supports.
   VkPhysicalDeviceFeatures base_features{};
   base_features.shaderInt64 = have_shader_int64 ? VK_TRUE : VK_FALSE;
+  base_features.shaderInt16 = have_shader_int16 ? VK_TRUE : VK_FALSE;
 
   // Extension features are chained via the pNext pointer instead.
   float queue_priority = 1.0f;
@@ -176,7 +203,7 @@ VulkanDevice::VulkanDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
   // of them because it names the *enumerator*, not a field path.
   const VkDeviceCreateInfo dev_create_info{
       .sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
-      .pNext = &buffer_address_features,        // Chained extension features (BDA)
+      .pNext = &device_v12_features,           // Chained extension features (BDA + shaderInt8)
       .queueCreateInfoCount = 1,
       .pQueueCreateInfos = &queue_create_info,
       .pEnabledFeatures = &base_features,       // Core features (shaderInt64)

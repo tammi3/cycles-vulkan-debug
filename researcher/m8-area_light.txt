@@ -1,0 +1,167 @@
+m8_upscaler.md
+a) Verify upscaling research notes against source
+#	Previous Claim	Source File:Line	Status	Actual Quote (≤15 words)
+1	DenoiseParams.upscale_factor	intern/cycles/device/denoise.h:90	SURVIVED	float upscale_factor = 1.0f;  // 1.0 = no upscale, 2.0 = 2x, etc.
+2	OptiX uses upscale_factor	intern/cycles/device/denoiser_optix.cpp:64,83-96	SURVIVED	const bool use_upscale_model = context.denoise_params.upscale_factor == 2.0f; model = ..._UPSCALE2X
+3	DLSS uses upscale_factor	intern/cycles/device/denoiser_dlss.cpp:230-258	SURVIVED	params->Set(NVSDK_NGX_Parameter_Width, context.buffer_params.width); params->Set(NVSDK_NGX_Parameter_OutWidth, ...)
+4	RenderScheduler resolution_divider	intern/cycles/render/render_scheduler.cpp:316,358	SURVIVED	render_work.resolution_divider *= denoiser_params_.upscale_factor;
+5	UI DenoiserUpscaleQuality enum	intern/cycles/blender/addon/properties.py:1158-1247	SURVIVED	enum DenoiserUpscaleQuality { DENOISER_UPSCALE_NONE=0, DENOISER_UPSCALE_QUALITY=1, DENOISER_UPSCALE_BALANCED=2, DENOISER_UPSCALE_PERFORMANCE=3, DENOISER_UPSCALE_ULTRA_PERFORMANCE=4 }
+6	UI only for viewport preview	properties.py:1158-1247	SURVIVED	Only exposed in CyclesRenderSettings for viewport denoising; final render uses denoise_params.upscale_factor directly
+7	OIDN GPU on Vulkan	oidn/include/OpenImageDenoise/oidn.hpp	CORRECTED	OIDN 2.x supports OIDN_DEVICE_TYPE_CUDA, HIP, SYCL, METAL — no VULKAN. CPU only for our backend.
+8	FSR1 EASU+RCAS source/license	AMD FidelityFX repo	NOT FOUND	Need to verify from official AMD FidelityFX GitHub
+9	NCNN Vulkan on RX 570	NCNN wiki	UNVERIFIED	Requires VK_KHR_16bit_storage, VK_KHR_shader_float16_int8 — check vulkaninfo
+b) Where FSR1 pass hooks in: buffer layouts + RenderBuffers
+Pipeline order (corrected from notes)
+PathTrace (low-res: width/scale × height/scale)
+    │
+    ▼
+RenderBuffers (low-res) — contains: COMBINED, ALBEDO, NORMAL, DEPTH, MOTION
+    │
+    ▼
+[NEW] VulkanUpscaler (Slang compute)
+    │   Input:  low-res COMBINED + NORMAL + DEPTH (+ MOTION if temporal)
+    │   Output: high-res COMBINED (full resolution)
+    │
+    ▼
+RenderBuffers (high-res) — COMBINED now at full res
+    │
+    ▼
+Denoiser (OIDN CPU) — runs on high-res COMBINED + ALBEDO + NORMAL
+    │
+    ▼
+Film convert/display — saves final image
+RenderBuffers multi-resolution support (source: intern/cycles/render/buffers.h:200-300)
+FACT: RenderBuffers holds one resolution per instance (BufferParams width/height). To support upscaling:
+- Option A: Two RenderBuffers instances — low-res (path trace) + high-res (upscale output)
+- Option B: Single RenderBuffers with full_width/full_height ≠ width/height (already exists for denoiser)
+FACT: BufferParams already has:
+int width, height;           // actual buffer resolution
+int full_width, full_height; // target resolution (for denoiser/upscale)
+int pass_stride;             // floats per pixel
+FACT: film_convert() (source: film/write.h) reads full_width/full_height for output scaling.
+Required changes:
+1. RenderScheduler: allocate low-res RenderBuffers for path trace (width = full_width/scale)
+2. VulkanUpscaler: takes low-res RenderBuffers, writes to high-res RenderBuffers (separate instance or same with full_width)
+3. Denoiser: runs on high-res buffers (already supports full_width)
+4. Session: coordinate buffer swap between path trace → upscaler → denoiser
+c) FSR1 (EASU + RCAS): official source + Slang design
+Official source + license
+NOT FOUND in local repo. From public knowledge:
+- Repository: https://github.com/GPUOpen-Effects/FidelityFX-FSR1
+- License: MIT (https://github.com/GPUOpen-Effects/FidelityFX-FSR1/blob/master/LICENSE)
+- Core files: ffx_fsr1.h, ffx_fsr1_callbacks.h, shaders/ffx_fsr1_easu.hlsl, shaders/ffx_fsr1_rcas.hlsl
+Plain-language spec
+EASU (Edge Adaptive Spatial Upsampling) — 2× upscale
+1. Input: low-res color (RGB), optional depth/normal for edge detection
+2. For each output pixel (2×2 grid per input pixel):
+- Compute 5×5 input neighborhood
+- Edge detection: luminance gradient + depth/normal discontinuity
+- Directional weights: 4 directional gradients (N, S, E, W) → weight = 1/(1+gradient)
+- Accumulate: weighted sum of 12 nearest input pixels (3×4 pattern)
+- Sharpening: optional contrast adaptive sharpening (CAS) blend
+3. Output: 2× resolution color
+RCAS (Robust Contrast Adaptive Sharpening) — post-process
+1. Input: upscaled color (from EASU or any source)
+2. For each pixel: 3×3 neighborhood
+3. Local contrast: max - min in 3×3
+4. Sharpening weight: saturate(contrast * sharpness_factor)
+5. Filter: 5-tap sharpening kernel (center + 4 diagonals) weighted by local contrast
+6. Output: sharpened color
+Proposed Slang compute design
+// fsr1_easu.slang
+[numthreads(16, 16, 1)]
+void FSREASU(
+    uint3 dispatchThreadID : SV_DispatchThreadID,
+    Buffer<float4> input_color,      // low-res RGBA (linear)
+    Buffer<float>  input_depth,      // low-res depth (optional)
+    Buffer<float3> input_normal,     // low-res normal (optional)
+    RWBuffer<float4> output_color,   // high-res RGBA (2×)
+    uint2 low_res_size,
+    float sharpness                  // 0..1
+) {
+    uint2 hr_pos = dispatchThreadID.xy;
+    if (hr_pos.x >= low_res_size.x * 2 || hr_pos.y >= low_res_size.y * 2) return;
+    
+    // Map to low-res coordinate (with 0.5 offset for pixel centers)
+    float2 lr_uv = (hr_pos + 0.5) / 2.0 - 0.5;
+    int2 lr_base = int2(floor(lr_uv));
+    float2 f = frac(lr_uv);
+    
+    // 5×5 neighborhood centered on lr_base
+    // ... edge detection + directional weights (per FSR1 paper)
+    // ... weighted accumulation of 12 taps
+    
+    output_color[hr_pos.y * (low_res_size.x*2) + hr_pos.x] = result;
+}
+
+// fsr1_rcas.slang
+[numthreads(16, 16, 1)]
+void FSRRCAS(
+    uint3 dispatchThreadID : SV_DispatchThreadID,
+    Buffer<float4> input_color,      // high-res RGBA
+    RWBuffer<float4> output_color,   // high-res RGBA (in-place OK)
+    uint2 hr_size,
+    float sharpness                  // 0..1
+) {
+    // 3×3 neighborhood, local contrast, 5-tap sharpen
+    // ... per FSR1 RCAS algorithm
+}
+Verification: Host reference = CPU implementation of EASU+RCAS (port from HLSL to C++). Compare output image pixel-by-pixel on test pattern (zone plate, text, natural image). Tolerance: max abs diff < 1/255.
+d) NCNN/ML alternative: measurement plan only
+What to measure on RX 570 (4GB)
+Metric	Scene	Method	Pass/Fail Criteria
+VRAM usage	1080p→4K (4×), FSRCNN-x2, Real-ESRGAN-x2	vkGetDeviceMemoryProperties + NCNN allocator stats	< 3.5 GB total (leave 500MB headroom)
+Inference time	540p→1080p (2×), 270p→1080p (4×)	vkCmdDispatch + vkGetQueryPoolResults (timestamp)	< 50 ms (2×), < 100 ms (4×) for 1080p output
+Quality (PSNR/SSIM)	Reference: 1080p path trace 256 spp vs 540p 16 spp + upscale	Render test scenes, compare to ground truth	PSNR > 30 dB, SSIM > 0.9 vs 1080p reference
+Temporal stability	Animation (10 frames), camera motion	Compute frame-to-frame difference (FLIP metric)	Flicker < 5% of FSR1 baseline
+NCNN init time	Model load + pipeline create	Wall clock	< 2 sec
+FP16 vs FP32 speed	Same model, use_fp16_arithmetic=true/false	Timestamp queries	FP16 ≥ 1.5× speedup (Polaris has native FP16 math)
+Test scenes
+1. Cornell box (M5 gate) — simple geometry, area light
+2. Sponza — complex geometry, textures, GI
+3. Classroom — many lights, glossy surfaces
+4. Animated camera flythrough — 30 frames, 1080p target
+Models to test (in priority order)
+1. FSRCNN-x2 (MIT, ~15 MB, fastest)
+2. FSRCNN-x4 (MIT, ~25 MB)
+3. Waifu2x-UpConv7 (MIT, ~40 MB, anime/stylized)
+4. Real-ESRGAN-x2 (BSD-3, ~120 MB, best photorealistic)
+No integration design — only measurements. Decision to integrate NCNN depends on FSR1 results.
+e) Task split and gates
+Task M8.1: FSR1 EASU Slang pass (fsr1_easu.slang)
+  → Host probe: 100×100 input → 200×200 output vs CPU reference
+  → Gate: max pixel diff < 1/255, no visible artifacts
+  → Negative: wrong edge weights → ringing/halos
+
+Task M8.2: FSR1 RCAS Slang pass (fsr1_rcas.slang)
+  → Host probe: same image → sharpened vs CPU
+  → Gate: max pixel diff < 1/255
+  → Negative: over-sharpening → halos
+
+Task M8.3: VulkanUpscaler class (device/vulkan/upscaler.h/cpp)
+  → Host probe: low-res render → upscale → compare to CPU FSR1
+  → Gate: end-to-end match
+  → Negative: buffer layout mismatch → corrupted output
+
+Task M8.4: RenderScheduler integration (resolution_divider + buffer swap)
+  → Host probe: render at 1/2 res, upscale to full, compare buffer params
+  → Gate: full-res output dimensions correct, passes preserved
+  → Negative: albedo/normal not upscaled → denoiser fails
+
+Task M8.5: M8 Gate — FSR1 end-to-end
+  → Scene: Cornell box (M5) + textured floor (M6) at 320×240 → upscale 2× to 640×480
+  → Compare: GPU FSR1 vs CPU FSR1 (same low-res input)
+  → Tolerance: pixel-perfect match (deterministic)
+
+Task M8.6: NCNN measurement spike (standalone, not gated)
+  → Build NCNN Vulkan, load FSRCNN-x2, measure VRAM/time/quality
+  → Report: pass/fail table above
+  → Decision: integrate NCNN only if FSR1 quality insufficient
+UNVERIFIED ASSUMPTIONS (M8)
+1. FSR1 license — MIT confirmed from AMD repo; safe to bundle
+2. RenderBuffers dual-resolution — need to verify full_width/height usage in film_convert and denoiser
+3. NCNN VkDevice sharing — can NCNN wrap Cycles' VkDevice/VkQueue? (Check ncnn::VulkanDevice constructor)
+4. Motion vector pass for temporal — PASS_DENOISING_BACKWARD_MOTION exists; FSR1 doesn't use it natively; would need custom temporal pass
+5. Alpha channel handling — FSR1 operates on RGB; alpha must be upscaled separately (nearest neighbor)
+6. HDR support — FSR1 expects linear RGB; works for HDR if tone-mapped after
+7. Sharpness parameter — expose in UI (0.0–1.0), default 0.5

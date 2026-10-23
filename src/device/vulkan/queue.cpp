@@ -44,6 +44,10 @@ bool vulkan_state_stride_table(VulkanDevice *device);
  * Runs at most once, no-op unless CYCLES_VULKAN_SLANG_STRIDE_PROBE=1. */
 bool vulkan_stride_check(VulkanDevice *device);
 
+/* M4e S1b-4 Stage A sub-word access probe hook, implemented in kernels.cpp.
+ * Runs at most once, no-op unless CYCLES_VULKAN_SUBWORD_PROBE=1. */
+bool vulkan_subword_check(VulkanDevice *device);
+
 VulkanQueue::VulkanQueue(VulkanDevice *d) : DeviceQueue(d), vulkan_device_(d) {}
 
 int VulkanQueue::num_concurrent_states(const size_t s) const {
@@ -90,6 +94,9 @@ bool VulkanQueue::enqueue(DeviceKernel k, const int n, const DeviceKernelArgumen
   /* M4e S1b-3 step 2: optional one-shot Slang stride check (env
    * CYCLES_VULKAN_SLANG_STRIDE_PROBE=1), same no-op-unless-set semantics. */
   vulkan_stride_check(vulkan_device_);
+  /* M4e S1b-4 Stage A: optional one-shot sub-word access probe (env
+   * CYCLES_VULKAN_SUBWORD_PROBE=1), same no-op-unless-set semantics. */
+  vulkan_subword_check(vulkan_device_);
   vulkan_device_->set_error("Vulkan: kernel dispatch not implemented yet (M4)");
   debug_enqueue_end();
   return false;

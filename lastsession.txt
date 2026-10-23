@@ -1,216 +1,122 @@
-M4e S1b-3 SESSION (state accessors + stride verification) — 2026-10-22
-================================================================================
-STATUS: STEPS 1 AND 2 COMPLETE (stride table + GPU stride check, both verified on
-RX 570 AND SwiftShader, 0 VUID, all OK). Steps 3-5 (accessors, gate, negative)
-NOT started — handed off (see STILL OPEN). NEG1 waiver (from S1b-2) still below.
+M4e S1b-4 SESSION (sub-word access: STAGE A COMPLETE; STAGE B NOT started) — 2026-10-22
+========================================================================================
+STATUS: STAGE A (items 1-4) COMPLETE on both devices, 0 VUID. Item 4 DECIDED (atomic
+fallback + accessor layer). STAGE B: item 5 BASELINE run (ABI probe ALL MATCH, sizeof=2128
+already correct); items 5-fix/6-9 NOT started — context ran short, handed off (see STILL
+OPEN). NEG1 waiver (S1b-2) still in force below.
 
-STEP 1 RESULT — IntegratorStateGPU STRIDE TABLE (env CYCLES_VULKAN_STATE_STRIDE_TABLE=1)
- ---------------------------------------------------------------------------
- Probe `vulkan_state_stride_table()` (kernels.cpp, wired queue.cpp) expands
- state_template.h + shadow_state_template.h with the SAME macros as the SoA
- allocator (path_trace_work_gpu.cpp:143-201) but prints a row per member.
- Allocator element size == sizeof(type): device_only_memory<type>.alloc_to_device
- (path_trace_work_gpu.cpp:151-152 member / 180-181 array member). So accessor
- stride MUST equal sizeof(type).
-   PACKED3 (12B, NOT Slang float3 16B; use float* base + 3*i):
-     ray.P, ray.D, path.mis_origin_n, path.throughput, path.pass_diffuse_weight,
-     path.pass_glossy_weight, path.denoising_feature_throughput,
-     subsurface.albedo/.radius/.N, shadow_path.throughput/.unshadowed_throughput/
-     .pass_diffuse_weight/.pass_glossy_weight/.unlit_throughput, shadow_ray.P/.D.
-   SUB4 (<4B, exact-width view, NOT uint): all uint16_t bounce fields,
-     path.queued_kernel, path.rng_offset, path.visibility(uint8), path.mnee(uint8),
-     shadow_path.packed_num_hits(uint16)/.lightgroup(uint8), guiding.use_surface_
-     guiding/.use_volume_guiding(bool).
-   ARRAY-OF-STRUCTS (allocator loop = separate device_only_memory per slot):
-     volume_stack[ai].object at ai*16+0 (shader ai*16+8), int elem_size=4;
-     shadow_isect[ai].t at ai*48+0 (u +4,v +8,prim +12,object +16,type +20);
-     shadow_volume_stack[ai].object at ai*16+0.
-   => CONFIRMS the packed_float3=12 blocker from S1b-2, AND reveals the carried-
-     over vulkan_data.slang IntegratorStateGPU mirror decomposes the array members
-     as struct-of-arrays (object[32], t[4]) which is the WRONG layout vs the C++
-     array-of-structs. Accessors must use AoS (base ptr to the slot struct).
- OTHER STEP-1 FACTS: build succeeds; run on RX 570 exit 0, VUID=0. packed_float3=12
- (types_float3.h:198), PackedSpectrum=packed_float3 (types_spectrum.h:14). Path
- guiding OFF in this build (no PATH_GUIDING in CMakeCache; state_template.h uses
- uint64_t for path_segment, state_template.h:129) => templates safe in kernels.cpp.
+STAGE A ITEM 1 — features that gate 16/8-bit access through PhysicalStorageBuffer
+---------------------------------------------------------------------------------
+SPIR-V caps: Int16=22, Int8=39 (spirv.h:1105,1121); Int64=11 for reference.
+Normative citation = probe's captured VUID-VkShaderModuleCreateInfo-pCode-08740:
+  Int16 capability -> VkPhysicalDeviceFeatures::shaderInt16 (base, core 1.0)
+  Int8  capability -> VkPhysicalDeviceVulkan12Features::shaderInt8 (core 1.2)
+storageBuffer16BitAccess (16BitStorage->Vulkan11) / storageBuffer8BitAccess (8BitStorage
+->Vulkan12) govern the DESCRIPTOR StorageBuffer class, NOT PhysicalStorageBuffer; the
+validation layer gates BDA narrow access on shaderInt16/shaderInt8 (the capabilities).
+Device-reported (probe prints them):
+  RX 570    : shaderInt16=1 storageBuffer16BitAccess=1 shaderInt8=1 storageBuffer8BitAccess=1 (ALL).
+  SwiftShader: all 0 (NONE; like it lacks Int64).
 
-STEP 2 RESULT — GPU SLANG STRIDE CHECK (env CYCLES_VULKAN_SLANG_STRIDE_PROBE=1 / ..._SPV)
- ---------------------------------------------------------------------------
- Probe `vulkan_stride_check()` (kernels.cpp, wired queue.cpp) dispatches
- stride_check.slang: 6 typed region pointers pushed; 3 threads write element
- k=tid.x (NON-constant index); host reads raw bytes, reports each type's actual
- element stride. BOTH devices (RX 570 and SwiftShader) AGREE -> ALL OK, exit 0,
- VUID=0:
-   float3* stride        = 12 bytes (off 0,12,24). SPIR-V ArrayStride=12; BOTH
-                           drivers honor 12 => Slang standalone float3* DOES use
-                           stride 12, which MATCHES packed_float3 (12B). So a
-                           ray.P/throughput accessor MAY use float3* directly.
-   packed3 via float*+3i = OK @12B (k=0,1,2). Robust alternative (float stride 4).
-   float*/uint*/int*     = 4 ; float4* = 16 ; canary intact.
-   => ANSWERS: (1) Slang float3* stride = 12 on this compiler, honored by both
-     devices. (2) packed_float3 read/write = EITHER float3* (stride 12, confirmed)
-     OR float* base + 3*i (confirmed). Both viable; float3* is cleaner.
- DEVICE RULE note: RX570==SwiftShader on every value => logic result real.
- SWIFTSHADER TRAP: a uint64_t DATA-array test (OpTypeInt 64) needs Int64
-   capability (SPIR-V cap 11) which SwiftShader Subzero CRASHES on (exit
-   0xC00000FD, "UNSUPPORTED capability 11"). Accessors must avoid strided uint64
-   DATA arrays; pointer MEMBERS (BDA loads at constant offset) are fine on both.
- STEP 2 files: src/kernel/device/vulkan/stride_check.slang (new); host
-   vulkan_stride_check() in kernels.cpp; wired in queue.cpp. slangc=0, val=0.
+STAGE A ITEMS 2-3 — probe (env CYCLES_VULKAN_SUBWORD_PROBE=1; N=256 threads, M=64 iters,
+value depends on iter so an RMW race leaves a STALE value = lost update). Two modules
+(SPIR-V caps are module-global):
+  Module W = subword_word.slang  (uint32 + OpAtomicAnd/Or only, NO Int16/Int8) -> runs anywhere.
+  Module N = subword_narrow.slang (Int16+Int8 true stores) -> feature-gated.
+                      RX 570              SwiftShader
+  atomic16 (AND/OR)   PASS                PASS
+  atomic8  (AND/OR)   PASS                PASS
+  RMW-neg16 (NEG)     DETECTED lost=128   DETECTED lost=128
+  RMW-neg8  (NEG)     DETECTED lost=191   DETECTED lost=192
+  true16 (narrow)     PASS                SKIPPED (no Int16/Int8; RX570-only)
+  true8    (narrow)   PASS                SKIPPED (no Int16/Int8; RX570-only)
+  VUID count          0 (after enabling shaderInt16+shaderInt8)   0
+Negative (item 3) DETECTED on BOTH: non-atomic read-modify-write on a shared word loses
+~half the uint16 / ~3/4 the uint8 updates (lockstep-SIMD lanes read the same stale word,
+both store, one clobbers the other). Atomic AND/OR + true narrow store = no lost updates,
+canaries intact (no OOB).
 
-S1b-3 STEPS 3-5 HANDOFF (NOT started; context ran short after 1-2)
- ---------------------------------------------------------------------------
- STEP 3 = integrator_state.slang: INTEGRATOR_STATE / INTEGRATOR_STATE_WRITE
-   equivalents for the members INIT_FROM_CAMERA + INTERSECT_CLOSEST +
-   SHADE_SURFACE(diffuse) touch. GPU accessor form (state.h:273-276):
-   `kernel_integrator_state.<ns>.<mem>[state]` = load the pointer member at a
-   CONSTANT offset in IntegratorStateGPU (BDA pointer load, safe on both dev),
-   then `[state]` on the flat typed data pointer (OpPtrAccessChain, safe).
-   Strides: use float3* for packed_float3 (12, confirmed) or float*+3i;
-   exact-width view for SUB4 (uint16/uint8/bool — do NOT use uint); float/uint/
-   int=4, float4=16. Array members are ARRAY-OF-STRUCTS: base ptr to the slot
-   struct (volume_stack[ai] is 16B: object@0, shader@8), NOT the SoA object[32]
-   in the carried-over vulkan_data.slang (that mirror's array layout is WRONG —
-   flag/fix or bypass). Do NOT make strided uint64 data arrays (SwiftShader cap
-   11 crash). Read WHICH members those 3 kernels touch from init_from_camera.h /
-   intersect_closest / shade_surface before writing; list unverified ones "not done."
- STEP 4 = gate probe: write known values via every accessor (incl. NON-constant
-   index into fixed arrays) for several state indices; host verifies each landed
-   at the exact byte offset from the step-1 table + canaries around/between.
-   NEGATIVE that MUST be detected: use the WRONG 16-byte stride for one packed
-   member -> probe must catch the corruption (if not detected, report+stop).
-   Allocate state with Cycles' own sizing (path_trace_work_gpu.cpp estimate +
-   alloc_integrator_soa logic). Requires reading init_from_camera + path_rng.
- STEP 5 = layer proven 0 VUID, every VkResult checked, slangc+spirv-val exit 0.
- Reusable: stride-table + stride-check probes (env gated) already prove the
- patterns; run ALL new probes on RX 570 AND SwiftShader (VK_ICD_FILENAMES=...\json).
+STAGE A ITEM 4 — DECISION (USER): both approaches work on the target (RX 570).
+ (a) TRUE NARROW STORE: simplest (p16[t]=v), fastest (1 store), RX570-only (SwiftShader
+     crashes on Int16/Int8 -> cannot dual-device cross-check kernels touching sub-word
+     fields). Needs device.cpp to enable shaderInt16 (base) + shaderInt8 (Vulkan12).
+ (b) ATOMIC AND/OR FALLBACK: works on BOTH devices (feature-independent), no feature gate,
+     but 2 atomics/write (slower) + more complex.
+ (c) HYBRID: uint16 -> narrow store (shaderInt16, base, always safe); uint8 -> atomic
+     fallback (keeps SwiftShader runnable).
+ My lean: (a) true narrow store for target perf + simplicity, with (b) as the documented
+ portable fallback. **USER DECIDED (item 4): Option (b) ATOMIC AND/OR FALLBACK for ALL
+ sub-word writes**, with requirements: (1) every sub-word read/write behind ONE small
+ accessor layer (store_u16/store_u8/load_u16/load_u8), macro-selectable (default = atomic,
+ narrow-store variant kept working/verified by the Stage A probe on RX570); (2) reads =
+ plain 32-bit load + shift/mask; (3) keep the narrow-store variant available; (4) log in
+ DIVERGENCES.md as "functionally equivalent, not result-changing; narrow-store variant to
+ be measured on RX 570 after M5". This gates Stage B accessors.
 
-M4e S1b-2 SESSION (Stage 0: dynindex experiment) — 2026-10-22
-================================================================================
+DEVICE.CPP CHANGE (frozen file, progress exception — enables narrow stores):
+ - Queried shaderInt16 (base) + shaderInt8 (Vulkan12Features chained after BDA in the
+   QUERY). Enabled base_features.shaderInt16 + a SINGLE VkPhysicalDeviceVulkan12Features
+   struct holding bufferDeviceAddress + shaderInt8. REASON for the merge: VUID
+   -VkDeviceCreateInfo-pNext-02830 forbids BOTH BufferDeviceAddressFeatures AND
+   Vulkan12Features in the create chain (bufferDeviceAddress promoted into Vulkan12).
+   Verified safe on BOTH devices (SwiftShader still creates + BDA works, exit 0).
 
-NEG1 WAIVER (verbatim, as instructed)
- ---------------------------------------------------------------------------
- "M4c PASS with documented waiver: NEG1 (skip instance pop) not detectable on
-  translation-only instance scenes; rotated/scaled instance transforms and the
-  pop's direction restore are UNTESTED and must be verified before supporting
-  instanced scenes."
- Harness NOT edited — it may keep printing FAIL for NEG1. Gate methodology is
- the user's (AGENTS.md).
+COMMANDS (worked):
+ slangc: C:\VulkanSDK\1.4.363.0\Bin\slangc.exe <f>.slang -target spirv -stage compute
+   -entry <word_main|narrow_main> -o "$env:LOCALAPPDATA\Temp\opencode\<f>.spv"
+   then spirv-val --target-env vulkan1.2 (both exit 0).
+ build: cmake --build build --config Release --target cycles -- /m
+ run:   $env:CYCLES_VULKAN_ALLOW_NO_KERNELS='1'; $env:CYCLES_VULKAN_SUBWORD_PROBE='1';
+   $env:CYCLES_VULKAN_SUBWORD_PROBE_SPV_WORD="$tmp\subword_word.spv";
+   $env:CYCLES_VULKAN_SUBWORD_PROBE_SPV_NARROW="$tmp\subword_narrow.spv";
+   $env:VK_INSTANCE_LAYERS='VK_LAYER_KHRONOS_validation'; $env:VK_LOADER_DEBUG='layer';
+   build\bin\Release\cycles.exe --device VULKAN --log-level info --samples 1 --background
+   instance2.xml. Unset VK_ICD_FILENAMES for RX570; set to
+   C:\Windows\System32\Microsoft-Edge-WebView\vk_swiftshader_icd.json for SwiftShader.
 
-STAGE 0 RESULTS (dynindex_repro on RX 570 unless noted)
- ---------------------------------------------------------------------------
- Form A = Params{Blob{uint words[8]}}, inline p->data.words[i]  (2 struct levels)
- Form B = Blob{uint words[8]}, inline p->words[i]               (1 struct level)
- Form C = Blob{uint* words}, inline p->words[i]                 (pointer member)
+TRAPS:
+ - SwiftShader hard-crashes (0xC00000FD stack overflow) on ANY SPIR-V declaring OpCapability
+   Int16/Int8 (same as the Int64 trap). Probe gates the narrow module on device-reported
+   shaderInt16&&shaderInt8 and skips it there (marks true16/true8 RX570-only).
+ - InterlockedOr/And in this Slang = 2-arg (uint lvalue, int value)->void; emits OpAtomicOr/
+   And on the BDA pointer, no Int64. Atomic fallback needs only Shader+PhysicalStorageBuffer.
+ - Probe command pool needs RESET_COMMAND_BUFFER_BIT (VUID -vkResetCommandBuffer-commandBuffer-
+   00046) because vkResetCommandBuffer is used per variant.
 
- | Form | Option                  | slangc | spirv-val | size  | runtime out(a)      | verdict |
- |------|-------------------------|--------|-----------|-------|---------------------|---------|
- | A    | baseline                | 0      | PASS      | 3360  | 10 10 10 10 11 11 11 11 | BUGGY  |
- | A    | -fvk-use-scalar-layout  | 0      | PASS      | 3360  | 10 10 10 10 11 11 11 11 | BUGGY  |
- | A    | -fvk-use-dx-layout      | 0      | FAIL      | 3360  | (probe failed)       | invalid |
- | A    | -fvk-use-c-layout       | 0      | PASS      | 3332  | 10 10 10 10 11 11 11 11 | BUGGY  |
- | A    | -fvk-use-gl-layout      | 0      | PASS      | 3360  | 10 10 10 10 11 11 11 11 | BUGGY  |
- | B    | baseline                | 0      | PASS      | 3360  | 10 10 10 10 11 11 11 11 | BUGGY  |
- | C    | baseline                | 0      | PASS      | --    | codegen-only (below)  | SAFE   |
- | A    | baseline on SwiftShader | 0      | PASS      | 3360  | 10 11 12 13 14 15 16 17 | CORRECT |
+STILL OPEN / NEXT:
+ - ITEM 4 DECIDED by user: atomic AND/OR fallback for all sub-word writes, behind a
+   macro-selectable accessor layer (store_u16/store_u8/load_u16/load_u8; default=atomic,
+   narrow-store kept working+verified on RX570). Reads = plain 32-bit load + shift/mask.
+   Log in DIVERGENCES.md as "functionally equivalent, not result-changing; narrow-store
+   variant to be measured on RX 570 after M5".
+ - STAGE B ITEM 5 BASELINE (run this session, RX 570, CYCLES_VULKAN_ABI_PROBE=1 +
+   abi_probe.spv): ABI probe ALL VALUES MATCH. sizeof(IntegratorStateGPU):
+   GPU=0x850 HOST=0x850 MATCH (=2128). bvh_nodes@2560 + render_pixel_index@2984 +
+   sentinel all MATCH. => The CURRENT vulkan_data.slang mirror is ALREADY SIZE-CORRECT
+   (2128). The S1b-3 "wrong SoA decomposition" concern is about the INTERNAL field ORDER
+   of the ARRAY members (volume_stack/shadow_isect/shadow_volume_stack), which the ABI
+   probe does NOT check. NEXT SESSION: read state_template.h + shadow_state_template.h +
+   vulkan_data.slang IntegratorStateGPU mirror; confirm whether the array members are AoS
+   (array-of-pointer-structs, matching C++ `struct {...} name[gpu_size]`) or wrongly flat
+   SoA; add host static_assert(offsetof(...)) locks for those members; if a static_assert
+   fails, fix the mirror to AoS, recompile abi_probe.slang, re-run to confirm sizeof still
+   2128 + the new offset asserts pass. Then items 6-9 (accessors + sub-word accessor layer
+   + gate + negatives).
+ - Stage B remaining (items 6-9): write integrator_state.slang accessors for INIT_FROM_CAMERA
+   + INTERSECT_CLOSEST + SHADE_SURFACE(diffuse) + queue path + the sub-word accessor layer
+   (atomic default, macro to swap to narrow); gate probe (distinct values via every accessor
+   incl. non-constant AoS indices; verify byte offsets from raw state memory allocated with
+   Cycles' own sizing; confirm float3* stride=12 when LOADED from IntegratorStateGPU);
+   negatives (16B stride on packed member, uint 4-byte store into uint16 field, wrong AoS
+   stride on volume_stack).
 
-CONCLUSIONS
- ---------------------------------------------------------------------------
- 1. NO slangc layout option fixes the bug. scalar/gl = identical codegen+result;
-    c = 28B smaller but same bug; dx = FAILS spirv-val. Do NOT adopt any option
-    (none change KernelParamsVulkan/IntegratorStateGPU need; base-ptr works
-    everywhere). Root cause is index LOWERING, not layout.
- 2. Form B (ONE struct level) is JUST as buggy: Slang inserts the
-    _Array_natural wrapper regardless of nesting depth
-    (Blob_natural{ _Array_natural_uint8{ uint[8] } }). => ANY fixed-array
-    STRUCT MEMBER hit by an inline dynamic index is buggy, at any depth.
- 3. Form C (pointer member uint* words) is SAFE by codegen:
-    Blob_natural = OpTypeStruct{_ptr_..._uint} (NO OpTypeArray);
-    inline index -> OpPtrAccessChain on a FLAT uint*. Matches the proven-safe
-    base-ptr/raw/traverse-pointer-member pattern.
- 4. SECOND DEVICE (Stage 0c): SwiftShader (Subzero) IS available, forced via
-    VK_ICD_FILENAMES=C:\Windows\System32\Microsoft-Edge-WebView\vk_swiftshader_icd.json
-    (self-contained; api 1.0.5; it supports BDA). On SwiftShader the SAME SPIR-V
-    runs CORRECTLY: out(a)=10 11 12 13 14 15 16 17. => The SPIR-V is
-    SEMANTICALLY VALID; the fault is the AMD RX 570 DRIVER (31.0.21925.1001)
-    mishandling OpAccessChain-dynamic-on-nested-array-in-PhysicalStorageBuffer.
-    Slang's contribution is emitting the _natural wrapper that creates the
-    pattern the AMD driver mishandles. The base-ptr/raw (OpPtrAccessChain on
-    flat uint*) workaround sidesteps the AMD driver fault.
+NEG1 WAIVER (S1b-2, in force): "M4c PASS with documented waiver: NEG1 (skip instance pop)
+not detectable on translation-only instance scenes; rotated/scaled instance transforms and
+the pop's direction restore are UNTESTED and must be verified before supporting instanced
+scenes."
 
-FORWARD HAZARD (unchanged, now CONFIRMED to apply at any nesting depth)
- ---------------------------------------------------------------------------
- S1b proper (state accessors) MUST use base-ptr/raw for EVERY dynamic index on
- a fixed-array member behind a device pointer. Per-state field arrays
- (kernel_integrator_state.<ns>.<member>[state], a uint*/float* member) are
- pointer-member => SAFE. Fixed sub-arrays indexed by [array_index]
- (INTEGRATOR_STATE_ARRAY: volume_stack.object[32], closure t/u/v/prim/object/
- type[4], sort_key_counter[18]) are the HAZARD => base-ptr required.
-
-BLOCKER FOUND for item 1 (do NOT write accessors until resolved)
- ---------------------------------------------------------------------------
- The `ray`/`isect`/`subsurface` state sub-structs are PACKED
- (state_template.h:78-108, KERNEL_STRUCT_BEGIN_PACKED). So `ray.P`/`ray.D` are
- `packed_float3` = 12-BYTE elements in the SoA data buffer, NOT 16-byte Slang
- float3. A `ray.P[state]` accessor written as `float3*` would use stride 16 and
- silently corrupt the ray (reads garbage from offset state*16 instead of
- state*12). Before writing ANY packed_float3 accessor, the next session MUST
- verify the exact element stride Cycles uses for these SoA buffers (read how
- KERNEL_STRUCT_MEMBER_PACKED + the GPU state allocator size the arrays; confirm
- 12 vs 16) and pick a representation (raw 3x float read, packed_float3 helper,
- or uint4/float4 only where genuinely 16B-aligned). This is a "layout comes
- from the real C++" item (AGENTS.md) — do not guess.
- The NON-packed fields (path.*: render_pixel_index/sample/rng_pixel/
- queued_kernel/throughput(PackedSpectrum); volume_stack int object[32]) do NOT
- have this issue but still need base-ptr on fixed sub-arrays.
- => Item 1 is a half-day of verification on its own; it is NOT a quick accessor
-    write. Split it into its own session.
-
-FILES TOUCHED (this session)
- ---------------------------------------------------------------------------
- - src/kernel/device/vulkan/dynindex_repro_b.slang : NEW Form B (1-level, buggy).
- - src/kernel/device/vulkan/dynindex_repro_c.slang : NEW Form C (ptr member, safe).
- - lastsession.txt : this file.
- (dynindex_repro.slang, kernels.cpp, queue.cpp, traverse_probe.slang were
-  carried over already-modified from S1b-1; no new edits to them this session.)
-
-STILL OPEN / SUGGESTED NEXT
- ---------------------------------------------------------------------------
- - S1b(a) items 1-7. Item 1 = integrator_state.slang accessors over
-   IntegratorStateGPU device pointers (INTEGRATOR_STATE /
-   INTEGRATOR_STATE_WRITE), base-ptr on every fixed-sub-array dynamic index.
-   Then item 2 = init_from_camera.slang (init_from_camera.h:57-130 +
-   path_state_init + path_state_init_integrator + integrator_state_write_ray +
-   film_need_sample_pixel + state_flow.h queue push). Item 3 = filter-table
-   camera_sample. Items 4-7 = enqueue wiring + gate probe + negatives.
-   START ITEM 1 IN ITS OWN SESSION (read src/kernel/integrator/state.h:264-282
-   for the GPU SoA accessor form, vulkan_data.slang IntegratorStateGPU layout).
-
-FACTS THE NEXT SESSION MUST KNOW
- ---------------------------------------------------------------------------
- - NEVER inline dynamic-index a fixed-array member through a device pointer,
-   at ANY nesting depth (Form A and B both buggy). Take a base pointer
-   (&arr[0]) and index through it, or use a raw uint view. Pointer MEMBERS
-   (uint*/float*) indexed dynamically are SAFE.
- - Bug present in slangc 2026.17 (SDK) AND 2026.20 (latest); no option fixes it.
- - Root cause is AMD-driver-specific (SwiftShader runs the SPIR-V correctly).
- - SwiftShader second device:
-   VK_ICD_FILENAMES=C:\Windows\System32\Microsoft-Edge-WebView\vk_swiftshader_icd.json
- - GPU SoA accessor form (state.h:273-276, non-packed):
-     INTEGRATOR_STATE(state,ns,mem)      = kernel_integrator_state.ns.mem[state]
-     INTEGRATOR_STATE_ARRAY(state,ns,ai,mem) = kernel_integrator_state.ns[ai].mem[state]
-   The [state] index is on a per-field pointer member (SAFE);
-   the [array_index] on a fixed sub-array is the HAZARD.
- - Build: cmake --build build --config Release --target cycles -- /m
- - Shader: slangc <f>.slang -target spirv -stage compute -entry <e> -o
-   %LOCALAPPDATA%\Temp\opencode\<f>.spv ; spirv-val --target-env vulkan1.2.
-   Keep .spv OUT of repo root.
- - Run: CYCLES_VULKAN_ALLOW_NO_KERNELS=1 (+probe env) VK_INSTANCE_LAYERS=
-   VK_LAYER_KHRONOS_validation VK_LOADER_DEBUG=layer
-   build\bin\Release\cycles.exe --device VULKAN --log-level info --samples 1
-   --background <scene>.xml. Unset VK_ICD_FILENAMES for real-GPU runs.
- - Probe verdicts print to stderr via fprintf (progress bar swallows LOG lines).
- - Uncommitted carried over: device_impl.h, math_core.slang, math_probe.slang,
-   kdata_probe.slang (pre-existing); dynindex_repro.slang, _b, _c,
-   kernels.cpp, queue.cpp, traverse_probe.slang. Stale traverse_*.spv in repo
-   root (user to handle via git).
+FACTS next session must know: see items above. Uncommitted files: NEW subword_word.slang,
+subword_narrow.slang, stride_check.slang, dynindex_repro.slang/_b/_c; MODIFIED kernels.cpp,
+queue.cpp, device.cpp (feature enablement), traverse_probe.slang, device_impl.h,
+lastsession.txt; pre-existing math_core.slang, math_probe.slang, kdata_probe.slang; stale
+traverse_*.spv in repo root (user to clean).

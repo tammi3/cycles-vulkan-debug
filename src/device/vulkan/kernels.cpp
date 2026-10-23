@@ -2431,6 +2431,415 @@ bool vulkan_stride_check(VulkanDevice *dev)
 }
 
 /* =========================================================================
+ * M4e S1b-4 STAGE A: SUB-WORD ACCESS probe (optional, env
+ * CYCLES_VULKAN_SUBWORD_PROBE=1 / ..._SPV_WORD / ..._SPV_NARROW).
+ *
+ * Decides how Cycles' sub-word SoA fields (uint16_t bounce/queued_kernel/rng_offset,
+ * uint8_t visibility/mnee, bool guiding -- element size 2 or 1, per the S1b-3 stride
+ * table) should be WRITTEN. Adjacent elements share one 32-bit word, so a store to
+ * element t must not clobber its neighbour. Six variants, each a full 256-thread x
+ * 64-iteration dispatch on a freshly canaried 4 KB buffer, then byte-exact verify:
+ *
+ *   module W (subword_word.slang, uint32 + OpAtomicAnd/Or only, NO Int16/Int8):
+ *     mode 0  atomic16  -- atomic AND/OR-on-word fallback, uint16 elements
+ *     mode 1  atomic8   -- atomic AND/OR-on-word fallback, uint8 elements
+ *     mode 2  RMW-neg16 -- NEGATIVE: non-atomic read-modify-write, uint16
+ *     mode 3  RMW-neg8  -- NEGATIVE: non-atomic read-modify-write, uint8
+ *   module N (subword_narrow.slang, Int16 + Int8):
+ *     mode 0  true16    -- true uint16 store (needs feature; captures the VUID)
+ *     mode 1  true8     -- true uint8 store
+ *
+ * Verification: for non-negative variants every element must equal its LAST-iteration
+ * value (no lost/clobbered values) and every canary byte outside the region must be
+ * 0xCD (no out-of-bounds). For the NEGATIVE variants the race is EXPECTED to lose
+ * updates, so DETECTED means lost>0 (and canaries intact, i.e. corruption is confined
+ * to lost updates, not OOB). If a negative shows lost=0 the race simply did not
+ * manifest on that device -- reported honestly as NOT-DETECTED.
+ *
+ * Also prints the device-REPORTED 8/16-bit features (item 1) and, for module N, the
+ * run script greps the validation VUID to cite which feature gates Int16/Int8 through
+ * PhysicalStorageBuffer. Run on BOTH the RX 570 and SwiftShader (DEVICE RULE). */
+
+namespace {
+
+constexpr uint32_t SUB_BUF_BYTES = 4096;
+constexpr uint8_t SUB_CANARY = 0xCDu;   // prefill byte; unwritten locations stay 0xCD
+constexpr uint32_t SUB_N = 256;         // N threads, element t = tid.x
+constexpr uint32_t SUB_M = 64;          // iterations (MW == MN == 64)
+constexpr uint32_t SUB_REGION_A = 0;    // uint16 elements at byte 0  (256 * 2 = 512 B)
+constexpr uint32_t SUB_REGION_B = 1024; // uint8 elements at byte 1024 (256 * 1 = 256 B)
+constexpr uint32_t SUB_PUSH_BYTES = 24; // PushW/PushN std430: ptr@0, ptr@8, mode@16
+
+// Host mirrors of the shaders' push structs (std430, offsets confirmed from the SPIR-V).
+struct WordPushHost {
+  uint64_t wordA, wordB;
+  uint32_t mode, pad;
+};
+struct NarrowPushHost {
+  uint64_t p16, p8;
+  uint32_t mode, pad;
+};
+
+struct SubPipe {
+  VkShaderModule module = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+};
+struct SubResources {
+  VkDevice device = VK_NULL_HANDLE;
+  SubPipe word, narrow;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  VkBuffer buf = VK_NULL_HANDLE;
+  VkDeviceMemory mem = VK_NULL_HANDLE;
+
+  ~SubResources()
+  {
+    if (device == VK_NULL_HANDLE) return;
+    for (SubPipe *p : {&word, &narrow}) {
+      if (p->pipeline) vkDestroyPipeline(device, p->pipeline, nullptr);
+      if (p->layout) vkDestroyPipelineLayout(device, p->layout, nullptr);
+      if (p->module) vkDestroyShaderModule(device, p->module, nullptr);
+    }
+    if (pool) vkDestroyCommandPool(device, pool, nullptr);
+    if (buf) vkDestroyBuffer(device, buf, nullptr);
+    if (mem) vkFreeMemory(device, mem, nullptr);
+  }
+};
+
+} /* namespace */
+
+// Mirrors of the shaders' value functions. The LAST iteration (SUB_M-1) is what a
+// correct store leaves behind; sub_v16/sub_v8 are exactly subword_{word,narrow}.slang.
+static uint32_t sub_v16(uint32_t t, uint32_t iter)
+{
+  return (iter * 37u + t * 3u + 11u) & 0xFFFFu;
+}
+static uint32_t sub_v8(uint32_t t, uint32_t iter)
+{
+  return (iter * 13u + t * 5u + 7u) & 0xFFu;
+}
+
+bool vulkan_subword_check(VulkanDevice *dev)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+  if (getenv("CYCLES_VULKAN_SUBWORD_PROBE") == nullptr) return true;
+
+  LOG_INFO << "Vulkan: sub-word access probe starting (CYCLES_VULKAN_SUBWORD_PROBE=1).";
+
+  const VkDevice vk_dev = dev->vk_device();
+  const VkPhysicalDevice phys = dev->vk_physical_device();
+  SubResources res;
+  res.device = vk_dev;
+
+  /* ---- 0. Device-REPORTED 8/16-bit features (Stage A item 1). ---- */
+  /* have_narrow gates the narrow (Int16/Int8) module: SwiftShader reports NONE of
+   * these and hard-crashes (0xC00000FD, same trap as Int64) when asked to JIT a
+   * module that declares OpCapability Int16/Int8, so we SKIP it there and run only
+   * the word-based (uint32 atomic / RMW) variants, which need no narrow capability. */
+  bool have_narrow = false;
+  {
+    VkPhysicalDeviceFeatures2 f2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+    VkPhysicalDeviceVulkan11Features f11{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_1_FEATURES};
+    VkPhysicalDeviceVulkan12Features f12{
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES};
+    f2.pNext = &f11;
+    f11.pNext = &f12;
+    vkGetPhysicalDeviceFeatures2(phys, &f2);
+    have_narrow = (f2.features.shaderInt16 != VK_FALSE) && (f12.shaderInt8 != VK_FALSE);
+    fprintf(stderr,
+            "\n=== M4e S1b-4 STAGE A: SUB-WORD ACCESS (device-REPORTED features) ===\n"
+            "  shaderInt16              = %u  (SPIR-V Int16=22; base VkPhysicalDeviceFeatures,"
+            " core 1.0)\n"
+            "  storageBuffer16BitAccess = %u  (16BitStorage->Vulkan11; VK_KHR_16bit_storage)\n"
+            "  shaderInt8               = %u  (SPIR-V Int8=39; 8BitStorage->Vulkan12;"
+            " VK_KHR_shader_float16_int8)\n"
+            "  storageBuffer8BitAccess  = %u  (8BitStorage->Vulkan12; VK_KHR_8bit_storage)\n"
+            "  (device.cpp currently enables NONE of these; only shaderInt64 +"
+            " bufferDeviceAddress)\n"
+            "  narrow (Int16/Int8) module: %s\n",
+            f2.features.shaderInt16,
+            f11.storageBuffer16BitAccess,
+            f12.shaderInt8,
+            f12.storageBuffer8BitAccess,
+            have_narrow ? "SUPPORTED -> will test true16/true8" :
+                           "NOT supported -> SKIP true16/true8 (RX570-only)");
+  }
+
+  /* ---- 1. Load both .spv and build one pipeline each. ---- */
+  auto make_pipe = [&](const char *env_path,
+                       const char *fallback,
+                       const char *name,
+                       SubPipe &out) -> bool {
+    std::vector<char> spirv;
+    const char *envp = getenv(env_path);
+    const char *cands[2] = {envp, fallback};
+    const char *found = nullptr;
+    for (const char *c : cands) {
+      if (c && probe_read_whole_file(c, spirv)) {
+        found = c;
+        break;
+      }
+    }
+    if (!found) {
+      LOG_ERROR << "Vulkan: subword probe (" << name << "): cannot find " << fallback
+                << " (compile with slangc or set " << env_path << ").";
+      return false;
+    }
+    if (spirv.size() % 4 != 0) {
+      LOG_ERROR << "Vulkan: subword probe (" << name << "): bad SPIR-V (" << found << ").";
+      return false;
+    }
+    VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    smi.codeSize = spirv.size();
+    smi.pCode = reinterpret_cast<const uint32_t *>(spirv.data());
+    if (vkCreateShaderModule(vk_dev, &smi, nullptr, &out.module) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: subword probe (" << name << "): vkCreateShaderModule failed.";
+      return false;
+    }
+    VkPushConstantRange pcr{};
+    pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pcr.offset = 0;
+    pcr.size = SUB_PUSH_BYTES;
+    VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+    pli.pushConstantRangeCount = 1;
+    pli.pPushConstantRanges = &pcr;
+    if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &out.layout) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: subword probe (" << name << "): pipeline layout failed.";
+      return false;
+    }
+    VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+    cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+    cpi.stage.module = out.module;
+    cpi.stage.pName = "main";
+    cpi.layout = out.layout;
+    if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &out.pipeline) !=
+        VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: subword probe (" << name << "): compute pipeline failed.";
+      return false;
+    }
+    return true;
+  };
+  if (!make_pipe("CYCLES_VULKAN_SUBWORD_PROBE_SPV_WORD",
+                 "subword_word.spv",
+                 "word",
+                 res.word))
+    return false;
+  /* Only build the narrow (Int16/Int8) pipeline if the device reports the features;
+   * otherwise (SwiftShader) it would crash, so skip it and mark true16/true8 RX570-only. */
+  if (have_narrow && !make_pipe("CYCLES_VULKAN_SUBWORD_PROBE_SPV_NARROW",
+                                "subword_narrow.spv",
+                                "narrow",
+                                res.narrow))
+    return false;
+
+  /* ---- 2. One 4 KB host-visible BDA buffer. ---- */
+  {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = SUB_BUF_BYTES;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(vk_dev, &bci, nullptr, &res.buf) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: subword probe: buffer creation failed.";
+      return false;
+    }
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(vk_dev, res.buf, &reqs);
+    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &flags_info;
+    ai.allocationSize = reqs.size;
+    ai.memoryTypeIndex = dev->find_memory_type(
+        reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vkAllocateMemory(vk_dev, &ai, nullptr, &res.mem) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: subword probe: memory allocation failed.";
+      return false;
+    }
+    if (vkBindBufferMemory(vk_dev, res.buf, res.mem, 0) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: subword probe: memory bind failed.";
+      return false;
+    }
+  }
+  VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  bai.buffer = res.buf;
+  const uint64_t base = vkGetBufferDeviceAddress(vk_dev, &bai);
+
+  /* ---- 3. Command pool + one reusable command buffer + queue. ---- */
+  const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
+  {
+    VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    /* RESET_COMMAND_BUFFER_BIT is REQUIRED for vkResetCommandBuffer (VUID
+     * -vkResetCommandBuffer-commandBuffer-00046); TRANSIENT because each command
+     * buffer is short-lived and re-recorded per variant. */
+    cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT |
+                 VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+    cpci.queueFamilyIndex = family;
+    if (vkCreateCommandPool(vk_dev, &cpci, nullptr, &res.pool) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: subword probe: command pool failed.";
+      return false;
+    }
+    VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbai.commandPool = res.pool;
+    cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbai.commandBufferCount = 1;
+    if (vkAllocateCommandBuffers(vk_dev, &cbai, &res.cmd) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: subword probe: command buffer failed.";
+      return false;
+    }
+  }
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(vk_dev, family, 0, &queue);
+
+  /* ---- 4. Helpers: prefill canary / dispatch / readback. ---- */
+  auto prefill = [&]() -> bool {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.mem, 0, SUB_BUF_BYTES, 0, &m) != VK_SUCCESS) return false;
+    memset(m, SUB_CANARY, SUB_BUF_BYTES);
+    vkUnmapMemory(vk_dev, res.mem);
+    return true;
+  };
+  auto readback = [&](std::vector<uint8_t> &raw) -> bool {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.mem, 0, SUB_BUF_BYTES, 0, &m) != VK_SUCCESS) return false;
+    memcpy(raw.data(), m, SUB_BUF_BYTES);
+    vkUnmapMemory(vk_dev, res.mem);
+    return true;
+  };
+  auto run = [&](VkPipeline pipe, VkPipelineLayout layout, const void *push) -> bool {
+    if (vkResetCommandBuffer(res.cmd, 0) != VK_SUCCESS) return false;
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(res.cmd, &bi) != VK_SUCCESS) return false;
+    vkCmdBindPipeline(res.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe);
+    vkCmdPushConstants(
+        res.cmd, layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, SUB_PUSH_BYTES, push);
+    vkCmdDispatch(res.cmd, 1, 1, 1);
+    if (vkEndCommandBuffer(res.cmd) != VK_SUCCESS) return false;
+    VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+    VkFence fence = VK_NULL_HANDLE;
+    if (vkCreateFence(vk_dev, &fci, nullptr, &fence) != VK_SUCCESS) return false;
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &res.cmd;
+    bool ok = vkQueueSubmit(queue, 1, &si, fence) == VK_SUCCESS;
+    if (ok)
+      ok = vkWaitForFences(vk_dev, 1, &fence, VK_TRUE, 10000000000ull) == VK_SUCCESS;
+    vkDestroyFence(vk_dev, fence, nullptr);
+    return ok;
+  };
+
+  /* ---- 5. Run each variant, verify, report. ---- */
+  struct Var {
+    const char *name;
+    bool narrow;  // false = module W (word/atomic/RMW), true = module N (narrow store)
+    uint32_t mode;
+    bool u16;     // true = uint16 elements (region A), false = uint8 elements (region B)
+    bool neg;     // true = NEGATIVE (expects lost updates)
+  };
+  const Var vars[] = {
+      {"atomic16 (AND/OR fallback)", false, 0, true, false},
+      {"atomic8  (AND/OR fallback)", false, 1, false, false},
+      {"RMW-neg16 (non-atomic NEG)", false, 2, true, true},
+      {"RMW-neg8  (non-atomic NEG)", false, 3, false, true},
+      {"true16 (narrow store)", true, 0, true, false},
+      {"true8   (narrow store)", true, 1, false, false},
+  };
+
+  bool all_ok = true;
+  for (const Var &v : vars) {
+    /* Narrow variants need the Int16/Int8 module, which the device may not support
+     * (SwiftShader). Skip them there rather than crash; mark clearly RX570-only. */
+    if (v.narrow && !have_narrow) {
+      fprintf(stderr, "  %-26s %-12s (device lacks Int16/Int8; RX570-only)\n", v.name, "SKIPPED");
+      continue;
+    }
+    if (!prefill()) {
+      LOG_ERROR << "Vulkan: subword probe: prefill failed.";
+      return false;
+    }
+    if (!v.narrow) {
+      WordPushHost push{};
+      push.wordA = base + SUB_REGION_A;
+      push.wordB = base + SUB_REGION_B;
+      push.mode = v.mode;
+      if (!run(res.word.pipeline, res.word.layout, &push)) {
+        LOG_ERROR << "Vulkan: subword probe: dispatch failed (" << v.name << ").";
+        return false;
+      }
+    }
+    else {
+      NarrowPushHost push{};
+      push.p16 = base + SUB_REGION_A;
+      push.p8 = base + SUB_REGION_B;
+      push.mode = v.mode;
+      if (!run(res.narrow.pipeline, res.narrow.layout, &push)) {
+        LOG_ERROR << "Vulkan: subword probe: dispatch failed (" << v.name << ").";
+        return false;
+      }
+    }
+
+    std::vector<uint8_t> raw(SUB_BUF_BYTES);
+    if (!readback(raw)) {
+      LOG_ERROR << "Vulkan: subword probe: readback failed.";
+      return false;
+    }
+
+    /* Verify: elements == LAST-iteration value; canaries outside the region == 0xCD. */
+    uint32_t lost = 0;
+    bool canary_ok = true;
+    if (v.u16) {
+      for (uint32_t t = 0; t < SUB_N; t++) {
+        uint16_t got;
+        memcpy(&got, raw.data() + SUB_REGION_A + t * 2, 2);
+        if (got != (uint16_t)sub_v16(t, SUB_M - 1)) lost++;
+      }
+      for (uint32_t b = SUB_REGION_A + SUB_N * 2; b < SUB_BUF_BYTES; b++)
+        if (raw[b] != SUB_CANARY) canary_ok = false;
+    }
+    else {
+      for (uint32_t t = 0; t < SUB_N; t++) {
+        if (raw[SUB_REGION_B + t] != (uint8_t)sub_v8(t, SUB_M - 1)) lost++;
+      }
+      for (uint32_t b = 0; b < SUB_REGION_B; b++)
+        if (raw[b] != SUB_CANARY) canary_ok = false;
+      for (uint32_t b = SUB_REGION_B + SUB_N; b < SUB_BUF_BYTES; b++)
+        if (raw[b] != SUB_CANARY) canary_ok = false;
+    }
+
+    bool verdict;
+    const char *tag;
+    if (v.neg) {
+      verdict = (lost > 0) && canary_ok;  // DETECTED: lost updates present, no OOB
+      tag = verdict ? "DETECTED" : "NOT-DETECTED";
+    }
+    else {
+      verdict = (lost == 0) && canary_ok;  // PASS: no lost values, no OOB
+      tag = verdict ? "PASS" : "FAIL";
+    }
+    if (!verdict) all_ok = false;
+    fprintf(stderr,
+            "  %-26s %-12s lost=%-3u canary=%s\n",
+            v.name,
+            tag,
+            lost,
+            canary_ok ? "ok" : "CORRUPT");
+  }
+
+  fprintf(stderr,
+          "=== sub-word access probe: %s ===\n\n",
+          all_ok ? "all variants behaved as expected"
+                 : "UNEXPECTED result (see above; a NOT-DETECTED negative = race did not"
+                   " manifest on this device)");
+  return all_ok;
+}
+
+/* =========================================================================
  * M4e S1b-1 minimal dynamic-index repro probe (optional, env
  * CYCLES_VULKAN_DYNINDEX_REPRO=1)
  * =========================================================================
