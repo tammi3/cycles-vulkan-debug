@@ -21,6 +21,10 @@ bool vulkan_traverse_probe(VulkanDevice *device);
  * once and is a no-op unless CYCLES_VULKAN_BSDF_PROBE=1 is set. */
 bool vulkan_bsdf_probe(VulkanDevice *device);
 
+/* M4e STEP 1a math probe hook, implemented in kernels.cpp. Runs at most once
+ * and is a no-op unless CYCLES_VULKAN_MATH_PROBE=1 is set. */
+bool vulkan_math_probe(VulkanDevice *device);
+
 VulkanQueue::VulkanQueue(VulkanDevice *d) : DeviceQueue(d), vulkan_device_(d) {}
 
 int VulkanQueue::num_concurrent_states(const size_t s) const {
@@ -52,6 +56,9 @@ bool VulkanQueue::enqueue(DeviceKernel k, const int n, const DeviceKernelArgumen
   /* M4d: optional one-shot diffuse-closure probe (env CYCLES_VULKAN_BSDF_PROBE=1)
    * with the same no-op-unless-set semantics. */
   vulkan_bsdf_probe(vulkan_device_);
+  /* M4e STEP 1a: optional one-shot math probe (env CYCLES_VULKAN_MATH_PROBE=1)
+   * with the same no-op-unless-set semantics. */
+  vulkan_math_probe(vulkan_device_);
   vulkan_device_->set_error("Vulkan: kernel dispatch not implemented yet (M4)");
   debug_enqueue_end();
   return false;

@@ -62,6 +62,13 @@ class VulkanDevice : public GPUDevice {
    * not been created yet (created lazily by const_copy_to). */
   uint64_t kernel_params_address() const;
 
+  /* M4e STEP 1a: const access to the real KernelData (host shadow of the
+   * "data" kernel global, filled by const_copy_to("data", ...)). The math
+   * probe reads kernel_data.cam / kernel_data.integrator from here so the
+   * camera matrices come from the real loaded scene, NOT the KernelParamsVulkan
+   * blob (device.cpp:317 memcpy's const data into host_params_). Read-only. */
+  const KernelData &host_kernel_data() const { return host_params_.data; }
+
  private:
   VkInstance instance;
   VkPhysicalDevice physical_device;

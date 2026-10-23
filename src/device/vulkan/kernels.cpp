@@ -22,6 +22,18 @@
  * shared by my Slang port AND the hand re-implementation is still caught. */
 #include "kernel/closure/bsdf_diffuse.h"
 
+/* M4e STEP 1a: the REAL Cycles sampler / camera headers, compiled on the host,
+ * used as the GPU reference for the math probe (vulkan_math_probe). On this
+ * target ccl_device is `static inline` and ccl_private/ccl_global are empty, so
+ * path_rng_pixel_init / path_rng_1D..4D / camera_sample are directly callable.
+ * kernel/globals.h (when !__KERNEL_GPU__) pulls kernel/device/cpu/globals.h,
+ * giving us KernelGlobalsCPU / ThreadKernelGlobalsCPU / KernelGlobals and the
+ * `kernel_data` (= kg->data) macro; pattern.h gives the path_rng_* family;
+ * camera.h gives camera_sample. */
+#include "kernel/globals.h"
+#include "kernel/sample/pattern.h"
+#include "kernel/camera/camera.h"
+
 #include "util/log.h"
 
 #include <cstdlib>
@@ -31,6 +43,8 @@
 #include <fstream>
 #include <string>
 #include <vector>
+#include <algorithm>
+#include <cstdint>
 
 CCL_NAMESPACE_BEGIN
 
@@ -869,6 +883,706 @@ bool vulkan_bsdf_probe(VulkanDevice *dev)
                  "reference.";
   }
   return mismatches == 0;
+}
+
+/* =========================================================================
+ * M4e STEP 1a math probe (optional, env CYCLES_VULKAN_MATH_PROBE=1)
+ * =========================================================================
+ * Exercises the just-ported sampler / hash / camera MATH CORE (math_core.slang
+ * via math_probe.slang) on the GPU with MANY threads, and compares every output
+ * against the REAL Cycles headers compiled on the host (kernel/sample/pattern.h
+ * path_rng_*, kernel/camera/camera.h camera_sample, util/hash.h hash_iqnt2d,
+ * kernel/sample/sobol_burley.h). This is the "sampler + camera math" gate in
+ * isolation: no integrator state, no queue, no traversal. The camera matrices
+ * and sampling config come from the REAL kernel data of the loaded scene
+ * (dev->host_kernel_data()), NOT the KernelParamsVulkan blob.
+ *
+ * Coverage: pixels over a 64x48 tile, samples {0,1,5,15,255,1023}, seeds
+ * {0,1,large} (integrator.seed varied across clean passes), dimensions
+ * low..high. Integers (hash_iqnt2d, path_rng_pixel_init) compared BIT-EXACT;
+ * floats (sobol / path_rng / camera P,D,tmin,tmax,time) compared with
+ * |a-b| <= 1e-5*max(1,|b|) (gate = MAXIMUM normalized error; 99.9th percentile
+ * and mean printed for information only). Sobol floats are additionally
+ * bit-compared (informational) since uint_to_float_excl is a single FMA-free
+ * multiply, so a bit-identical float implies a bit-identical sobol integer.
+ *
+ * Three fault injections (negative tests) MUST be detected:
+ *   neg_mode 1 -> perturb the first dimension-1 sobol table read,
+ *   neg_mode 2 -> wrong seed XOR in path_rng_pixel_init,
+ *   neg_mode 3 -> transposed rastertocamera.
+ * The clean pass (neg_mode 0) must MATCH for all three seeds. */
+
+namespace {
+
+/* Case kinds (must match math_probe.slang). */
+enum MathProbeKind : uint32_t {
+  MATHK_HASH = 0,
+  MATHK_PIXEL_INIT = 1,
+  MATHK_SOBOL1D = 2,
+  MATHK_SOBOL2D = 3,
+  MATHK_SOBOL3D = 4,
+  MATHK_SOBOL4D = 5,
+  MATHK_RNG1D = 6,
+  MATHK_RNG2D = 7,
+  MATHK_RNG3D = 8,
+  MATHK_RNG4D = 9,
+  MATHK_CAMERA = 10,
+  MATHK_COUNT = 11
+};
+
+/* Host mirrors of the Slang probe structs. All members are 4-byte scalars so
+ * the layouts are identical in Slang and C++ (no alignment padding to disagree
+ * on). Locked with static_asserts below. */
+struct MathProbeCase {
+  uint32_t kind;
+  int32_t sample;
+  uint32_t x, y;
+  uint32_t dim, seed, mask, index;
+  float fx, fy, fz, fw;
+};
+static_assert(sizeof(MathProbeCase) == 48, "ProbeCase layout must match Slang");
+
+struct MathProbeResult {
+  uint32_t u0, has_u, nfloat, pad;
+  float f[12];
+};
+static_assert(sizeof(MathProbeResult) == 64, "ProbeResult layout must match Slang");
+
+struct MathProbeParams {
+  int32_t cam_type, have_perspective_motion;
+  float aperturesize;
+  int32_t num_motion_steps;
+  float interocular_offset, shuttertime;
+  int32_t rolling_shutter_type;
+  float nearclip, cliplength;
+  float pixel_jitter_x, pixel_jitter_y;
+  float ctw_x_x, ctw_x_y, ctw_x_z, ctw_x_w;
+  float ctw_y_x, ctw_y_y, ctw_y_z, ctw_y_w;
+  float ctw_z_x, ctw_z_y, ctw_z_z, ctw_z_w;
+  float rtc_x_x, rtc_x_y, rtc_x_z, rtc_x_w;
+  float rtc_y_x, rtc_y_y, rtc_y_z, rtc_y_w;
+  float rtc_z_x, rtc_z_y, rtc_z_z, rtc_z_w;
+  float rtc_w_x, rtc_w_y, rtc_w_z, rtc_w_w;
+  int32_t sampling_pattern;
+  uint32_t seed, sobol_index_mask, blue_noise_sequence_length;
+  int32_t neg_mode;
+};
+static_assert(sizeof(MathProbeParams) == 176, "MathParams layout must match Slang");
+
+/* Push block: 3 device pointers + count = 32 bytes (matches Slang Push). */
+struct MathProbePush {
+  VkDeviceAddress cases;
+  VkDeviceAddress out;
+  VkDeviceAddress params;
+  uint32_t num_cases;
+};
+static_assert(sizeof(MathProbePush) == 32, "Push layout must match Slang");
+
+constexpr uint32_t MATH_PROBE_PUSH_BYTES = 32;
+constexpr uint32_t MATH_PROBE_CANARY_WORDS = 4;
+constexpr uint32_t MATH_PROBE_CANARY = 0xCAFEBABEu;
+
+/* RAII for every Vulkan handle the probe creates (same pattern as the M4d
+ * probe), so early-return error paths still destroy everything. */
+struct MathProbeResources {
+  VkDevice device = VK_NULL_HANDLE;
+  VkShaderModule module = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  VkBuffer cases_buffer = VK_NULL_HANDLE, out_buffer = VK_NULL_HANDLE,
+           params_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory cases_memory = VK_NULL_HANDLE, out_memory = VK_NULL_HANDLE,
+                  params_memory = VK_NULL_HANDLE;
+
+  ~MathProbeResources()
+  {
+    if (device == VK_NULL_HANDLE) return;
+    if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+    if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+    if (module) vkDestroyShaderModule(device, module, nullptr);
+    if (pool) vkDestroyCommandPool(device, pool, nullptr);
+    if (fence) vkDestroyFence(device, fence, nullptr);
+    if (cases_buffer) vkDestroyBuffer(device, cases_buffer, nullptr);
+    if (out_buffer) vkDestroyBuffer(device, out_buffer, nullptr);
+    if (params_buffer) vkDestroyBuffer(device, params_buffer, nullptr);
+    if (cases_memory) vkFreeMemory(device, cases_memory, nullptr);
+    if (out_memory) vkFreeMemory(device, out_memory, nullptr);
+    if (params_memory) vkFreeMemory(device, params_memory, nullptr);
+  }
+};
+
+} /* namespace */
+
+bool vulkan_math_probe(VulkanDevice *dev)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+  if (getenv("CYCLES_VULKAN_MATH_PROBE") == nullptr) return true;
+
+  LOG_INFO << "Vulkan: Math probe starting (CYCLES_VULKAN_MATH_PROBE=1).";
+
+  MathProbeResources res;
+  const VkDevice vk_dev = dev->vk_device();
+  res.device = vk_dev;
+
+  /* ---- 1. SPIR-V (env override or repo-relative default) ---- */
+  std::vector<char> spirv;
+  const char *env_path = getenv("CYCLES_VULKAN_MATH_PROBE_SPV");
+  const char *candidates[2] = {env_path, "math_probe.spv"};
+  const char *found = nullptr;
+  for (const char *c : candidates) {
+    if (c && probe_read_whole_file(c, spirv)) { found = c; break; }
+  }
+  if (!found) {
+    LOG_ERROR << "Vulkan: Math probe: cannot find math_probe.spv "
+                 "(compile it with slangc or set CYCLES_VULKAN_MATH_PROBE_SPV).";
+    return false;
+  }
+  if (spirv.size() % 4 != 0) {
+    LOG_ERROR << "Vulkan: Math probe: '" << found << "' is not a valid SPIR-V module.";
+    return false;
+  }
+  LOG_INFO << "Vulkan: Math probe: spirv='" << found << "' (" << spirv.size() << " bytes).";
+
+  /* ---- 2. Shader module ---- */
+  VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = spirv.size();
+  smi.pCode = reinterpret_cast<const uint32_t *>(spirv.data());
+  if (vkCreateShaderModule(vk_dev, &smi, nullptr, &res.module) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Math probe: vkCreateShaderModule failed.";
+    return false;
+  }
+
+  /* ---- 3. Pipeline layout: no descriptor sets, one push-constant range ---- */
+  VkPushConstantRange pcr{};
+  pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pcr.offset = 0;
+  pcr.size = MATH_PROBE_PUSH_BYTES;
+  VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pli.pushConstantRangeCount = 1;
+  pli.pPushConstantRanges = &pcr;
+  if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &res.layout) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Math probe: pipeline layout creation failed.";
+    return false;
+  }
+
+  /* ---- 4. Compute pipeline (entry name "main"; slangc renames) ---- */
+  VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  cpi.stage.module = res.module;
+  cpi.stage.pName = "main";
+  cpi.layout = res.layout;
+  if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &res.pipeline) !=
+      VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Math probe: compute pipeline creation failed "
+                 "(bad entry point name?).";
+    return false;
+  }
+
+  /* ---- 5. Build MathParams from the REAL kernel data of the scene ---- */
+  const KernelData &kd = dev->host_kernel_data();
+  MathProbeParams mp{};
+  mp.cam_type = kd.cam.type;
+  mp.have_perspective_motion = kd.cam.have_perspective_motion;
+  mp.aperturesize = kd.cam.aperturesize;
+  mp.num_motion_steps = kd.cam.num_motion_steps;
+  mp.interocular_offset = kd.cam.interocular_offset;
+  mp.shuttertime = kd.cam.shuttertime;
+  mp.rolling_shutter_type = kd.cam.rolling_shutter_type;
+  mp.nearclip = kd.cam.nearclip;
+  mp.cliplength = kd.cam.cliplength;
+  /* NOTE: pixel_jitter is OVERRIDDEN to a non-FLT_MAX value so camera_sample
+   * takes the no-table branch (raster += -pixel_jitter). The FLT_MAX
+   * (Blackman-Harris filter-table) branch needs kernel_data.tables.lookup_table,
+   * which is NOT passed to the shader in S1a; see the report. Both the GPU and
+   * the host reference use this SAME overridden value, so the gate is still a
+   * like-for-like check of camera_sample. */
+  mp.pixel_jitter_x = 0.25f;
+  mp.pixel_jitter_y = -0.5f;
+  mp.ctw_x_x = kd.cam.cameratoworld.x.x; mp.ctw_x_y = kd.cam.cameratoworld.x.y;
+  mp.ctw_x_z = kd.cam.cameratoworld.x.z; mp.ctw_x_w = kd.cam.cameratoworld.x.w;
+  mp.ctw_y_x = kd.cam.cameratoworld.y.x; mp.ctw_y_y = kd.cam.cameratoworld.y.y;
+  mp.ctw_y_z = kd.cam.cameratoworld.y.z; mp.ctw_y_w = kd.cam.cameratoworld.y.w;
+  mp.ctw_z_x = kd.cam.cameratoworld.z.x; mp.ctw_z_y = kd.cam.cameratoworld.z.y;
+  mp.ctw_z_z = kd.cam.cameratoworld.z.z; mp.ctw_z_w = kd.cam.cameratoworld.z.w;
+  mp.rtc_x_x = kd.cam.rastertocamera.x.x; mp.rtc_x_y = kd.cam.rastertocamera.x.y;
+  mp.rtc_x_z = kd.cam.rastertocamera.x.z; mp.rtc_x_w = kd.cam.rastertocamera.x.w;
+  mp.rtc_y_x = kd.cam.rastertocamera.y.x; mp.rtc_y_y = kd.cam.rastertocamera.y.y;
+  mp.rtc_y_z = kd.cam.rastertocamera.y.z; mp.rtc_y_w = kd.cam.rastertocamera.y.w;
+  mp.rtc_z_x = kd.cam.rastertocamera.z.x; mp.rtc_z_y = kd.cam.rastertocamera.z.y;
+  mp.rtc_z_z = kd.cam.rastertocamera.z.z; mp.rtc_z_w = kd.cam.rastertocamera.z.w;
+  mp.rtc_w_x = kd.cam.rastertocamera.w.x; mp.rtc_w_y = kd.cam.rastertocamera.w.y;
+  mp.rtc_w_z = kd.cam.rastertocamera.w.z; mp.rtc_w_w = kd.cam.rastertocamera.w.w;
+  /* sampling_pattern is OVERRIDDEN to SOBOL_BURLEY. instance2.xml's real
+   * sampling_pattern is TABULATED_SOBOL (=1, confirmed by the probe log), which
+   * path_rng implements via tabulated_sobol_sample_* reading
+   * kernel_data.tables.sobol_rng_sample_order — a table NOT passed to the
+   * shader in S1a and explicitly out of the S1a scope (the task scopes the
+   * SOBOL_BURLEY branch of path_rng). Overriding to SOBOL_BURLEY in BOTH the
+   * GPU params and the host reference exercises the in-scope SOBOL_BURLEY
+   * branch of path_rng, like-for-like. The TABULATED_SOBOL branch is NOT
+   * covered (see the report). */
+  mp.sampling_pattern = SAMPLING_PATTERN_SOBOL_BURLEY;
+  mp.sobol_index_mask = (uint32_t)kd.integrator.sobol_index_mask;
+  mp.blue_noise_sequence_length = (uint32_t)kd.integrator.blue_noise_sequence_length;
+  mp.seed = 0; /* set per pass */
+
+  LOG_INFO << "Vulkan: Math probe: cam.type=" << mp.cam_type
+           << " shuttertime=" << mp.shuttertime << " aperturesize=" << mp.aperturesize
+           << " nearclip=" << mp.nearclip << " cliplength=" << mp.cliplength
+           << " sampling_pattern=" << mp.sampling_pattern
+           << " sobol_index_mask=" << (int)mp.sobol_index_mask
+           << " have_persp_motion=" << mp.have_perspective_motion
+           << " num_motion_steps=" << mp.num_motion_steps
+           << " interocular=" << mp.interocular_offset;
+
+  if (mp.cam_type != 0 /* CAMERA_PERSPECTIVE */ || mp.shuttertime != -1.0f ||
+      mp.aperturesize != 0.0f || mp.have_perspective_motion != 0 ||
+      mp.num_motion_steps != 0 || mp.interocular_offset != 0.0f) {
+    LOG_WARNING << "Vulkan: Math probe: scene camera is outside the S1a covered config "
+                   "(perspective, aperture 0, shuttertime -1, no motion/stereo); the "
+                   "camera cases will report as unsupported and the gate is not met.";
+  }
+
+  /* ---- 6. Build the host reference globals (REAL Cycles functions) ---- */
+  /* KernelGlobalsCPU holds KernelData + the kernel_array data pointers. We fill
+   * `data` from the real kernel data (with the same pixel_jitter override) and
+   * build a ThreadKernelGlobalsCPU from it. lookup_table is left empty (unused:
+   * pixel_jitter != FLT_MAX skips the filter-table read; shuttertime == -1
+   * skips the shutter-table read). OSL globals are null (safe: OSLThreadData
+   * returns early on null, kernel/osl/globals.cpp:17). Path guiding is off. */
+  KernelGlobalsCPU kg_cpu;
+  kg_cpu.data = kd;
+  kg_cpu.data.integrator.pixel_jitter = make_float2(mp.pixel_jitter_x, mp.pixel_jitter_y);
+  /* Match the GPU override: SOBOL_BURLEY (the scene's real pattern is
+   * TABULATED_SOBOL, whose table is not passed to the shader in S1a; see the
+   * MathParams comment). Both sides must use the same pattern for a
+   * like-for-like check of the in-scope SOBOL_BURLEY path_rng branch. */
+  kg_cpu.data.integrator.sampling_pattern = SAMPLING_PATTERN_SOBOL_BURLEY;
+  Profiler math_probe_profiler;
+  ThreadKernelGlobalsCPU tkg(kg_cpu, nullptr, math_probe_profiler, 0);
+  KernelGlobals kg = &tkg;
+
+  /* ---- 7. Build the case list ---- */
+  std::vector<MathProbeCase> cases;
+  const uint32_t samples[6] = {0, 1, 5, 15, 255, 1023};
+  const uint32_t dims[8] = {0, 1, 2, 3, 8, 32, 200, 1023};
+  const uint32_t sobol_seeds[3] = {0u, 1u, 0xDEADBEEFu};
+  const uint32_t sobol_masks[2] = {0xFFFFFFFFu, (uint32_t)kd.integrator.sobol_index_mask};
+  const uint32_t sobol_indices[8] = {0u, 1u, 2u, 5u, 255u, 1023u, 0xFFFFu, 0x12345u};
+  const uint32_t sobol_dimsets[4] = {0u, 1u, 5u, 31u};
+
+  auto add = [&cases](uint32_t kind, int32_t sample, uint32_t x, uint32_t y, uint32_t dim,
+                      uint32_t seed, uint32_t mask, uint32_t index, float fx, float fy,
+                      float fz) {
+    MathProbeCase c{};
+    c.kind = kind; c.sample = sample; c.x = x; c.y = y;
+    c.dim = dim; c.seed = seed; c.mask = mask; c.index = index;
+    c.fx = fx; c.fy = fy; c.fz = fz; c.fw = 0.0f;
+    cases.push_back(c);
+  };
+
+  /* Pixel grid over the 64x48 tile (stride 2 -> 32x24 = 768 pixels). */
+  std::vector<std::pair<int, int>> pix;
+  for (int y = 0; y < 48; y += 2)
+    for (int x = 0; x < 64; x += 2)
+      pix.emplace_back(x, y);
+
+  /* hash_iqnt2d: one case per pixel (bit-exact integer). */
+  for (auto &p : pix)
+    add(MATHK_HASH, 0, (uint32_t)p.first, (uint32_t)p.second, 0, 0, 0, 0, 0, 0, 0);
+  /* path_rng_pixel_init: one case per pixel (bit-exact integer; seed axis is
+   * covered by the 3 clean passes varying integrator.seed). */
+  for (auto &p : pix)
+    add(MATHK_PIXEL_INIT, 0, (uint32_t)p.first, (uint32_t)p.second, 0, 0, 0, 0, 0, 0, 0);
+  /* camera_sample: one case per pixel (ray P/D/tmin/tmax/time). filter_uv/time
+   * are ignored in the covered config but passed for signature fidelity. */
+  for (auto &p : pix)
+    add(MATHK_CAMERA, 0, (uint32_t)p.first, (uint32_t)p.second, 0, 0, 0, 0, 0.5f, 0.5f, 0.5f);
+  /* sobol_burley_sample_1D/2D/3D/4D: cross(index, dim_set, seed, mask). */
+  for (uint32_t s = 1; s <= 4; s++)
+    for (uint32_t ii = 0; ii < 8; ii++)
+      for (uint32_t dd = 0; dd < 4; dd++)
+        for (uint32_t ss = 0; ss < 3; ss++)
+          for (uint32_t mm = 0; mm < 2; mm++)
+            add(MATHK_SOBOL1D + (s - 1), 0, 0, 0, sobol_dimsets[dd], sobol_seeds[ss],
+                sobol_masks[mm], sobol_indices[ii], 0, 0, 0);
+  /* path_rng_1D/2D/3D/4D: cross(a few pixels, sample, dim). rng_pixel is
+   * derived inside the shader/reference from (x,y,seed). */
+  const uint32_t rng_pix[6] = {0, 1, 2, 32, 33, 767};
+  for (uint32_t s = 6; s <= 9; s++)
+    for (uint32_t pi = 0; pi < 6; pi++) {
+      uint32_t xy = rng_pix[pi];
+      uint32_t px = (xy % 32) * 2, py = (xy / 32) * 2;
+      for (uint32_t si = 0; si < 6; si++)
+        for (uint32_t dd = 0; dd < 8; dd++)
+          add(MATHK_RNG1D + (s - 6), (int32_t)samples[si], px, py, dims[dd], 0, 0, 0, 0, 0, 0);
+    }
+
+  const uint32_t num_cases = (uint32_t)cases.size();
+  LOG_INFO << "Vulkan: Math probe: " << num_cases << " cases, "
+           << (num_cases + 63) / 64 << " workgroups of 64 threads.";
+
+  /* ---- 8. Allocate the three host-visible + device-address buffers ---- */
+  auto make_buffer = [&](VkDeviceSize size, VkBuffer &buf, VkDeviceMemory &mem,
+                         uint64_t &addr) -> bool {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(vk_dev, &bci, nullptr, &buf) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Math probe: buffer creation failed.";
+      return false;
+    }
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(vk_dev, buf, &reqs);
+    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &flags_info;
+    ai.allocationSize = reqs.size;
+    ai.memoryTypeIndex = dev->find_memory_type(
+        reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX) {
+      LOG_ERROR << "Vulkan: Math probe: no host-visible+coherent memory type.";
+      return false;
+    }
+    if (vkAllocateMemory(vk_dev, &ai, nullptr, &mem) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Math probe: memory allocation failed.";
+      return false;
+    }
+    if (vkBindBufferMemory(vk_dev, buf, mem, 0) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Math probe: memory bind failed.";
+      return false;
+    }
+    VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    bai.buffer = buf;
+    addr = vkGetBufferDeviceAddress(vk_dev, &bai);
+    return true;
+  };
+
+  uint64_t cases_addr = 0, out_addr = 0, params_addr = 0;
+  const VkDeviceSize cases_bytes = (VkDeviceSize)num_cases * sizeof(MathProbeCase);
+  const VkDeviceSize out_bytes =
+      (VkDeviceSize)num_cases * sizeof(MathProbeResult) +
+      (VkDeviceSize)MATH_PROBE_CANARY_WORDS * sizeof(uint32_t);
+  const VkDeviceSize params_bytes = sizeof(MathProbeParams);
+  if (!make_buffer(cases_bytes, res.cases_buffer, res.cases_memory, cases_addr) ||
+      !make_buffer(out_bytes, res.out_buffer, res.out_memory, out_addr) ||
+      !make_buffer(params_bytes, res.params_buffer, res.params_memory, params_addr)) {
+    return false;
+  }
+
+  /* ---- 9. Upload the case list (write once) ---- */
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.cases_memory, 0, cases_bytes, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Math probe: mapping cases buffer failed.";
+      return false;
+    }
+    memcpy(m, cases.data(), (size_t)cases_bytes);
+    vkUnmapMemory(vk_dev, res.cases_memory);
+  }
+  /* Pre-fill the output canary region so we can detect an overrun. */
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.out_memory, 0, out_bytes, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Math probe: mapping out buffer (canary) failed.";
+      return false;
+    }
+    uint32_t *canary = reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(m) +
+                                                    (size_t)num_cases * sizeof(MathProbeResult));
+    for (uint32_t i = 0; i < MATH_PROBE_CANARY_WORDS; i++)
+      canary[i] = MATH_PROBE_CANARY;
+    vkUnmapMemory(vk_dev, res.out_memory);
+  }
+
+  /* ---- 10. Command pool + buffer ---- */
+  const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
+  VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  cpci.queueFamilyIndex = family;
+  if (vkCreateCommandPool(vk_dev, &cpci, nullptr, &res.pool) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Math probe: command pool creation failed.";
+    return false;
+  }
+  VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = res.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(vk_dev, &cbai, &cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Math probe: command buffer allocation failed.";
+    return false;
+  }
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(vk_dev, family, 0, &queue);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (vkCreateFence(vk_dev, &fci, nullptr, &res.fence) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Math probe: fence creation failed.";
+    return false;
+  }
+
+  /* ---- 11. Per-pass runner: update seed/neg_mode, dispatch, read back ---- */
+  std::vector<MathProbeResult> results(num_cases);
+  auto run_pass = [&](uint32_t seed, int neg_mode) -> bool {
+    /* Update params (seed + fault switch) on the GPU buffer. */
+    mp.seed = seed;
+    mp.neg_mode = neg_mode;
+    {
+      void *m = nullptr;
+      if (vkMapMemory(vk_dev, res.params_memory, 0, params_bytes, 0, &m) != VK_SUCCESS) {
+        LOG_ERROR << "Vulkan: Math probe: mapping params buffer failed.";
+        return false;
+      }
+      memcpy(m, &mp, sizeof(mp));
+      vkUnmapMemory(vk_dev, res.params_memory);
+    }
+    /* Keep the host reference in sync (same integrator.seed). */
+    tkg.data.integrator.seed = (int)seed;
+
+    /* Record + submit. */
+    VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkResetCommandBuffer(cmd, 0);
+    vkBeginCommandBuffer(cmd, &begin_info);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.pipeline);
+    MathProbePush push{cases_addr, out_addr, params_addr, num_cases};
+    vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd, (num_cases + 63) / 64, 1, 1);
+    vkEndCommandBuffer(cmd);
+
+    vkResetFences(vk_dev, 1, &res.fence);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (vkQueueSubmit(queue, 1, &si, res.fence) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Math probe: queue submit failed.";
+      return false;
+    }
+    if (vkWaitForFences(vk_dev, 1, &res.fence, VK_TRUE, 10000000000ull) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Math probe: fence wait failed.";
+      return false;
+    }
+
+    /* Read back. */
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.out_memory, 0, out_bytes, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Math probe: mapping out buffer failed.";
+      return false;
+    }
+    memcpy(results.data(), m, (size_t)num_cases * sizeof(MathProbeResult));
+    /* Verify the canary region is intact (no overrun). */
+    const uint32_t *canary = reinterpret_cast<const uint32_t *>(
+        static_cast<const uint8_t *>(m) + (size_t)num_cases * sizeof(MathProbeResult));
+    bool canary_ok = true;
+    for (uint32_t i = 0; i < MATH_PROBE_CANARY_WORDS; i++)
+      if (canary[i] != MATH_PROBE_CANARY) canary_ok = false;
+    vkUnmapMemory(vk_dev, res.out_memory);
+    if (!canary_ok) {
+      LOG_ERROR << "Vulkan: Math probe: OUTPUT CANARY CORRUPTED (shader overran the "
+                   "results buffer).";
+      return false;
+    }
+    return true;
+  };
+
+  /* ---- 12. Compare one pass against the REAL Cycles reference ---- */
+  struct PassStats {
+    uint64_t int_cases = 0, int_mismatch = 0;
+    uint64_t float_comps = 0, float_mismatch = 0;
+    uint64_t sobol_bitexact = 0, sobol_floats = 0;
+    double max_norm_err = 0.0, sum_norm_err = 0.0;
+    std::vector<double> norm_errs;
+    uint64_t by_kind_mismatch[MATHK_COUNT] = {0};
+    bool bad_output_shape = false;
+  };
+  auto compare_pass = [&](PassStats &st) {
+    st.norm_errs.reserve(num_cases * 2);
+    for (uint32_t i = 0; i < num_cases; i++) {
+      const MathProbeCase &c = cases[i];
+      const MathProbeResult &r = results[i];
+      auto bad_shape = [&](const char *what) {
+        if (!st.bad_output_shape) {
+          LOG_ERROR << "Vulkan: Math probe: case " << i << " (" << what
+                    << ") has invalid has_u/nfloat; dispatch did not run correctly.";
+        }
+        st.bad_output_shape = true;
+      };
+
+      if (c.kind == MATHK_HASH) {
+        const uint32_t ref = hash_iqnt2d(c.x, c.y);
+        if (r.has_u != 1) { bad_shape("hash"); continue; }
+        st.int_cases++;
+        if (r.u0 != ref) { st.int_mismatch++; st.by_kind_mismatch[c.kind]++; }
+      }
+      else if (c.kind == MATHK_PIXEL_INIT) {
+        const uint32_t ref = path_rng_pixel_init(kg, c.sample, (int)c.x, (int)c.y);
+        if (r.has_u != 1) { bad_shape("pixel_init"); continue; }
+        st.int_cases++;
+        if (r.u0 != ref) { st.int_mismatch++; st.by_kind_mismatch[c.kind]++; }
+      }
+      else if (c.kind >= MATHK_SOBOL1D && c.kind <= MATHK_SOBOL4D) {
+        float ref[4];
+        uint32_t n = 0;
+        if (c.kind == MATHK_SOBOL1D) {
+          ref[0] = sobol_burley_sample_1D(c.index, c.dim, c.seed, c.mask); n = 1;
+        }
+        else if (c.kind == MATHK_SOBOL2D) {
+          const float2 v = sobol_burley_sample_2D(c.index, c.dim, c.seed, c.mask);
+          ref[0] = v.x; ref[1] = v.y; n = 2;
+        }
+        else if (c.kind == MATHK_SOBOL3D) {
+          const float3 v = sobol_burley_sample_3D(c.index, c.dim, c.seed, c.mask);
+          ref[0] = v.x; ref[1] = v.y; ref[2] = v.z; n = 3;
+        }
+        else {
+          const float4 v = sobol_burley_sample_4D(c.index, c.dim, c.seed, c.mask);
+          ref[0] = v.x; ref[1] = v.y; ref[2] = v.z; ref[3] = v.w; n = 4;
+        }
+        if (r.nfloat != n) { bad_shape("sobol"); continue; }
+        bool any = false;
+        for (uint32_t k = 0; k < n; k++) {
+          const double denom = std::max(1.0, (double)std::fabs(ref[k]));
+          const double err = std::fabs((double)r.f[k] - (double)ref[k]) / denom;
+          st.float_comps++;
+          st.sum_norm_err += err;
+          if (err > st.max_norm_err) st.max_norm_err = err;
+          st.norm_errs.push_back(err);
+          if (err > 1e-5) { st.float_mismatch++; any = true; }
+          /* Informational: exact-bit (implies sobol integer bit-exact). */
+          uint32_t gb, rb;
+          memcpy(&gb, &r.f[k], 4); memcpy(&rb, &ref[k], 4);
+          st.sobol_floats++;
+          if (gb == rb) st.sobol_bitexact++;
+        }
+        if (any) st.by_kind_mismatch[c.kind]++;
+      }
+      else if (c.kind >= MATHK_RNG1D && c.kind <= MATHK_RNG4D) {
+        const uint32_t rng_pixel = path_rng_pixel_init(kg, c.sample, (int)c.x, (int)c.y);
+        float ref[4];
+        uint32_t n = 0;
+        if (c.kind == MATHK_RNG1D) {
+          ref[0] = path_rng_1D(kg, rng_pixel, (uint32_t)c.sample, (int)c.dim); n = 1;
+        }
+        else if (c.kind == MATHK_RNG2D) {
+          const float2 v = path_rng_2D(kg, rng_pixel, c.sample, (int)c.dim);
+          ref[0] = v.x; ref[1] = v.y; n = 2;
+        }
+        else if (c.kind == MATHK_RNG3D) {
+          const float3 v = path_rng_3D(kg, rng_pixel, c.sample, (int)c.dim);
+          ref[0] = v.x; ref[1] = v.y; ref[2] = v.z; n = 3;
+        }
+        else {
+          const float4 v = path_rng_4D(kg, rng_pixel, c.sample, (int)c.dim);
+          ref[0] = v.x; ref[1] = v.y; ref[2] = v.z; ref[3] = v.w; n = 4;
+        }
+        if (r.nfloat != n) { bad_shape("rng"); continue; }
+        bool any = false;
+        for (uint32_t k = 0; k < n; k++) {
+          const double denom = std::max(1.0, (double)std::fabs(ref[k]));
+          const double err = std::fabs((double)r.f[k] - (double)ref[k]) / denom;
+          st.float_comps++;
+          st.sum_norm_err += err;
+          if (err > st.max_norm_err) st.max_norm_err = err;
+          st.norm_errs.push_back(err);
+          if (err > 1e-5) { st.float_mismatch++; any = true; }
+        }
+        if (any) st.by_kind_mismatch[c.kind]++;
+      }
+      else if (c.kind == MATHK_CAMERA) {
+        Ray ray;
+        memset(&ray, 0, sizeof(ray));
+        int cache_miss = 0;
+        const float2 filter_uv = make_float2(c.fx, c.fy);
+        const float2 lens_uv = make_float2(0.0f, 0.0f);
+        camera_sample(kg, (int)c.x, (int)c.y, filter_uv, c.fz, lens_uv, &ray, cache_miss);
+        if (r.nfloat != 9) { bad_shape("camera"); continue; }
+        const float ref[9] = {ray.P.x, ray.P.y, ray.P.z,
+                              ray.D.x, ray.D.y, ray.D.z,
+                              ray.tmin, ray.tmax, ray.time};
+        bool any = false;
+        for (int k = 0; k < 9; k++) {
+          const double denom = std::max(1.0, (double)std::fabs(ref[k]));
+          const double err = std::fabs((double)r.f[k] - (double)ref[k]) / denom;
+          st.float_comps++;
+          st.sum_norm_err += err;
+          if (err > st.max_norm_err) st.max_norm_err = err;
+          st.norm_errs.push_back(err);
+          if (err > 1e-5) { st.float_mismatch++; any = true; }
+        }
+        if (any) st.by_kind_mismatch[c.kind]++;
+      }
+    }
+    std::sort(st.norm_errs.begin(), st.norm_errs.end());
+  };
+
+  auto log_stats = [&](const char *label, uint32_t seed, const PassStats &st) {
+    const double mean = st.norm_errs.empty() ?
+                            0.0 :
+                            st.sum_norm_err / (double)st.norm_errs.size();
+    const double p999 = st.norm_errs.empty() ?
+                            0.0 :
+                            st.norm_errs[(size_t)((double)(st.norm_errs.size() - 1) * 0.999)];
+    LOG_INFO << "Vulkan: Math probe: [" << label << " seed=" << seed << "] int "
+             << st.int_mismatch << "/" << st.int_cases << " mismatch; float "
+             << st.float_mismatch << "/" << st.float_comps << " over tol; max_norm_err="
+             << st.max_norm_err << " mean=" << mean << " p99.9=" << p999
+             << " sobol_bitexact=" << st.sobol_bitexact << "/" << st.sobol_floats
+             << (st.bad_output_shape ? " [BAD OUTPUT SHAPE]" : "");
+  };
+
+  /* ---- 13. Run: clean for seeds {0,1,large}; negatives at seed 0 ---- */
+  const uint32_t clean_seeds[3] = {0u, 1u, 0xDEADBEEFu};
+  bool clean_ok = true;
+  for (int s = 0; s < 3; s++) {
+    if (!run_pass(clean_seeds[s], 0)) return false;
+    PassStats st;
+    compare_pass(st);
+    log_stats("CLEAN", clean_seeds[s], st);
+    if (st.int_mismatch != 0 || st.float_mismatch != 0 || st.bad_output_shape) clean_ok = false;
+  }
+
+  bool neg_detected[4] = {true, false, false, false};
+  const char *neg_name[4] = {"", "sobol-table", "seed-xor", "transpose-rtc"};
+  for (int n = 1; n <= 3; n++) {
+    if (!run_pass(0u, n)) return false;
+    PassStats st;
+    compare_pass(st);
+    log_stats(neg_name[n], 0, st);
+    /* Detection is per targeted family. */
+    if (n == 1) { /* sobol table: any sobol/rng float mismatch */
+      uint64_t m = 0;
+      for (int k = MATHK_SOBOL1D; k <= MATHK_RNG4D; k++) m += st.by_kind_mismatch[k];
+      neg_detected[1] = (m > 0);
+    }
+    else if (n == 2) { /* seed xor: any pixel_init int mismatch */
+      neg_detected[2] = (st.by_kind_mismatch[MATHK_PIXEL_INIT] > 0);
+    }
+    else { /* transpose: any camera float mismatch */
+      neg_detected[3] = (st.by_kind_mismatch[MATHK_CAMERA] > 0);
+    }
+  }
+
+  /* ---- 14. Verdict ---- */
+  bool all_ok = clean_ok;
+  for (int n = 1; n <= 3; n++) {
+    LOG_INFO << "Vulkan: Math probe: negative '" << neg_name[n] << "' "
+             << (neg_detected[n] ? "DETECTED" : "NOT DETECTED");
+    if (!neg_detected[n]) all_ok = false;
+  }
+  if (clean_ok)
+    LOG_INFO << "Vulkan: Math probe: CLEAN PASS (all seeds bit/tolerance-exact).";
+  else
+    LOG_ERROR << "Vulkan: Math probe: CLEAN PASS FAILED (GPU disagrees with the real "
+                 "Cycles reference).";
+  LOG_INFO << "Vulkan: Math probe: " << (all_ok ? "GATE MET." : "GATE NOT MET.");
+  return all_ok;
 }
 
 /* =========================================================================
