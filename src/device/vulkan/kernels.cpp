@@ -1586,6 +1586,434 @@ bool vulkan_math_probe(VulkanDevice *dev)
 }
 
 /* =========================================================================
+ * M4e STEP 1b-0: dual-view KernelData dump probe (optional, env
+ * CYCLES_VULKAN_KDATA_PROBE=1)
+ * =========================================================================
+ * Settles the M4b anomaly: the typed view `params->data.words[356]`
+ * reportedly returned 0x80000803 while the raw uint32 view at the SAME byte
+ * offset (1424) returned 0x00000000 (traverse_probe.slang:104-115). This
+ * dispatches kdata_probe.slang, which reads ALL 640 words of the KernelData
+ * blob through BOTH views in one pass, then compares each view against the
+ * host bytes (host_kernel_data(), the same blob const_copy_to uploaded via
+ * device.cpp:317) and against each other, index by index. Every disagreement
+ * is printed with the owning KernelData field (offsetof from the real
+ * data_template macros) and the surrounding fields.
+ *
+ * The readback buffer is prefilled with 0xA5A5A5A5 (NOT 0x80000803) so the
+ * probe can settle whether 0x80000803 was ever a probe-written sentinel: if
+ * the typed view returns 0x80000803 it cannot have come from this prefill. */
+
+namespace {
+
+/* Readback layout must match kdata_probe.slang: [0..639] typed loop,
+ * [640..1279] raw loop, [1280] canary, [1281] typed words[356],
+ * [1282] raw params_raw[356], [1283..1922] base-ptr loop. */
+constexpr uint32_t KDATA_WORDS = 640;
+constexpr uint32_t KDATA_ANOMALY_WORD = 356;
+constexpr uint32_t KDATA_OUT_WORDS = 3 * KDATA_WORDS + 3; /* 1923 */
+/* Offset of view (c) in the readback: right after canary + 2 constant slots. */
+constexpr uint32_t KDATA_VIEW_C_BASE = 2 * KDATA_WORDS + 3; /* 1283 */
+/* KdataProbeParams = three 64-bit device pointers (kdata_probe.slang). */
+constexpr uint32_t KDATA_PUSH_BYTES = 24;
+/* Prefill sentinel: a readback word still equal to this was NOT written by
+ * the shader. Deliberately NOT 0x80000803 (the historical anomaly value). */
+constexpr uint32_t KDATA_PREFILL_SENTINEL = 0xA5A5A5A5u;
+/* Canary the shader writes at out[1280]; must match kdata_probe.slang. */
+constexpr uint32_t KDATA_CANARY = 0xCAFEF00Du;
+
+std::string kdata_hex32(const uint32_t v) { return string_printf("%08x", v); }
+
+struct KdataProbeResources {
+  VkDevice device = VK_NULL_HANDLE;
+  VkShaderModule module = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkBuffer out_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory out_memory = VK_NULL_HANDLE;
+
+  ~KdataProbeResources()
+  {
+    if (device == VK_NULL_HANDLE) return;
+    if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+    if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+    if (module) vkDestroyShaderModule(device, module, nullptr);
+    if (pool) vkDestroyCommandPool(device, pool, nullptr);
+    if (out_buffer) vkDestroyBuffer(device, out_buffer, nullptr);
+    if (out_memory) vkFreeMemory(device, out_memory, nullptr);
+  }
+};
+
+/* Field-attribution table: top-level KernelData members with their REAL
+ * offsets (offsetof). Sizes are implied by consecutive offsets; the last
+ * field runs to sizeof(KernelData). Built from the actual member names so a
+ * mismatching byte offset maps to the Cycles field that owns it. */
+struct KdataField {
+  size_t offset;
+  const char *name;
+};
+static const KdataField kdata_field_table[] = {
+    {offsetof(KernelData, kernel_features), "kernel_features"},
+    {offsetof(KernelData, max_closures), "max_closures"},
+    {offsetof(KernelData, max_shaders), "max_shaders"},
+    {offsetof(KernelData, volume_stack_size), "volume_stack_size"},
+    {offsetof(KernelData, cam), "cam"},
+    {offsetof(KernelData, bake), "bake"},
+    {offsetof(KernelData, tables), "tables"},
+    {offsetof(KernelData, light_link_sets), "light_link_sets"},
+    {offsetof(KernelData, scene_time), "scene_time"},
+    {offsetof(KernelData, background), "background"},
+    {offsetof(KernelData, bvh), "bvh"},
+    {offsetof(KernelData, film), "film"},
+    {offsetof(KernelData, integrator), "integrator"},
+    {offsetof(KernelData, image), "image"},
+    {offsetof(KernelData, svm_usage), "svm_usage"},
+    {offsetof(KernelData, device_bvh), "device_bvh"},
+};
+static const size_t KDATA_FIELD_COUNT = sizeof(kdata_field_table) /
+                                        sizeof(kdata_field_table[0]);
+
+/* KernelBVH sub-fields (data_template.h:51-60), for drill-down when the
+ * owning top-level field is `bvh` (the historical anomaly lives here). */
+struct BvhField {
+  size_t offset;
+  const char *name;
+};
+static const BvhField bvh_field_table[] = {
+    {offsetof(KernelBVH, root), "root"},
+    {offsetof(KernelBVH, have_motion), "have_motion"},
+    {offsetof(KernelBVH, have_curves), "have_curves"},
+    {offsetof(KernelBVH, have_points), "have_points"},
+    {offsetof(KernelBVH, have_volumes), "have_volumes"},
+    {offsetof(KernelBVH, bvh_layout), "bvh_layout"},
+    {offsetof(KernelBVH, use_bvh_steps), "use_bvh_steps"},
+    {offsetof(KernelBVH, curve_subdivisions), "curve_subdivisions"},
+};
+static const size_t BVH_FIELD_COUNT = sizeof(bvh_field_table) / sizeof(bvh_field_table[0]);
+
+/* Print the owning KernelData field for a byte offset, plus the fields on
+ * either side (surrounding context). Drill into KernelBVH when the offset
+ * lands inside `bvh`. */
+void kdata_attrib(const size_t byte_off)
+{
+  size_t idx = 0;
+  for (size_t i = 0; i < KDATA_FIELD_COUNT; i++) {
+    if (kdata_field_table[i].offset <= byte_off) idx = i;
+  }
+  const size_t field_off = kdata_field_table[idx].offset;
+  const size_t field_end = (idx + 1 < KDATA_FIELD_COUNT) ?
+                               kdata_field_table[idx + 1].offset :
+                               sizeof(KernelData);
+  if (idx > 0)
+    LOG_INFO << "Vulkan: KData probe:   prev field: " << kdata_field_table[idx - 1].name
+             << " @ " << kdata_field_table[idx - 1].offset;
+  LOG_INFO << "Vulkan: KData probe:   OWNING FIELD: " << kdata_field_table[idx].name
+           << " @ offset " << field_off << " size " << (field_end - field_off) << " (+"
+           << (byte_off - field_off) << " into field)";
+  if (idx + 1 < KDATA_FIELD_COUNT)
+    LOG_INFO << "Vulkan: KData probe:   next field: " << kdata_field_table[idx + 1].name
+             << " @ " << kdata_field_table[idx + 1].offset;
+  if (strcmp(kdata_field_table[idx].name, "bvh") == 0) {
+    const size_t rel = byte_off - field_off;
+    for (size_t i = 0; i < BVH_FIELD_COUNT; i++) {
+      if (bvh_field_table[i].offset <= rel) {
+        LOG_INFO << "Vulkan: KData probe:     -> KernelBVH." << bvh_field_table[i].name
+                 << " (+" << (rel - bvh_field_table[i].offset) << " into it)";
+        break;
+      }
+    }
+  }
+}
+
+} /* namespace */
+
+bool vulkan_kdata_probe(VulkanDevice *dev)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+  if (getenv("CYCLES_VULKAN_KDATA_PROBE") == nullptr) return true;
+
+  LOG_INFO << "Vulkan: KData probe starting (CYCLES_VULKAN_KDATA_PROBE=1).";
+
+  KdataProbeResources res;
+  const VkDevice vk_dev = dev->vk_device();
+  res.device = vk_dev;
+
+  /* 1. Device address of the KernelParamsVulkan buffer (const_copy_to created
+   *    it during the scene upload; this probe runs from enqueue, after that). */
+  const uint64_t params_addr = dev->kernel_params_address();
+  if (params_addr == 0) {
+    LOG_ERROR << "Vulkan: KData probe: kernel params buffer does not exist; probe skipped.";
+    return false;
+  }
+
+  /* 2. SPIR-V (env override or repo-relative default). */
+  std::vector<char> spirv;
+  const char *env_path = getenv("CYCLES_VULKAN_KDATA_PROBE_SPV");
+  const char *candidates[2] = {env_path, "kdata_probe.spv"};
+  const char *found = nullptr;
+  for (const char *c : candidates) {
+    if (c && probe_read_whole_file(c, spirv)) {
+      found = c;
+      break;
+    }
+  }
+  if (!found) {
+    LOG_ERROR << "Vulkan: KData probe: cannot find kdata_probe.spv "
+                 "(compile it with slangc or set CYCLES_VULKAN_KDATA_PROBE_SPV).";
+    return false;
+  }
+  if (spirv.size() % 4 != 0) {
+    LOG_ERROR << "Vulkan: KData probe: '" << found << "' is not a valid SPIR-V module.";
+    return false;
+  }
+  LOG_INFO << "Vulkan: KData probe: spirv='" << found << "' (" << spirv.size() << " bytes).";
+
+  /* 3. Shader module. */
+  VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = spirv.size();
+  smi.pCode = reinterpret_cast<const uint32_t *>(spirv.data());
+  if (vkCreateShaderModule(vk_dev, &smi, nullptr, &res.module) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: KData probe: vkCreateShaderModule failed.";
+    return false;
+  }
+
+  /* 4. Pipeline layout: no descriptor sets, one 24-byte push-constant range. */
+  VkPushConstantRange pcr{};
+  pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pcr.offset = 0;
+  pcr.size = KDATA_PUSH_BYTES;
+  VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pli.pushConstantRangeCount = 1;
+  pli.pPushConstantRanges = &pcr;
+  if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &res.layout) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: KData probe: pipeline layout creation failed.";
+    return false;
+  }
+
+  /* 5. Compute pipeline (entry name "main"; slangc renames). */
+  VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  cpi.stage.module = res.module;
+  cpi.stage.pName = "main";
+  cpi.layout = res.layout;
+  if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &res.pipeline) !=
+      VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: KData probe: compute pipeline creation failed "
+                 "(bad entry point name?).";
+    return false;
+  }
+
+  /* 6. Readback buffer, host-visible + coherent so the host can prefill the
+   *    sentinel and read back after the fence. STORAGE | SHADER_DEVICE_ADDRESS
+   *    because the shader writes through a raw device pointer. */
+  VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+  bci.size = KDATA_OUT_WORDS * sizeof(uint32_t);
+  bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+  bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (vkCreateBuffer(vk_dev, &bci, nullptr, &res.out_buffer) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: KData probe: readback buffer creation failed.";
+    return false;
+  }
+  VkMemoryRequirements reqs;
+  vkGetBufferMemoryRequirements(vk_dev, res.out_buffer, &reqs);
+  VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+  flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+  VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+  ai.pNext = &flags_info;
+  ai.allocationSize = reqs.size;
+  ai.memoryTypeIndex = dev->find_memory_type(
+      reqs.memoryTypeBits,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (vkAllocateMemory(vk_dev, &ai, nullptr, &res.out_memory) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: KData probe: readback memory allocation failed.";
+    return false;
+  }
+  if (vkBindBufferMemory(vk_dev, res.out_buffer, res.out_memory, 0) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: KData probe: readback memory bind failed.";
+    return false;
+  }
+  VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+  bai.buffer = res.out_buffer;
+  const uint64_t out_addr = vkGetBufferDeviceAddress(vk_dev, &bai);
+
+  /* 7. Prefill the readback buffer with the sentinel so unwritten words are
+   *    detectable. Host-coherent memory: the host write is made visible to the
+   *    device by the queue submission, so no explicit barrier is needed. */
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.out_memory, 0, bci.size, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: KData probe: mapping readback buffer for prefill failed.";
+      return false;
+    }
+    uint32_t *words = static_cast<uint32_t *>(m);
+    for (uint32_t i = 0; i < KDATA_OUT_WORDS; i++) words[i] = KDATA_PREFILL_SENTINEL;
+    vkUnmapMemory(vk_dev, res.out_memory);
+  }
+
+  /* 8. Record + submit one workgroup of one thread. */
+  const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
+  VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  cpci.queueFamilyIndex = family;
+  if (vkCreateCommandPool(vk_dev, &cpci, nullptr, &res.pool) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: KData probe: command pool creation failed.";
+    return false;
+  }
+  VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = res.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(vk_dev, &cbai, &cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: KData probe: command buffer allocation failed.";
+    return false;
+  }
+  VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: KData probe: vkBeginCommandBuffer failed.";
+    return false;
+  }
+  vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.pipeline);
+  const uint64_t push[3] = {params_addr, params_addr, out_addr};
+  vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+  vkCmdDispatch(cmd, 1, 1, 1);
+  if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: KData probe: vkEndCommandBuffer failed.";
+    return false;
+  }
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(vk_dev, family, 0, &queue);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VkFence fence = VK_NULL_HANDLE;
+  if (vkCreateFence(vk_dev, &fci, nullptr, &fence) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: KData probe: fence creation failed.";
+    return false;
+  }
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &cmd;
+  bool submitted = false;
+  if (vkQueueSubmit(queue, 1, &si, fence) == VK_SUCCESS) {
+    submitted = vkWaitForFences(vk_dev, 1, &fence, VK_TRUE, 10000000000ull) == VK_SUCCESS;
+  }
+  vkDestroyFence(vk_dev, fence, nullptr);
+  if (!submitted) {
+    LOG_ERROR << "Vulkan: KData probe: queue submit/wait failed.";
+    return false;
+  }
+
+  /* 9. Read back. */
+  uint32_t out[KDATA_OUT_WORDS];
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.out_memory, 0, bci.size, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: KData probe: mapping readback buffer failed.";
+      return false;
+    }
+    memcpy(out, m, sizeof(out));
+    vkUnmapMemory(vk_dev, res.out_memory);
+  }
+
+  /* 10. Host reference: the SAME KernelData blob const_copy_to uploaded into
+   *     the params buffer (host_params_.data, mirrored 1:1 by device.cpp:317).
+   *     Reinterpret as a flat uint32 array of 640 words. */
+  const KernelData &kd = dev->host_kernel_data();
+  static_assert(sizeof(KernelData) == 2560, "KernelData must be 640 uint32 words");
+  const uint32_t *host_words = reinterpret_cast<const uint32_t *>(&kd);
+
+  /* 11. Verify the canary and detect any word the shader did not overwrite.
+   *     Check the two loop regions (views a,b and view c), skipping the
+   *     canary and the two constant slots in between. */
+  const bool canary_ok = (out[2 * KDATA_WORDS] == KDATA_CANARY);
+  uint32_t unwritten = 0;
+  for (uint32_t i = 0; i < 2 * KDATA_WORDS; i++) {
+    if (out[i] == KDATA_PREFILL_SENTINEL) unwritten++;
+  }
+  for (uint32_t i = 0; i < KDATA_WORDS; i++) {
+    if (out[KDATA_VIEW_C_BASE + i] == KDATA_PREFILL_SENTINEL) unwritten++;
+  }
+  if (!canary_ok)
+    LOG_ERROR << "Vulkan: KData probe: CANARY MISMATCH (out[" << (2 * KDATA_WORDS)
+              << "]=0x" << kdata_hex32(out[2 * KDATA_WORDS]) << ", expected 0x"
+              << kdata_hex32(KDATA_CANARY) << ").";
+  if (unwritten)
+    LOG_ERROR << "Vulkan: KData probe: " << unwritten
+              << " word(s) still hold the prefill sentinel (shader did not write them).";
+
+  /* 12. Compare each view against the host bytes and against each other.
+   *     Print every disagreement with full attribution. View (c) is the
+   *     root-cause discriminator: base-pointer + dynamic index. */
+  uint32_t mism_a_host = 0, mism_b_host = 0, mism_a_b = 0, mism_c_host = 0;
+  for (uint32_t i = 0; i < KDATA_WORDS; i++) {
+    const uint32_t a = out[i];               /* typed view        */
+    const uint32_t b = out[KDATA_WORDS + i]; /* raw view          */
+    const uint32_t c = out[KDATA_VIEW_C_BASE + i]; /* base-ptr view */
+    const uint32_t host = host_words[i];
+    const bool a_bad = (a != host);
+    const bool b_bad = (b != host);
+    const bool c_bad = (c != host);
+    const bool ab_bad = (a != b);
+    if (a_bad) mism_a_host++;
+    if (b_bad) mism_b_host++;
+    if (c_bad) mism_c_host++;
+    if (ab_bad) mism_a_b++;
+    if (a_bad || b_bad || c_bad || ab_bad) {
+      const size_t byte_off = (size_t)i * 4;
+      LOG_ERROR << "Vulkan: KData probe: MISMATCH word " << i << " (byte " << byte_off
+                << "): typed=0x" << kdata_hex32(a) << " raw=0x" << kdata_hex32(b)
+                << " baseptr=0x" << kdata_hex32(c) << " host=0x" << kdata_hex32(host) << "  [typed"
+                << (a_bad ? "!=host" : "==host") << " raw" << (b_bad ? "!=host" : "==host")
+                << " baseptr" << (c_bad ? "!=host" : "==host") << (ab_bad ? " typed!=raw" : "")
+                << "]";
+      kdata_attrib(byte_off);
+    }
+  }
+
+  /* 13. The historical anomaly read, through CONSTANT index356. */
+  {
+    const uint32_t a_const = out[2 * KDATA_WORDS + 1];
+    const uint32_t b_const = out[2 * KDATA_WORDS + 2];
+    const uint32_t host356 = host_words[KDATA_ANOMALY_WORD];
+    LOG_INFO << "Vulkan: KData probe: anomaly word " << KDATA_ANOMALY_WORD << " (byte "
+             << (KDATA_ANOMALY_WORD * 4) << ") CONSTANT-index: typed=0x" << kdata_hex32(a_const)
+             << " raw=0x" << kdata_hex32(b_const) << " host=0x" << kdata_hex32(host356)
+             << (a_const == b_const && a_const == host356 ? " AGREE" : " DISAGREE");
+    /* Where is KernelBVH / bvh.root really? Print for the record. */
+    LOG_INFO << "Vulkan: KData probe: offsetof(KernelData,bvh)=" << offsetof(KernelData, bvh)
+             << " offsetof(KernelBVH,root)=" << offsetof(KernelBVH, root) << " => bvh.root at byte "
+             << (offsetof(KernelData, bvh) + offsetof(KernelBVH, root)) << " (word "
+             << ((offsetof(KernelData, bvh) + offsetof(KernelBVH, root)) / 4) << ")";
+  }
+
+  /* 14. Verdict. The root-cause discriminator is view (c): if baseptr==host
+   *     for all words but typed!=host, the blob LAYOUT is correct and only
+   *     the inline `params->data.words[i]` dynamic-index codegen is broken. */
+  const bool ok = canary_ok && (unwritten == 0) && (mism_a_host == 0) && (mism_b_host == 0) &&
+                  (mism_a_b == 0) && (mism_c_host == 0);
+  const bool layout_ok = (mism_b_host == 0) && (mism_c_host == 0);
+  LOG_INFO << "Vulkan: KData probe: typed-vs-host=" << mism_a_host
+           << " raw-vs-host=" << mism_b_host << " baseptr-vs-host=" << mism_c_host
+           << " typed-vs-raw=" << mism_a_b << " unwritten=" << unwritten
+           << (canary_ok ? "" : " CANARY-BAD");
+  if (layout_ok && mism_a_host != 0)
+    LOG_ERROR << "Vulkan: KData probe: ROOT CAUSE = the KernelData blob LAYOUT is correct "
+                 "(raw + base-ptr dynamic index match host for all 640 words), but the inline "
+                 "`params->data.words[i]` DYNAMIC index is miscompiled by this Slang/SPIR-V "
+                 "toolchain (returns a constant for i>=1). Constant index works. Fix: access the "
+                 "blob via a base pointer or raw view, never inline dynamic-index data.words[].";
+  if (ok)
+    LOG_INFO << "Vulkan: KData probe: NO MISMATCH. All three views agree with the host bytes for "
+                "all 640 words (anomaly NOT reproduced).";
+  else
+    LOG_ERROR << "Vulkan: KData probe: MISMATCH PRESENT (see above).";
+  return ok;
+}
+
+/* =========================================================================
  * M4c traverse probe (optional, env CYCLES_VULKAN_TRAVERSE_PROBE=1)
  * =========================================================================
  * Traces 64x64 pinhole rays on the GPU through the ported closest-hit

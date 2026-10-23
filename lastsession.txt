@@ -1,98 +1,94 @@
-M4e STEP 1a SESSION (math-core probe: GATE MET) — 2026-10-22
-====================================================================
-STATUS: S1a COMPLETE. The math-core gate PASSES: clean pass matches the real
-Cycles headers for all 3 seeds; all 3 negative tests DETECTED; 0 VUID; validation
-layer active; canaries intact; every VkResult checked; slangc+spirv-val exit 0.
-S1b and S1c are NOT approved yet (plan for S1b's first task written below, no code).
+M4e STEP 1b-0 SESSION (dual-view KernelData dump probe: ANOMALY REPRODUCED + ROOT-CAUSED) — 2026-10-22
+=================================================================================================
+STATUS: S1b-0 COMPLETE. The M4b `words[356]` anomaly REPRODUCES and is now fully characterized.
+The KernelData blob LAYOUT is CORRECT; the fault is a Slang/SPIR-V CODEGEN bug that miscompiles the
+inline DYNAMIC index `params->data.words[i]`. NO mirror/layout fix was needed (so no frozen-file
+edit was made). ABI probe still passes (ALL VALUES MATCH). Traverse probe still runs and its
+KernelData-blob checks (root, checksums) MATCH. S1b proper and S1c are NOT approved (Research B
+written below, no code).
+
+ROOT CAUSE (proven, evidence in kdata_probe run):
+- Probe `kdata_probe.slang` reads the blob 3 ways in one dispatch:
+    (a) inline typed dynamic index : params->data.words[i]      -> MISCOMPILED
+    (b) raw dynamic index          : params_raw[i]              -> CORRECT (== host, all 640)
+    (c) base-ptr dynamic index     : (&params->data.words[0])[i]-> CORRECT (== host, all 640)
+  plus a CONSTANT-index read params->data.words[356] -> CORRECT (0x0 == host).
+- Host compares each vs host_kernel_data() (= host_params_.data, the blob const_copy_to uploaded).
+- Result (instance2.xml): typed-vs-host=639, raw-vs-host=0, baseptr-vs-host=0, unwritten=0.
+  View (a) returns 0x80000803 for EVERY i (incl. i=0). 0x80000803 is NOT a probe sentinel (prefill
+  was 0xA5A5A5A5, unwritten=0); it is the REAL kernel_features (blob word 0) — the ABI probe logs
+  literal `data.words[0]=0x80000803` too. => The inline `params->data.words[<dyn i>]` expression
+  DROPS the dynamic index and always loads words[0]. Constant index and base-pointer index both
+  work, so the struct layout (data@0, words@0-in-data, stride 4) is byte-correct.
+- offsetof(KernelData,bvh)=1424, offsetof(KernelBVH,root)=0 => bvh.root at word 356 (confirmed live).
+- CAUTION: traverse_probe.slang:104-115 comment MIS-attributes this to "a stride that does not
+  match". That is WRONG — the stride/layout is correct; it is a dynamic-index codegen bug. The
+  traverse probe's raw-view workaround is nonetheless the CORRECT pattern. Left the comment as-is
+  (out of S1b-0 scope: no layout fix was found, and the task scoped frozen edits to a layout fix).
+
+FIX / RULE FOR ALL FUTURE SLANG: never dynamically index `params->data.words[]` inline. Take the
+base pointer once (`uint* base = &params->data.words[0];`) and index through it, or use the raw
+`uint*` view — both are proven correct. (No code change was required; traverse.slang already uses
+the raw view.)
 
 WHAT WAS DONE (file by file):
-- src/kernel/device/vulkan/math_core.slang (NEW, untracked): faithful Slang port
-  of the hash / sobol_burley / pattern (path_rng) / camera math core. Refactored
-  MathParams to ALL-SCALAR (176 bytes) so Slang and C++ layouts cannot disagree
-  on padding (AGENTS §4). camera_sample_perspective rebuilds float4 matrix rows
-  from scalars locally. Sobol-table negative perturbs the first dimension-1 table
-  read (robust regardless of mask/clz). Compiles clean (slangc+spirv-val exit 0).
-- src/kernel/device/vulkan/math_probe.slang (NEW, untracked): probe entry
-  (math_probe_main). Reads MathParams + case array via device addresses (push
-  constants = 3 VkDeviceAddress + uint32 = 32 bytes, no descriptor sets). One
-  thread per case. Compiles clean.
-- src/device/vulkan/device_impl.h: added public getter
-  `const KernelData &host_kernel_data() const { return host_params_.data; }`
-  (was private). Camera/sampling input comes from the REAL loaded-scene KernelData.
-- src/device/vulkan/kernels.cpp: added includes (kernel/globals.h,
-  kernel/sample/pattern.h, kernel/camera/camera.h, <algorithm>, <cstdint>) and
-  the ~450-line `vulkan_math_probe(VulkanDevice*)` host function (struct mirrors
-  with static_asserts, MathParams fill from real KernelData, KernelGlobalsCPU +
-  Profiler + ThreadKernelGlobalsCPU reference, 4224-case list, 3 host-visible
-  device-address buffers with canary, per-pass dispatch, per-kind compare with
-  tolerance/bit-exact/percentile, 3 clean seeds + 3 negatives, verdict).
-- src/device/vulkan/queue.cpp: added `vulkan_math_probe` declaration + call in
-  enqueue (after vulkan_bsdf_probe, before the M4 stub set_error).
+- src/kernel/device/vulkan/kdata_probe.slang (NEW, untracked): 3-view dump entry `kdata_probe_main`
+  (1 thread). out[0..639]=typed dyn, [640..1279]=raw dyn, [1280]=canary 0xCAFEF00D,
+  [1281]=typed const words[356], [1282]=raw const params_raw[356], [1283..1922]=base-ptr dyn.
+  24-byte push {params, params_raw, out}. slangc+spirv-val exit 0.
+- src/device/vulkan/kernels.cpp (MODIFIED): added `vulkan_kdata_probe()` (~260 lines) after
+  vulkan_math_probe. Env-gated CYCLES_VULKAN_KDATA_PROBE=1. Vulkan setup mirrors vulkan_abi_probe
+  (no descriptor sets, 24B push, host-visible+coherent STORAGE|SHADER_DEVICE_ADDRESS readback).
+  Prefills readback 0xA5A5A5A5; host compares a/b/c vs host_kernel_data() + a-vs-b per index; prints
+  every disagreement with owning KernelData field (offsetof table over kernel_features..device_bvh)
+  + surrounding fields + KernelBVH drill-down; prints const-index anomaly read + real bvh offsets;
+  verdict prints ROOT CAUSE line when layout_ok && typed broken. static_assert(sizeof(KernelData)
+  ==2560) already existed (kernels.cpp:228) and is referenced.
+- src/device/vulkan/queue.cpp (MODIFIED): declared + called vulkan_kdata_probe after
+  vulkan_math_probe (no-op unless env set; M4 stub set_error still emitted).
 
-TWO ROOT-CAUSE FIXES DURING DEBUG (both were TEST-HARNESS bugs, not port bugs):
-1. Crash 0xC0000005 in path_rng_1D: instance2.xml's real sampling_pattern is
-   TABULATED_SOBOL (=1), so the host reference path_rng took the tabulated branch
-   and dereferenced a NULL kernel_data.tables pointer. Fix: OVERRIDE
-   sampling_pattern to SOBOL_BURLEY (0) in BOTH the GPU MathParams and the host
-   reference KernelData (like the pixel_jitter override), so both sides exercise
-   the in-scope SOBOL_BURLEY branch like-for-like. TABULATED_SOBOL branch is NOT
-   covered (out of S1a scope; table not passed to shader).
-2. VUID-vkDestroyDevice-device-05137 (leaked child object): the probe's fence was
-   a local, never destroyed. Fix: moved the fence into the MathProbeResources RAII
-   struct so it is destroyed on all paths. VUID count went 1 -> 0.
+GATE RESULTS (real output):
+- kdata probe: typed-vs-host=639 raw-vs-host=0 baseptr-vs-host=0 typed-vs-raw=639 unwritten=0;
+  const-index words[356] typed=raw=host=0x0 AGREE; run exit 0; VUID=0; layer active.
+- ABI probe (re-run after queue.cpp edit): ALL VALUES MATCH (sizeof params=0x1400, integrator_state
+  =0x850, bvh_nodes typed==raw@2560, ist[0] typed==raw@2984, sentinel); VUID=0.
+- traverse probe (re-run; my change is a no-op — env unset): root live=0x0 dump=0x0 MATCH;
+  bvh_nodes checksum live==dump; tri_verts live==dump; clean D1 MISMATCHES(not near edge)=0,
+  shader errors=0, type mismatches 0/0, canaries INTACT; NEG2+NEG3 DETECTED. NOTE (pre-existing M4c
+  behaviour, NOT caused by S1b-0): NEG1 (skip instance pop) NOT DETECTED and TIES=886 exceed the
+  8-limit warning. My queue.cpp addition is gated on CYCLES_VULKAN_KDATA_PROBE (unset here) => no-op.
 
-GATE RESULTS (real output, final clean build):
-  CLEAN seed=0   : int 0/1536 mismatch; float 0/11712 over tol; max_norm_err=2.34236e-07; sobol_bitexact=1920/1920
-  CLEAN seed=1   : int 0/1536 mismatch; float 0/11712 over tol; max_norm_err=2.34236e-07; sobol_bitexact=1920/1920
-  CLEAN seed=3735928559 (0xDEADBEEF): int 0/1536; float 0/11712; max_norm_err=2.34236e-07; sobol_bitexact=1920/1920
-  negative 'sobol-table'  : float 288/11712 over tol -> DETECTED
-  negative 'seed-xor'     : int 768/1536 mismatch    -> DETECTED
-  negative 'transpose-rtc': float 3072/11712 over tol-> DETECTED
-  CLEAN PASS (all seeds bit/tolerance-exact).  GATE MET.
-  VUID_or_ValidationErrors=0 ; layer_insert_lines=6 (VK_LAYER_KHRONOS_validation active).
-  slangc exit 0 ; spirv-val exit 0 ; cycles.exe exit 0.
+RESEARCH A (sampling pattern + pixel filter; NO code) — see report for citations:
+- XML: integrator `sampling_pattern` enum {sobol_burley=0, tabulated_sobol=1 (DEFAULT), blue_noise_*}
+  (integrator.cpp:149-157; types.h:122-123). film `filter_type` enum {box=0 (DEFAULT), gaussian,
+  blackman_harris} + `filter_width` float (default 1.0) (film.cpp:95-101; film.h:21-27).
+- camera_sample FLT_MAX filter-table branch (camera.h:461-468) is taken IFF pixel_jitter.x==FLT_MAX,
+  which happens exactly when use_pixel_jitter==false (integrator.cpp:160 default false; :401 FLT_MAX).
+  => TAKEN BY DEFAULT for ANY scene, INDEPENDENT of sampling_pattern and filter_type (those only
+  change path_rng tables / table contents, not which camera_sample branch runs).
+- FLT_MAX branch needs on GPU: tables.filter_table_offset (already in blob; types.h:1335),
+  lookup_table device array (data_arrays.h:78; params->lookup_table @ offset 2888, vulkan_data.slang:297),
+  FILTER_TABLE_SIZE=1024 (types.h:34); read via lookup_table_read (lookup_table.h:14-29). No new ABI
+  struct needed. Options + recommendation in report (keep S1a override for the math gate; adopt the
+  FLT_MAX path only for end-to-end fidelity).
 
-TOLERANCE/METRIC (user-specified): gate = MAXIMUM error over all samples (not a
-percentile). Floats pass iff |a-b| <= 1e-5*max(1,|b|) per value. Integers (hash,
-pixel_init) bit-exact. Sobol floats additionally bit-compared (informational;
-1920/1920 bit-exact implies sobol integers bit-exact via FMA-free uint_to_float_excl).
-p99.9 and mean printed for information only.
+RESEARCH B (S1b proper plan; NO code) — see report: state accessors Slang (~150-250),
+init_from_camera.slang port (~200-350), path_trace.slang entry (~50-150), host state-init gate in
+kernels.cpp (~100-200), possible device_impl/device.cpp exposure (~20-50). ~600-1000 lines; split
+into >=2 sub-tasks.
 
-KEY FACTS FOR THE NEXT SESSION:
-- Build: cmake --build build --config Release --target cycles -- /m
-- Compile shader: C:\VulkanSDK\1.4.363.0\Bin\slangc.exe math_probe.slang -target
-  spirv -stage compute -entry math_probe_main -o <temp>\math_probe.spv
-  then spirv-val.exe <that .spv>. Both must exit 0.
-- Run probe (PowerShell):
-  $env:CYCLES_VULKAN_ALLOW_NO_KERNELS='1'; $env:CYCLES_VULKAN_MATH_PROBE='1';
-  $env:CYCLES_VULKAN_MATH_PROBE_SPV="$env:LOCALAPPDATA\Temp\opencode\math_probe.spv";
-  $env:VK_INSTANCE_LAYERS='VK_LAYER_KHRONOS_validation'; $env:VK_LOADER_DEBUG='layer';
-  build\bin\Release\cycles.exe --device VULKAN --log-level info --samples 1 --background instance2.xml
-- DEBUG TRAP: on a crash the buffered stdout LOG_INFO lines are LOST. Use
-  fprintf(stderr,...) breadcrumbs (unbuffered) to localize; they survive a crash.
-  Exit code -1073741819 = 0xC0000005 access violation (NOT stack overflow).
-- The probe runs from VulkanQueue::enqueue BEFORE the M4 stub set_error, so the
-  probe executes even though the render later fails. cycles.exe still exits 0.
-- instance2.xml: cam.type=0 (perspective), shuttertime=-1, aperturesize=0,
-  have_perspective_motion=0, num_motion_steps=0, interocular_offset=0,
-  sampling_pattern=1 (TABULATED_SOBOL), sobol_index_mask=0.
+FILES FOR GIT (I ran NO git commands):
+- Modified: src/device/vulkan/kernels.cpp (adds vulkan_kdata_probe + helpers)
+- Modified: src/device/vulkan/queue.cpp (decl + call)
+- New/untracked: src/kernel/device/vulkan/kdata_probe.slang
+- Pre-existing uncommitted from earlier sessions (untouched by me): device_impl.h, math_core.slang,
+  math_probe.slang, and the S1a portions of kernels.cpp/queue.cpp. Repo-root traverse_*.spv are
+  stale prior-session artifacts (my compiles went to temp); no new artifacts in repo root.
 
-FILES (git):
-- Modified: src/device/vulkan/device_impl.h (+7), kernels.cpp (+714), queue.cpp (+7).
-- Untracked NEW source (intended deliverables): src/kernel/device/vulkan/math_core.slang,
-  src/kernel/device/vulkan/math_probe.slang.
-- math_probe.spv written to temp dir only (NOT in repo root). No other generated
-  artifacts left in the repo.
-
-OPEN / STILL COVERS NOTHING BEYOND S1a:
-- NOT covered (deferred): filter-table (pixel_jitter==FLT_MAX), DOF, motion blur,
-  panorama/custom camera, stereo, ray differentials, TABULATED_SOBOL path_rng.
-- S1b and S1c not started. S1b first-task plan (typed-vs-raw KernelData comparison
-  to explain the words[356] anomaly) written in the session report — NO code yet.
-
-S1b FIRST-TASK PLAN (NO code) — see the session report for the full 640-word plan.
-In brief: build a host-only field-by-field table of KernelData (offset, size,
-typed value, raw word from the const_copy_to snapshot), auto-localize which field
-owns byte offset 1424 (word 356), and classify the anomaly as (a) probe
-attribution error [MATCH], (b) real layout bug [scalar MISMATCH -> fix Slang
-mirror + static_assert], or (c) benign padding [MISMATCH only in padding bytes].
+OPEN / NEXT:
+- traverse_probe.slang:104-115 comment is factually wrong (blames "stride"); recommend correcting it
+  to "inline dynamic-index codegen drops the index — use a base pointer or raw view". Not edited
+  (out of S1b-0 scope). User to approve.
+- The M4c traverse NEG1-not-detected + TIES=886 are pre-existing; if they matter, they need their own
+  investigation (unrelated to KernelData layout).
+- Next task when approved: S1b proper per Research B (split it).
