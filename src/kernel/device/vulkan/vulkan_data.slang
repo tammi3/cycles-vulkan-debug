@@ -124,12 +124,26 @@ struct IntegratorStateSubsurface
 };                     // size 32
 
 /* state_template.h:112-117, 2 array members x MAX_VOLUME_STACK_SIZE (32,
- * source: src/kernel/types.h:846-847) -> 64 pointers, 512 bytes */
+ * source: src/kernel/types.h:847). M4e S1b-5: this is ARRAY-OF-STRUCTS, NOT
+ * struct-of-arrays. state.h:174 maps KERNEL_STRUCT_ARRAY_MEMBER to
+ * KERNEL_STRUCT_MEMBER (ccl_global type *name) and state.h:178-180 maps
+ * KERNEL_STRUCT_END_ARRAY to "} name[gpu_size];", so the member is
+ *   struct { int *object; int *shader; } volume_stack[32];
+ * i.e. 32 elements of 16 bytes (a PAIR of pointers per slot), element i at byte
+ * i*16: object at i*16+0, shader at i*16+8. The host allocator
+ * (path_trace_work_gpu.cpp:174-186) writes volume_stack[i].object and
+ * volume_stack[i].shader as separate SoA allocations, confirming the pair-per-slot
+ * shape. Total size 32*16 = 512, unchanged from the old flat layout. */
+struct IntegratorStateVolumeStackElement
+{
+    uint64_t object; // offset 0 (device_ptr -> int[] for slot i)
+    uint64_t shader; // offset 8 (device_ptr -> int[] for slot i)
+};                   // size 16
+
 struct IntegratorStateVolumeStack
 {
-    uint64_t object[32]; // offset 0
-    uint64_t shader[32]; // offset 256
-};                       // size 512
+    IntegratorStateVolumeStackElement slot[32]; // offset 0, 32*16 = 512 bytes
+};                                              // size 512
 
 /* state_template.h:120-147, 8 pointer members -> 64 bytes
  * (path_segment is a pointer on the host whether or not __PATH_GUIDING__ is
@@ -198,23 +212,41 @@ struct IntegratorStateShadowRay
 };                             // size 72
 
 /* shadow_state_template.h:94-103, 6 array members x INTEGRATOR_SHADOW_ISECT_SIZE_GPU
- * (4, source: src/kernel/types.h:59) -> 24 pointers, 192 bytes */
+ * (4, source: src/kernel/types.h:59). M4e S1b-5: ARRAY-OF-STRUCTS, NOT struct-of-arrays.
+ * state.h:174 + state.h:178-180 give
+ *   struct { float *t; float *u; float *v;
+ *            int *prim; int *object; int *type; } shadow_isect[4];
+ * i.e. 4 elements of 48 bytes (a 6-pointer tuple per slot), element i at byte i*48:
+ * t@i*48+0, u@+8, v@+16, prim@+24, object@+32, type@+40. The host allocator
+ * (path_trace_work_gpu.cpp:174-186) writes shadow_isect[i].t etc. as separate SoA
+ * allocations, confirming the tuple-per-slot shape. Total size 4*48 = 192, unchanged. */
+struct IntegratorStateShadowIsectElement
+{
+    uint64_t t;      // offset 0  (device_ptr -> float[])
+    uint64_t u;      // offset 8  (device_ptr -> float[])
+    uint64_t v;      // offset 16 (device_ptr -> float[])
+    uint64_t prim;   // offset 24 (device_ptr -> int[])
+    uint64_t object; // offset 32 (device_ptr -> int[])
+    uint64_t type;   // offset 40 (device_ptr -> int[])
+};                   // size 48
+
 struct IntegratorStateShadowIsect
 {
-    uint64_t t[4];      // offset 0
-    uint64_t u[4];      // offset 32
-    uint64_t v[4];      // offset 64
-    uint64_t prim[4];   // offset 96
-    uint64_t object[4]; // offset 128
-    uint64_t type[4];   // offset 160
-};                      // size 192
+    IntegratorStateShadowIsectElement slot[4]; // offset 0, 4*48 = 192 bytes
+};                                             // size 192
 
-/* shadow_state_template.h:107-112, same shape as volume_stack -> 512 bytes */
+/* shadow_state_template.h:107-112, same AoS shape as volume_stack (M4e S1b-5):
+ * struct { int *object; int *shader; } shadow_volume_stack[32]; 32*16 = 512 bytes. */
+struct IntegratorStateShadowVolumeStackElement
+{
+    uint64_t object; // offset 0 (device_ptr -> int[] for slot i)
+    uint64_t shader; // offset 8 (device_ptr -> int[] for slot i)
+};                   // size 16
+
 struct IntegratorStateShadowVolumeStack
 {
-    uint64_t object[32]; // offset 0
-    uint64_t shader[32]; // offset 256
-};                       // size 512
+    IntegratorStateShadowVolumeStackElement slot[32]; // offset 0, 32*16 = 512 bytes
+};                                                    // size 512
 
 /* IntegratorStateGPU itself (source: src/kernel/integrator/state.h:140-213).
  * 265 pointer members = 2120 bytes + uint sort_partition_divisor (state.h:212)

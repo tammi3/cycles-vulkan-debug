@@ -45,6 +45,10 @@
 #include <vector>
 #include <algorithm>
 #include <cstdint>
+/* M4e S1b-5: <cstddef> for offsetof(), <type_traits> for std::remove_reference_t, both
+ * used by the IntegratorStateGPU array-member layout static_asserts below. */
+#include <cstddef>
+#include <type_traits>
 
 CCL_NAMESPACE_BEGIN
 
@@ -234,10 +238,70 @@ static_assert(sizeof(IntegratorStateGPU) == 2128,
 static_assert(sizeof(KernelParamsVulkan) == 5120,
               "KernelParamsVulkan size (Slang mirror has an explicit tail pad)");
 
+/* M4e S1b-5 Task 1: lock the ARRAY-MEMBER layout of IntegratorStateGPU.
+ *
+ * This build is NON-packed on both host and Slang: __INTEGRATOR_GPU_PACKED_STATE__ is
+ * defined only for Apple ARM64 (types.h:626-628), which this Windows/MSVC target is not.
+ * In non-packed __KERNEL_GPU__ mode, state.h:174 maps KERNEL_STRUCT_ARRAY_MEMBER to
+ * KERNEL_STRUCT_MEMBER (ccl_global type *name) and state.h:178-180 maps
+ * KERNEL_STRUCT_END_ARRAY to "} name[gpu_size];". So every array member is an ARRAY OF
+ * STRUCTS OF POINTERS (AoS), NOT a struct of arrays (SoA):
+ *
+ *   volume_stack[32]        = { int   *object; int  *shader; }        stride 16
+ *   shadow_isect[4]         = { float *t; float*u; float*v;
+ *                               int   *prim; int *object; int *type; } stride 48
+ *   shadow_volume_stack[32] = { int   *object; int  *shader; }        stride 16
+ *   (sizes: MAX_VOLUME_STACK_SIZE=32 types.h:847; INTEGRATOR_SHADOW_ISECT_SIZE_GPU=4
+ *    types.h:59)
+ *
+ * The host allocator confirms it: path_trace_work_gpu.cpp:174-186 writes
+ * integrator_state_gpu_.parent_struct[array_index].name, i.e. each [i].field is its own
+ * SoA array allocation (its own device pointer), and .device_pointer is memcpy'd into the
+ * element. The ELEMENT is a struct of pointers; the DATA behind each pointer is SoA.
+ *
+ * These asserts lock (a) each element's stride and (b) each member's offset inside the
+ * element, so a Cycles layout change breaks the build instead of silently corrupting the
+ * Slang mirror. */
+using VolumeStackElem = std::remove_reference_t<decltype(
+    ((IntegratorStateGPU *)nullptr)->volume_stack[0])>;
+using ShadowIsectElem = std::remove_reference_t<decltype(
+    ((IntegratorStateGPU *)nullptr)->shadow_isect[0])>;
+using ShadowVolumeStackElem = std::remove_reference_t<decltype(
+    ((IntegratorStateGPU *)nullptr)->shadow_volume_stack[0])>;
+
+/* volume_stack: base + per-element AoS offsets. */
+static_assert(offsetof(IntegratorStateGPU, volume_stack) == 376, "volume_stack base offset");
+static_assert(sizeof(VolumeStackElem) == 16, "volume_stack element stride (AoS)");
+static_assert(offsetof(VolumeStackElem, object) == 0, "volume_stack[].object offset");
+static_assert(offsetof(VolumeStackElem, shader) == 8, "volume_stack[].shader offset");
+
+/* shadow_isect: base + per-element AoS offsets (6 pointers -> 48 B). */
+static_assert(offsetof(IntegratorStateGPU, shadow_isect) == 1240, "shadow_isect base offset");
+static_assert(sizeof(ShadowIsectElem) == 48, "shadow_isect element stride (AoS)");
+static_assert(offsetof(ShadowIsectElem, t) == 0, "shadow_isect[].t offset");
+static_assert(offsetof(ShadowIsectElem, u) == 8, "shadow_isect[].u offset");
+static_assert(offsetof(ShadowIsectElem, v) == 16, "shadow_isect[].v offset");
+static_assert(offsetof(ShadowIsectElem, prim) == 24, "shadow_isect[].prim offset");
+static_assert(offsetof(ShadowIsectElem, object) == 32, "shadow_isect[].object offset");
+static_assert(offsetof(ShadowIsectElem, type) == 40, "shadow_isect[].type offset");
+
+/* shadow_volume_stack: same shape as volume_stack. */
+static_assert(offsetof(IntegratorStateGPU, shadow_volume_stack) == 1432,
+              "shadow_volume_stack base offset");
+static_assert(sizeof(ShadowVolumeStackElem) == 16, "shadow_volume_stack element stride (AoS)");
+static_assert(offsetof(ShadowVolumeStackElem, object) == 0, "shadow_volume_stack[].object offset");
+static_assert(offsetof(ShadowVolumeStackElem, shader) == 8, "shadow_volume_stack[].shader offset");
+
 namespace {
 
-/* Number of uint32 words abi_probe.slang writes to the readback buffer. */
-constexpr uint32_t ABI_PROBE_OUT_WORDS = 12;
+/* Number of uint32 words abi_probe.slang writes to the readback buffer.
+ * M4e S1b-5: 12 -> 24. The extra 12 words (out[12..23]) carry three typed-vs-raw
+ * pairs for the ARRAY-MEMBER AoS decomposition (volume_stack[1].shader,
+ * shadow_isect[1].object, shadow_volume_stack[1].shader). Each pair is lo/hi of the
+ * typed 64-bit pointer read through the Slang mirror, then lo/hi of the raw words at
+ * the host static_assert's expected byte offset. A flat-SoA mirror would place the
+ * typed read at a different byte offset than the raw read and the pair would MISMATCH. */
+constexpr uint32_t ABI_PROBE_OUT_WORDS = 24;
 /* AbiProbeParams = three 64-bit device pointers (abi_probe.slang). */
 constexpr uint32_t ABI_PROBE_PUSH_BYTES = 24;
 /* Sentinel written by the shader; proves the dispatch actually ran. */
@@ -510,6 +574,21 @@ bool vulkan_abi_probe(VulkanDevice *dev)
   check("bvh_nodes typed vs raw@2560", gpu_bvh, raw_bvh);
   /* integrator_state.path.render_pixel_index: same idea at offset 2984. */
   check("integrator_state[0] typed vs raw@2984", gpu_ist, raw_ist);
+  /* M4e S1b-5 Task 2: array-member AoS decomposition. out[12..23] are three
+   * typed-vs-raw pairs (lo,hi each). The typed read goes through the Slang
+   * IntegratorStateGPU mirror at a NON-zero slot index; the raw read is at the
+   * byte offset the host static_asserts expect (AoS: base + stride*i + inner).
+   * A flat-SoA mirror would land the typed read at a different offset and
+   * MISMATCH. See the OFF_* constants in abi_probe.slang. */
+  check("volume_stack[1].shader typed vs raw@3384",
+        ((uint64_t)out[13] << 32) | out[12],
+        ((uint64_t)out[15] << 32) | out[14]);
+  check("shadow_isect[1].object typed vs raw@4304",
+        ((uint64_t)out[17] << 32) | out[16],
+        ((uint64_t)out[19] << 32) | out[18]);
+  check("shadow_volume_stack[1].shader typed vs raw@4440",
+        ((uint64_t)out[21] << 32) | out[20],
+        ((uint64_t)out[23] << 32) | out[22]);
   /* First KernelData word: value as the shader sees it. No host-side
    * reference exists (host_params_ is private and the params buffer has no
    * TRANSFER_SRC usage to copy it back), so it is logged, not compared. */

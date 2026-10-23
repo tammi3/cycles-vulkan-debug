@@ -41,11 +41,23 @@ static const uint OFF_INTEGRATOR_STATE = 2984u;
 /* Sentinel written to out[11]; the host checks it to prove the dispatch ran. */
 static const uint PROBE_SENTINEL = 0xAB10E57Fu;
 
+/* M4e S1b-5: byte offsets WITHIN IntegratorStateGPU for the array members'
+ * non-zero-index slots, locking the ARRAY-OF-STRUCTS decomposition. Each is the
+ * host static_asserts' expected offset (kernels.cpp): element stride x index +
+ * inner member offset. A flat-SoA mirror would place these differently, so a
+ * typed-vs-raw MISMATCH here proves the decomposition is wrong. Indices are
+ * compile-time constants (safe: constant OpAccessChain, not the dynamic-index
+ * RX 570 miscompile pattern). */
+static const uint OFF_IST = 2984u; // offsetof(KernelParamsVulkan, integrator_state)
+static const uint OFF_VS_ELEM1_SHADER = 376u + 16u + 8u;  // volume_stack[1].shader   = 400
+static const uint OFF_SI_ELEM1_OBJECT = 1240u + 48u + 32u; // shadow_isect[1].object  = 1320
+static const uint OFF_SVS_ELEM1_SHADER = 1432u + 16u + 8u; // shadow_volume_stack[1].shader = 1456
+
 struct AbiProbeParams
 {
     KernelParamsVulkan* params; // typed view of the params buffer (BDA)
     uint* params_raw;           // same address, raw uint32 words
-    uint* out;                  // host-visible uint32[12] readback buffer
+    uint* out;                  // host-visible uint32[24] readback buffer
 };                              // 24 bytes, pushed as one block
 
 [[vk::push_constant]]
@@ -80,6 +92,31 @@ void abi_probe_main(uint3 tid : SV_DispatchThreadID)
     probe.out[8] = uint(typed_ist >> 32);
     probe.out[9] = probe.params_raw[OFF_INTEGRATOR_STATE / 4];
     probe.out[10] = probe.params_raw[OFF_INTEGRATOR_STATE / 4 + 1];
+
+    /* M4e S1b-5 Task 2: array-member AoS decomposition. Read a NON-zero-index
+     * slot through the typed view and compare to raw words at the host-asserted
+     * byte offset. If the mirror were still flat-SoA, these would MISMATCH. */
+
+    /* volume_stack[1].shader */
+    uint64_t vs1s = probe.params->integrator_state.volume_stack.slot[1].shader;
+    probe.out[12] = uint(vs1s);
+    probe.out[13] = uint(vs1s >> 32);
+    probe.out[14] = probe.params_raw[(OFF_IST + OFF_VS_ELEM1_SHADER) / 4];
+    probe.out[15] = probe.params_raw[(OFF_IST + OFF_VS_ELEM1_SHADER) / 4 + 1];
+
+    /* shadow_isect[1].object */
+    uint64_t si1o = probe.params->integrator_state.shadow_isect.slot[1].object;
+    probe.out[16] = uint(si1o);
+    probe.out[17] = uint(si1o >> 32);
+    probe.out[18] = probe.params_raw[(OFF_IST + OFF_SI_ELEM1_OBJECT) / 4];
+    probe.out[19] = probe.params_raw[(OFF_IST + OFF_SI_ELEM1_OBJECT) / 4 + 1];
+
+    /* shadow_volume_stack[1].shader */
+    uint64_t svs1s = probe.params->integrator_state.shadow_volume_stack.slot[1].shader;
+    probe.out[20] = uint(svs1s);
+    probe.out[21] = uint(svs1s >> 32);
+    probe.out[22] = probe.params_raw[(OFF_IST + OFF_SVS_ELEM1_SHADER) / 4];
+    probe.out[23] = probe.params_raw[(OFF_IST + OFF_SVS_ELEM1_SHADER) / 4 + 1];
 
     /* Dispatch-completed sentinel. */
     probe.out[11] = PROBE_SENTINEL;

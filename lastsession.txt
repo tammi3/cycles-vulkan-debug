@@ -1,3 +1,62 @@
+M4e S1b-5 SESSION (Stage B: state accessors + gate) — 2026-10-23
+========================================================================
+STATUS: TASKS 1-2 COMPLETE (layout determined + mirror fixed + ABI probe
+re-run). TASKS 3-6 NOT started (accessors, gate, negatives, full validation).
+NEG1 waiver (S1b-2) still in force below.
+
+TASK 1 — array-member layout determined from source + locked with static_asserts
+--------------------------------------------------------------------------------
+Non-packed on BOTH host and Slang: __INTEGRATOR_GPU_PACKED_STATE__ is defined ONLY
+for Apple ARM64 (src/kernel/types.h:626-628); this Windows/MSVC target is not it.
+In non-packed __KERNEL_GPU__ mode: state.h:174 maps KERNEL_STRUCT_ARRAY_MEMBER to
+KERNEL_STRUCT_MEMBER (ccl_global type *name) and state.h:178-180 maps
+KERNEL_STRUCT_END_ARRAY to "} name[gpu_size];". So EVERY array member is an ARRAY OF
+STRUCTS OF POINTERS (AoS), NOT struct-of-arrays:
+  volume_stack[32]        = { int   *object; int  *shader; }         stride 16
+  shadow_isect[4]         = { float *t; float*u; float*v;
+                              int   *prim; int *object; int *type; }  stride 48
+  shadow_volume_stack[32] = { int   *object; int  *shader; }         stride 16
+Sizes: MAX_VOLUME_STACK_SIZE=32 (types.h:847), INTEGRATOR_SHADOW_ISECT_SIZE_GPU=4
+(types.h:59). Allocator confirms AoS: path_trace_work_gpu.cpp:174-186 writes
+integrator_state_gpu_.parent_struct[array_index].name (each [i].field = its own
+device pointer). sort_key_counter[18] is an array of SCALAR pointers (uint64[18]),
+already correct in the mirror (no inner struct) — no change.
+Added host static_asserts in src/device/vulkan/kernels.cpp (base offsets
+376/1240/1432; element strides 16/48/16; inner offsets via offsetof on
+decltype-derived element types). Added <cstddef> + <type_traits> includes. Build
+exit 0 -> asserts PASS.
+
+TASK 2 — mirror fixed (SoA -> AoS) + ABI probe re-run
+------------------------------------------------------
+vulkan_data.slang: the three inner structs rewritten as arrays of element structs:
+  IntegratorStateVolumeStack        { IntegratorStateVolumeStackElement   slot[32]; } 512
+  IntegratorStateShadowIsect        { IntegratorStateShadowIsectElement   slot[4];  } 192
+  IntegratorStateShadowVolumeStack  { IntegratorStateShadowVolumeStackElement slot[32]; } 512
+Total sizes UNCHANGED (512/192/512) so sizeof(IntegratorStateGPU) stays 2128 and
+outer offsets (376/1240/1432) are unchanged. abi_probe.slang extended: out buffer
+12->24 words; three new typed-vs-raw pairs read slot[1] (constant index = safe
+constant OpAccessChain, NOT the dynamic-index RX570 miscompile) at host-asserted
+AoS byte offsets: volume_stack[1].shader @2984+400=3384, shadow_isect[1].object
+@2984+1320=4304, shadow_volume_stack[1].shader @2984+1456=4440. A flat-SoA mirror
+would land the typed read at a different offset and MISMATCH.
+  RX 570 ABI probe: ALL VALUES MATCH. sizeof(KernelParamsVulkan)=0x1400=5120,
+  sizeof(IntegratorStateGPU)=0x850=2128, bvh_nodes@2560 MATCH, render_pixel_index
+  @2984 MATCH, shadow_isect[1].object MATCH (real ptr 0x313480000 — proves AoS),
+  volume_stack[1].shader + shadow_volume_stack[1].shader MATCH (both 0: unused
+  volume slots never allocated, weaker but same struct shape proven by shadow_isect),
+  sentinel MATCH. 0 VUID.
+  SwiftShader ABI probe: CRASHES 0xC00000FD (stack overflow) on OpCapability Int64
+  (spirv-dis caps: PhysicalStorageBufferAddresses, Int64, Shader — UNCHANGED by my
+  edit). This is the documented AGENTS.md limitation: BDA kernels store 64-bit device
+  pointers, so the ABI probe is RX570-only by design; "where the capabilities allow"
+  excludes it. NOT a regression.
+slangc exit 0, spirv-val --target-env vulkan1.2 exit 0 (abi_probe.spv, 16060 bytes,
+written to %LOCALAPPDATA%\Temp\opencode, NOT repo root).
+
+NEXT: TASK 3 (integrator_state.slang accessors), TASK 4 (gate), TASK 5 (negatives),
+TASK 6 (validation) + DIVERGENCES.md entry.
+
+STILL OPEN from S1b-4 Stage A (unchanged):
 M4e S1b-4 SESSION (sub-word access: STAGE A COMPLETE; STAGE B NOT started) — 2026-10-22
 ========================================================================================
 STATUS: STAGE A (items 1-4) COMPLETE on both devices, 0 VUID. Item 4 DECIDED (atomic

@@ -536,3 +536,71 @@ UNVERIFIED ASSUMPTIONS (M5)
 
 9\. SwiftShader available at C:\\Windows\\System32\\Microsoft-Edge-WebView\\vk\_swiftshader\_icd.json — confirmed in S1b-2
 
+
+
+
+
+M5 Gate Scene — corrected
+XML with real <light type="area"> syntax:
+<cycles>
+    <transform translate="0 -6 3">
+        <camera type="perspective" fov="0.8" full_width="320" full_height="240" />
+    </transform>
+
+    <shader name="white_wall">
+        <diffuse_bsdf name="bsdf" color="0.8 0.8 0.8" />
+        <connect from="bsdf bsdf" to="output surface" />
+    </shader>
+    <shader name="light_shader">
+        <emission_closure name="emit" color="1 1 1" strength="15" />
+        <connect from="emit emission" to="output surface" />
+    </shader>
+
+    <state shader="white_wall">
+        <object name="floor" mesh="box_floor" />
+        <object name="ceiling" mesh="box_ceiling" />
+        <object name="back_wall" mesh="box_back" />
+        <object name="left_wall" mesh="box_left" />
+        <object name="right_wall" mesh="box_right" />
+        <object name="tall_box" mesh="box_tall" />
+    </state>
+    <transform translate="1.5 0 0">
+        <state shader="white_wall">
+            <object name="short_box" mesh="box_short" />
+        </state>
+    </transform>
+
+    <!-- Area light on ceiling (rectangle) -->
+    <transform translate="0 2.9 0">
+        <state shader="light_shader">
+            <light light_type="area" mesh="light_quad" />
+        </state>
+    </transform>
+
+    <mesh name="box_floor" P="2 0 2 -2 0 2 -2 0 -2 2 0 -2" nverts="4" verts="0 1 2 3" />
+    <mesh name="box_ceiling" P="2 3 2 2 3 -2 -2 3 -2 -2 3 2" nverts="4" verts="0 1 2 3" />
+    <mesh name="box_back" P="2 0 -2 2 3 -2 -2 3 -2 -2 0 -2" nverts="4" verts="0 1 2 3" />
+    <mesh name="box_left" P="-2 0 2 -2 3 2 -2 3 -2 -2 0 -2" nverts="4" verts="0 1 2 3" />
+    <mesh name="box_right" P="2 0 2 2 0 -2 2 3 -2 2 3 2" nverts="4" verts="0 1 2 3" />
+    <mesh name="light_quad" P="1 0 1 -1 0 1 -1 0 -1 1 0 -1" nverts="4" verts="0 1 2 3" />
+    <mesh name="box_tall" P="0.5 0 0.5 -0.5 0 0.5 -0.5 1.5 0.5 0.5 1.5 0.5 -0.5 0 -0.5 0.5 0 -0.5 -0.5 1.5 -0.5 0.5 1.5 -0.5" nverts="4 4 4 4 4 4" verts="0 1 2 3 4 5 6 7 0 1 5 4 2 3 7 6 0 4 7 3 1 5 6 2" />
+    <mesh name="box_short" P="0.3 0 0.3 -0.3 0 0.3 -0.3 0.6 0.3 0.3 0.6 0.3 -0.3 0 -0.3 0.3 0 -0.3 -0.3 0.6 -0.3 0.3 0.6 -0.3" nverts="4 4 4 4 4 4" verts="0 1 2 3 4 5 6 7 0 1 5 4 2 3 7 6 0 4 7 3 1 5 6 2" />
+</cycles>
+Integrator settings for CPU reference (disable light tree):
+cycles.exe --device CPU --background cornell_area_light.xml \
+  --set scene.integrator.use_light_tree=false \
+  --samples 16 --resolution 320x240 \
+  --set scene.cycles.filter_type=BOX \
+  -o cornell_cpu_16spp.png
+Tolerance: Per-pixel L2 in linear space. Propose: mean abs diff < 0.01 (1/255), max abs diff < 0.05 in penumbra. USER DECISION on exact threshold.
+M5 Kernel task list (corrected with verified files)
+Task	Files to port	Host probe
+M5.1 Flat light distribution	light/distribution.h (lines 16-58)	Light index + pdf_selection vs CPU
+M5.2 Area light sample/eval	light/area.h (area_light_sample:329, area_light_eval:250)	LightSample struct match
+M5.3 MIS weights	sample/mis.h:26 power_heuristic, light/sample.h:344 mis_weight_nee	Deterministic math match
+M5.4 Shadow ray setup	light/sample.h:265 shadow_ray_offset, light/sample.h:304 light_sample_to_surface_shadow_ray	Ray struct match
+M5.5 INTERSECT_SHADOW	integrator/intersect_shadow.h:150	packed_num_hits + throughput
+M5.6 SHADE_SHADOW	integrator/shade_shadow.h:265 integrate_transparent_shadow	Throughput after eval
+M5.7 SHADE_LIGHT_NEE	integrator/shade_light.h:228 integrate_light_nee	Light eval + throughput update
+M5.8 SHADE_SURFACE NEE branch	integrator/shade_surface.h:311 integrate_surface_direct_light	Shadow state spawned
+M5.9 M5 Gate	Full pipeline	Per-pixel vs CPU
