@@ -1,8 +1,89 @@
-M4e S1b-5 SESSION (Stage B: state accessors + gate) — 2026-10-23
+M4e S1b-6 SESSION (Stage B: state accessors + gate) — 2026-10-23
 ========================================================================
+STATUS: TASK 1 DESIGN PROVEN + DOCUMENTED, but integrator_state.slang DOES
+NOT COMPILE YET (uses unavailable cast<>). Tasks 2-6 NOT started (DIVERGENCES
+entry, gate, negatives, validation). Context ran short per the escape hatch;
+stopped cleanly at a well-defined next step. NEG1 waiver (S1b-2) still below.
+
+*** CRITICAL DISCOVERY THIS SESSION (blocks task 1 compile) ***
+`cast<T[]>` / `cast<T*>` are UNAVAILABLE in slangc 2026.17-25-gc7954ebd1
+(error[E30015]: undefined identifier 'cast'). bvh2.slang / path_trace.slang
+use cast<> and DO NOT COMPILE STANDALONE with this toolchain — treat them as
+STALE, not a working reference. There is NO uint64->typed-pointer conversion
+either: functional `T*(addr)` parses as multiplication (E39999); `T*(addr)`
+and reinterpret forms fail. Only the REVERSE works: `uint64_t(typed_ptr)`
+compiles (recover a raw address FROM a typed pointer).
+
+=> The SoA members in vulkan_data.slang are stored as `uint64_t`, but to INDEX
+   them as arrays they MUST be TYPED device pointers (uint*/float3*/float*/
+   int*/uint16_t*/uint8_t*). A typed pointer is 8 bytes = uint64_t, so byte
+   layout and ALL ABI-probe offsets are UNCHANGED. This retype is the exact
+   next step to make the accessors compile.
+
+PROVEN PATTERNS (all slangc + spirv-val exit 0, cast_test.slang this session):
+  1. Scalar/sub-word/packed3 SoA: load a TYPED pointer member from the struct
+     reached via a typed device pointer, then index it by a NON-constant state:
+       IstSub ist = pc.params->ist;   // pc.params is Params* (device ptr)
+       ist.throughput[s] = float3(...); // s = tid.x, non-constant
+     => %_ptr_PhysicalStorageBuffer_v3float + OpPtrAccessChain. SAFE.
+  2. AoS array members (volume_stack/shadow_isect/shadow_volume_stack):
+       SlotElem* base = &pc.params->volume_stack.slot[0];  // &slot[0] CONSTANT
+       int* obj = base[i].object;   // i NON-constant -> OpPtrAccessChain
+       obj[state] = value;
+     Array does NOT decay to a pointer; must take &slot[0]. Push-constant
+     embedded structs are IMMUTABLE (cannot take &pc.volume_stack.slot[0]);
+     must reach the struct through a typed DEVICE pointer (Params*), which is
+     mutable. Confirmed OpPtrAccessChain on SlotElem_natural.
+  3. float3* stride is 12, NOT 16: disassembly shows
+     `OpDecorate %_ptr_PhysicalStorageBuffer_v3float ArrayStride 12`.
+     => packed3/PackedSpectrum accessors use `float3*` DIRECTLY. NO float*+3i
+        workaround needed. (This contradicts the earlier caution; stride 12 is
+        confirmed on this compiler for a typed float3* member.)
+  4. `ushort`/`uchar` are UNDEFINED here; use `uint16_t`/`uint8_t` (emit
+     Int16/Int8 -> RX 570-only, SwiftShader crash-gated on shaderInt16&&Int8).
+
+RX 570 ABI PROBE (re-run this session, unchanged from S1b-5): ALL VALUES MATCH,
+sizeof(IntegratorStateGPU)=0x850=2128, sizeof(KernelParamsVulkan)=0x1400=5120,
+0 VUID. (SwiftShader still crashes 0xC00000FD on OpCapability Int64 — pre-existing
+BDA limitation; ABI-probe-style kernels are RX 570-only by design.)
+
+NEXT TASK (exact steps to finish task 1):
+  A. Retype the SoA members used by the accessors in vulkan_data.slang from
+     uint64_t to typed pointers (uint*/float3*/float*/int*/uint16_t*/uint8_t*),
+     per the accessor file's usage. Layout unchanged.
+  B. In integrator_state.slang, replace every
+       `let data_ptr = params->...m; return cast<T[]>(data_ptr)[state];`
+     with `T* data_ptr = params->...m; return data_ptr[state];`
+     (and `cast<T[]>(data_ptr)[state] = v;` -> `data_ptr[state] = v;`).
+     AoS members use the &slot[0] base-pointer pattern (proven #2).
+     Sub-word (uint16/uint8/bool) keep the atomic AND/OR word fallback via a
+     `uint*` word view (default portable); load via 32-bit load+shift/mask.
+     Remove the aos_soa_ptr() helper (it uses cast<uint64_t[]>); replace with
+     the &slot[0] pattern.
+  C. Fix the 3 ABI-probe reads in abi_probe.slang (render_pixel_index@90,
+     shadow_isect.slot[1].object@108, shadow_volume_stack.slot[1].shader@115)
+     to wrap in `uint64_t(...)` so they still compile after the retype.
+  D. slangc + spirv-val integrator_state.slang (as a module; it has no entry —
+     compile it included by a small probe entry, or add a dummy probe entry).
+  E. Task 2: DIVERGENCES.md entry for the atomic sub-word fallback.
+  F. Tasks 3-6: gate (Cycles-sized state memory, distinct values at non-constant
+     indices / AoS non-zero slots / adjacent sub-word states from different
+     threads, exact byte offsets + canaries, float3 stride-12-from-struct),
+     negatives (a) 16-byte stride, (b) 4-byte store into uint16, (c) wrong AoS
+     stride, (d) non-atomic sub-word store, and full validation/layer proof.
+
+FILES (untracked, for git cleanup): integrator_state.slang (NEW, non-compiling),
+cast_test.slang, stride_probe.slang (throwaway probes), subword_word.slang,
+subword_narrow.slang, stride_check.slang, dynindex_repro*.slang, math_core/
+math_probe/kdata_probe/bsdf_probe.slang; MODIFIED kernels.cpp, queue.cpp,
+device.cpp, abi_probe.slang, vulkan_data.slang, traverse_probe.slang,
+device_impl.h, lastsession.txt; stale traverse_*.spv + path_trace/bvh2 slangs.
+
+========================================================================
+M4e S1b-5 SESSION (Stage B: state accessors + gate) — 2026-10-23
+------------------------------------------------------------------------
 STATUS: TASKS 1-2 COMPLETE (layout determined + mirror fixed + ABI probe
-re-run). TASKS 3-6 NOT started (accessors, gate, negatives, full validation).
-NEG1 waiver (S1b-2) still in force below.
+re-run). TASKS 3-6 NOT started. NEG1 waiver (S1b-2) still in force below.
 
 TASK 1 — array-member layout determined from source + locked with static_asserts
 --------------------------------------------------------------------------------
@@ -16,166 +97,9 @@ STRUCTS OF POINTERS (AoS), NOT struct-of-arrays:
   shadow_isect[4]         = { float *t; float*u; float*v;
                               int   *prim; int *object; int *type; }  stride 48
   shadow_volume_stack[32] = { int   *object; int  *shader; }         stride 16
-Sizes: MAX_VOLUME_STACK_SIZE=32 (types.h:847), INTEGRATOR_SHADOW_ISECT_SIZE_GPU=4
-(types.h:59). Allocator confirms AoS: path_trace_work_gpu.cpp:174-186 writes
-integrator_state_gpu_.parent_struct[array_index].name (each [i].field = its own
-device pointer). sort_key_counter[18] is an array of SCALAR pointers (uint64[18]),
-already correct in the mirror (no inner struct) — no change.
-Added host static_asserts in src/device/vulkan/kernels.cpp (base offsets
-376/1240/1432; element strides 16/48/16; inner offsets via offsetof on
-decltype-derived element types). Added <cstddef> + <type_traits> includes. Build
-exit 0 -> asserts PASS.
-
-TASK 2 — mirror fixed (SoA -> AoS) + ABI probe re-run
-------------------------------------------------------
-vulkan_data.slang: the three inner structs rewritten as arrays of element structs:
-  IntegratorStateVolumeStack        { IntegratorStateVolumeStackElement   slot[32]; } 512
-  IntegratorStateShadowIsect        { IntegratorStateShadowIsectElement   slot[4];  } 192
-  IntegratorStateShadowVolumeStack  { IntegratorStateShadowVolumeStackElement slot[32]; } 512
-Total sizes UNCHANGED (512/192/512) so sizeof(IntegratorStateGPU) stays 2128 and
-outer offsets (376/1240/1432) are unchanged. abi_probe.slang extended: out buffer
-12->24 words; three new typed-vs-raw pairs read slot[1] (constant index = safe
-constant OpAccessChain, NOT the dynamic-index RX570 miscompile) at host-asserted
-AoS byte offsets: volume_stack[1].shader @2984+400=3384, shadow_isect[1].object
-@2984+1320=4304, shadow_volume_stack[1].shader @2984+1456=4440. A flat-SoA mirror
-would land the typed read at a different offset and MISMATCH.
-  RX 570 ABI probe: ALL VALUES MATCH. sizeof(KernelParamsVulkan)=0x1400=5120,
-  sizeof(IntegratorStateGPU)=0x850=2128, bvh_nodes@2560 MATCH, render_pixel_index
-  @2984 MATCH, shadow_isect[1].object MATCH (real ptr 0x313480000 — proves AoS),
-  volume_stack[1].shader + shadow_volume_stack[1].shader MATCH (both 0: unused
-  volume slots never allocated, weaker but same struct shape proven by shadow_isect),
-  sentinel MATCH. 0 VUID.
-  SwiftShader ABI probe: CRASHES 0xC00000FD (stack overflow) on OpCapability Int64
-  (spirv-dis caps: PhysicalStorageBufferAddresses, Int64, Shader — UNCHANGED by my
-  edit). This is the documented AGENTS.md limitation: BDA kernels store 64-bit device
-  pointers, so the ABI probe is RX570-only by design; "where the capabilities allow"
-  excludes it. NOT a regression.
-slangc exit 0, spirv-val --target-env vulkan1.2 exit 0 (abi_probe.spv, 16060 bytes,
-written to %LOCALAPPDATA%\Temp\opencode, NOT repo root).
-
-NEXT: TASK 3 (integrator_state.slang accessors), TASK 4 (gate), TASK 5 (negatives),
-TASK 6 (validation) + DIVERGENCES.md entry.
-
-STILL OPEN from S1b-4 Stage A (unchanged):
-M4e S1b-4 SESSION (sub-word access: STAGE A COMPLETE; STAGE B NOT started) — 2026-10-22
-========================================================================================
-STATUS: STAGE A (items 1-4) COMPLETE on both devices, 0 VUID. Item 4 DECIDED (atomic
-fallback + accessor layer). STAGE B: item 5 BASELINE run (ABI probe ALL MATCH, sizeof=2128
-already correct); items 5-fix/6-9 NOT started — context ran short, handed off (see STILL
-OPEN). NEG1 waiver (S1b-2) still in force below.
-
-STAGE A ITEM 1 — features that gate 16/8-bit access through PhysicalStorageBuffer
----------------------------------------------------------------------------------
-SPIR-V caps: Int16=22, Int8=39 (spirv.h:1105,1121); Int64=11 for reference.
-Normative citation = probe's captured VUID-VkShaderModuleCreateInfo-pCode-08740:
-  Int16 capability -> VkPhysicalDeviceFeatures::shaderInt16 (base, core 1.0)
-  Int8  capability -> VkPhysicalDeviceVulkan12Features::shaderInt8 (core 1.2)
-storageBuffer16BitAccess (16BitStorage->Vulkan11) / storageBuffer8BitAccess (8BitStorage
-->Vulkan12) govern the DESCRIPTOR StorageBuffer class, NOT PhysicalStorageBuffer; the
-validation layer gates BDA narrow access on shaderInt16/shaderInt8 (the capabilities).
-Device-reported (probe prints them):
-  RX 570    : shaderInt16=1 storageBuffer16BitAccess=1 shaderInt8=1 storageBuffer8BitAccess=1 (ALL).
-  SwiftShader: all 0 (NONE; like it lacks Int64).
-
-STAGE A ITEMS 2-3 — probe (env CYCLES_VULKAN_SUBWORD_PROBE=1; N=256 threads, M=64 iters,
-value depends on iter so an RMW race leaves a STALE value = lost update). Two modules
-(SPIR-V caps are module-global):
-  Module W = subword_word.slang  (uint32 + OpAtomicAnd/Or only, NO Int16/Int8) -> runs anywhere.
-  Module N = subword_narrow.slang (Int16+Int8 true stores) -> feature-gated.
-                      RX 570              SwiftShader
-  atomic16 (AND/OR)   PASS                PASS
-  atomic8  (AND/OR)   PASS                PASS
-  RMW-neg16 (NEG)     DETECTED lost=128   DETECTED lost=128
-  RMW-neg8  (NEG)     DETECTED lost=191   DETECTED lost=192
-  true16 (narrow)     PASS                SKIPPED (no Int16/Int8; RX570-only)
-  true8    (narrow)   PASS                SKIPPED (no Int16/Int8; RX570-only)
-  VUID count          0 (after enabling shaderInt16+shaderInt8)   0
-Negative (item 3) DETECTED on BOTH: non-atomic read-modify-write on a shared word loses
-~half the uint16 / ~3/4 the uint8 updates (lockstep-SIMD lanes read the same stale word,
-both store, one clobbers the other). Atomic AND/OR + true narrow store = no lost updates,
-canaries intact (no OOB).
-
-STAGE A ITEM 4 — DECISION (USER): both approaches work on the target (RX 570).
- (a) TRUE NARROW STORE: simplest (p16[t]=v), fastest (1 store), RX570-only (SwiftShader
-     crashes on Int16/Int8 -> cannot dual-device cross-check kernels touching sub-word
-     fields). Needs device.cpp to enable shaderInt16 (base) + shaderInt8 (Vulkan12).
- (b) ATOMIC AND/OR FALLBACK: works on BOTH devices (feature-independent), no feature gate,
-     but 2 atomics/write (slower) + more complex.
- (c) HYBRID: uint16 -> narrow store (shaderInt16, base, always safe); uint8 -> atomic
-     fallback (keeps SwiftShader runnable).
- My lean: (a) true narrow store for target perf + simplicity, with (b) as the documented
- portable fallback. **USER DECIDED (item 4): Option (b) ATOMIC AND/OR FALLBACK for ALL
- sub-word writes**, with requirements: (1) every sub-word read/write behind ONE small
- accessor layer (store_u16/store_u8/load_u16/load_u8), macro-selectable (default = atomic,
- narrow-store variant kept working/verified by the Stage A probe on RX570); (2) reads =
- plain 32-bit load + shift/mask; (3) keep the narrow-store variant available; (4) log in
- DIVERGENCES.md as "functionally equivalent, not result-changing; narrow-store variant to
- be measured on RX 570 after M5". This gates Stage B accessors.
-
-DEVICE.CPP CHANGE (frozen file, progress exception — enables narrow stores):
- - Queried shaderInt16 (base) + shaderInt8 (Vulkan12Features chained after BDA in the
-   QUERY). Enabled base_features.shaderInt16 + a SINGLE VkPhysicalDeviceVulkan12Features
-   struct holding bufferDeviceAddress + shaderInt8. REASON for the merge: VUID
-   -VkDeviceCreateInfo-pNext-02830 forbids BOTH BufferDeviceAddressFeatures AND
-   Vulkan12Features in the create chain (bufferDeviceAddress promoted into Vulkan12).
-   Verified safe on BOTH devices (SwiftShader still creates + BDA works, exit 0).
-
-COMMANDS (worked):
- slangc: C:\VulkanSDK\1.4.363.0\Bin\slangc.exe <f>.slang -target spirv -stage compute
-   -entry <word_main|narrow_main> -o "$env:LOCALAPPDATA\Temp\opencode\<f>.spv"
-   then spirv-val --target-env vulkan1.2 (both exit 0).
- build: cmake --build build --config Release --target cycles -- /m
- run:   $env:CYCLES_VULKAN_ALLOW_NO_KERNELS='1'; $env:CYCLES_VULKAN_SUBWORD_PROBE='1';
-   $env:CYCLES_VULKAN_SUBWORD_PROBE_SPV_WORD="$tmp\subword_word.spv";
-   $env:CYCLES_VULKAN_SUBWORD_PROBE_SPV_NARROW="$tmp\subword_narrow.spv";
-   $env:VK_INSTANCE_LAYERS='VK_LAYER_KHRONOS_validation'; $env:VK_LOADER_DEBUG='layer';
-   build\bin\Release\cycles.exe --device VULKAN --log-level info --samples 1 --background
-   instance2.xml. Unset VK_ICD_FILENAMES for RX570; set to
-   C:\Windows\System32\Microsoft-Edge-WebView\vk_swiftshader_icd.json for SwiftShader.
-
-TRAPS:
- - SwiftShader hard-crashes (0xC00000FD stack overflow) on ANY SPIR-V declaring OpCapability
-   Int16/Int8 (same as the Int64 trap). Probe gates the narrow module on device-reported
-   shaderInt16&&shaderInt8 and skips it there (marks true16/true8 RX570-only).
- - InterlockedOr/And in this Slang = 2-arg (uint lvalue, int value)->void; emits OpAtomicOr/
-   And on the BDA pointer, no Int64. Atomic fallback needs only Shader+PhysicalStorageBuffer.
- - Probe command pool needs RESET_COMMAND_BUFFER_BIT (VUID -vkResetCommandBuffer-commandBuffer-
-   00046) because vkResetCommandBuffer is used per variant.
-
-STILL OPEN / NEXT:
- - ITEM 4 DECIDED by user: atomic AND/OR fallback for all sub-word writes, behind a
-   macro-selectable accessor layer (store_u16/store_u8/load_u16/load_u8; default=atomic,
-   narrow-store kept working+verified on RX570). Reads = plain 32-bit load + shift/mask.
-   Log in DIVERGENCES.md as "functionally equivalent, not result-changing; narrow-store
-   variant to be measured on RX 570 after M5".
- - STAGE B ITEM 5 BASELINE (run this session, RX 570, CYCLES_VULKAN_ABI_PROBE=1 +
-   abi_probe.spv): ABI probe ALL VALUES MATCH. sizeof(IntegratorStateGPU):
-   GPU=0x850 HOST=0x850 MATCH (=2128). bvh_nodes@2560 + render_pixel_index@2984 +
-   sentinel all MATCH. => The CURRENT vulkan_data.slang mirror is ALREADY SIZE-CORRECT
-   (2128). The S1b-3 "wrong SoA decomposition" concern is about the INTERNAL field ORDER
-   of the ARRAY members (volume_stack/shadow_isect/shadow_volume_stack), which the ABI
-   probe does NOT check. NEXT SESSION: read state_template.h + shadow_state_template.h +
-   vulkan_data.slang IntegratorStateGPU mirror; confirm whether the array members are AoS
-   (array-of-pointer-structs, matching C++ `struct {...} name[gpu_size]`) or wrongly flat
-   SoA; add host static_assert(offsetof(...)) locks for those members; if a static_assert
-   fails, fix the mirror to AoS, recompile abi_probe.slang, re-run to confirm sizeof still
-   2128 + the new offset asserts pass. Then items 6-9 (accessors + sub-word accessor layer
-   + gate + negatives).
- - Stage B remaining (items 6-9): write integrator_state.slang accessors for INIT_FROM_CAMERA
-   + INTERSECT_CLOSEST + SHADE_SURFACE(diffuse) + queue path + the sub-word accessor layer
-   (atomic default, macro to swap to narrow); gate probe (distinct values via every accessor
-   incl. non-constant AoS indices; verify byte offsets from raw state memory allocated with
-   Cycles' own sizing; confirm float3* stride=12 when LOADED from IntegratorStateGPU);
-   negatives (16B stride on packed member, uint 4-byte store into uint16 field, wrong AoS
-   stride on volume_stack).
-
-NEG1 WAIVER (S1b-2, in force): "M4c PASS with documented waiver: NEG1 (skip instance pop)
-not detectable on translation-only instance scenes; rotated/scaled instance transforms and
-the pop's direction restore are UNTESTED and must be verified before supporting instanced
-scenes."
-
-FACTS next session must know: see items above. Uncommitted files: NEW subword_word.slang,
-subword_narrow.slang, stride_check.slang, dynindex_repro.slang/_b/_c; MODIFIED kernels.cpp,
-queue.cpp, device.cpp (feature enablement), traverse_probe.slang, device_impl.h,
-lastsession.txt; pre-existing math_core.slang, math_probe.slang, kdata_probe.slang; stale
-traverse_*.spv in repo root (user to clean).
+Host static_asserts added to kernels.cpp locking strides 16/48/16, base offsets
+376/1240/1432, inner object@0/shader@8 etc. (with <cstddef>,<type_traits>).
+vulkan_data.slang mirror fixed to AoS (slot[32]/slot[4] element structs).
+ABI probe extended to 24 words with three slot[1] typed-vs-raw checks
+(3384/4304/4440). RX 570: ALL VALUES MATCH. SwiftShader: crashes 0xC00000FD on
+OpCapability Int64 (pre-existing BDA limitation, ABI probe is RX 570-only).

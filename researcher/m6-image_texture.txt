@@ -1,0 +1,237 @@
+M6 RESEARCH: Image textures for the Vulkan backend (read-only research, 2026-10-23)
+(file that could not be written: researcher/m6-image-textures.md)
+Source of truth: this fork (C:\dev\cycles-vulkan-debug). Blender main (E:/blender-git/blender/intern/cycles) only for "Blender main differs" notes. Every claim below was re-verified in this session with the command shown (run via Git bash: & "C:\Program Files\Git\bin\bash.exe" -lc "cd /c/dev/cycles-vulkan-debug && <cmd>"); nothing is taken from the older, untrusted researcher/ files.
+1. Data path, host to kernel
+1.1 Kernel-side structs (FACT)
+Command: sed -n '80,170p' src/util/types_image.h — raw output (excerpt):
+93: struct KernelImageInfo {
+94:   /* Pointer, offset or image/texture object depending on device. */
+95:   uint64_t data = 0;
+97:   uint data_type = IMAGE_DATA_NUM_TYPES;
+99:   uint interpolation = INTERPOLATION_NONE;
+100:  uint extension = EXTENSION_REPEAT;
+102:  uint width = 0;
+103:  uint height = 0;
+104:  float inv_width = 0.0f;
+105:  float inv_height = 0.0f;
+106: };
+145: struct KernelImageTexture {
+147:   uint image_info_id = KERNEL_IMAGE_NONE;
+149:   uint tile_descriptor_offset = KERNEL_TILE_LOAD_NONE;
+150:   int tile_size_shift = 0;
+151:   int tile_levels = 0;
+152:   int tile_num = 0;
+154:  int width = 0;
+155:  int height = 0;
+157:  uint interpolation = INTERPOLATION_NONE;
+158:  uint extension = EXTENSION_REPEAT;
+160:  uint use_transform_3d = false;
+161:  Transform transform_3d = transform_zero();
+163:  float4 average_color = zero_float4();
+164: };
+166: #define KERNEL_IMAGE_TEX_PADDING 2
+KernelImageInfo.data per device (FACT):
+- CPU = host pointer. Command: sed -n '225,262p' src/device/cpu/device_impl.cpp | grep -n 'host_pointer' →
+258:  (*image_info)[image_info_id] = mem.info; / 259:  (*image_info)[image_info_id].data = (uint64_t)mem.host_pointer;
+- CUDA/HIP = texture object, or device pointer for NanoVDB. Command: grep -n 'tex_info.data' src/device/cuda/device_impl.cpp src/device/hip/device_impl.cpp →
+cuda/device_impl.cpp:891: tex_info.data = (uint64_t)cmem->texobject; / cuda:894: tex_info.data = (uint64_t)mem.device_pointer; / hip:837,840 same.
+Our Vulkan device should put the BDA of the uploaded pixel buffer in data (INFERENCE, strong) — same model as CPU (a raw pointer), because our design is BDA-only + software sampling. Nothing does this today (see 1.4).
+1.2 Full host call chain (FACT)
+1. Scene::device_update → image_manager->device_update(device, this, progress). Command: grep -n 'image_manager->device_update' src/scene/scene.cpp → 336:.
+2. ImageManager::device_update (src/scene/image.cpp:632) fills a KernelImageTexture, loads, then device_copy_image_textures() (image.cpp:440). From sed -n '620,720p' src/scene/image.cpp:
+647:  kimage->mip_bias = (scene->params.texture_resolution < 1.0f) ? -log2f(...) : 0.0f;
+653:  device_update_udims(device, scene);
+655:  device_resize_image_textures(scene);
+665:        device_load_image(device, scene, image_texture_id, progress);
+674:  device_copy_image_textures(device, scene);
+3. ImageManager::device_load_image (image.cpp:467):
+480:  load_image_metadata(img, progress);
+481:  KernelImageTexture tex;
+482:  tex.width = img->metadata.width;
+484:  tex.interpolation = img->params.interpolation;
+485:  tex.extension = img->params.extension;
+487:  tex.use_transform_3d = img->metadata.use_transform_3d;
+489:  tex.average_color = img->metadata.average_color;
+493:  if (use_texture_cache && img->metadata.has_tiles_and_mipmaps && img->metadata.tile_size) {
+503:    image_cache.load_image_tiled(scene->dscene, img->metadata, tex);
+505:  else {
+512:    img->vdb_memory = image_cache.load_image_full(*device, *img->loader, img->metadata, texture_resolution, tex);
+4. ImageCache::load_image_full (src/scene/image_cache.cpp:276) → template load_full (:192) → alloc_full (:125) which creates a device_image (MEM_IMAGE_TEXTURE) with an image_info_id and loads the pixels into its host memory; then 343:  tex.image_info_id = image_info_id; (from sed -n '130,330p' output).
+5. device_image (src/device/memory.h:633-660) holds KernelImageInfo info; (memory.h:655); device_image::alloc (src/device/memory.cpp:287) sets info.width/height/inv_width/inv_height (lines 301-304, pasted).
+6. ImageManager::device_copy_image_textures (image.cpp:440-465): image_cache.copy_to_device(scene->dscene), dscene.image_textures.copy_to_device_if_modified(), and registers tile-load callbacks via device->set_image_cache_func(...) (lines 449-464, pasted).
+7. device_image::copy_to_device() (memory.cpp:309) → device_memory::device_copy_to() (memory.cpp:137-142) → device->mem_copy_to(*this):
+- CPU: branches on MEM_IMAGE_TEXTURE → image_free+image_alloc (cpu/device_impl.cpp:108-117), then image_alloc (:227) writes image_info[id] = mem.info; .data = host_pointer (:258-259).
+- CUDA: CUDADevice::image_alloc (cuda/device_impl.cpp:758) uploads pixels, creates a CUtexObject (:886-891), stores image_info[image_info_id] = tex_info; need_image_info = true; (:899-907); image_copy_to (:911), image_free (:942).
+8. KernelImageInfo array upload: GPUDevice::image_info is device_vector<KernelImageInfo> image_info typed MEM_GLOBAL (src/device/device.h:389; ctor image_info(this, "image_info", MEM_GLOBAL) at :381), flushed by GPUDevice::load_image_info (src/device/device.cpp:631-651, pasted) when need_image_info is set; CUDA queue calls it before enqueue (src/device/cuda/queue.cpp:71,77,96).
+9. Kernel arrays list. Command: grep -n 'image_textures|...' src/kernel/data_arrays.h →
+93:KERNEL_DATA_ARRAY(KernelImageTexture, image_textures)
+94:KERNEL_DATA_ARRAY_WRITABLE(KernelTileDescriptor, image_texture_tile_descriptors)
+95:KERNEL_DATA_ARRAY_WRITABLE(uint8_t, image_texture_tile_access_state)
+96:KERNEL_DATA_ARRAY(KernelImageUDIM, image_texture_udims)
+97:KERNEL_DATA_ARRAY(KernelImageInfo, image_info)
+1.3 UDIM side data (FACT)
+ImageManager::device_update_udims (image.cpp:611-629, pasted) fills dscene.image_texture_udims (src/scene/devicescene.h:96-99).
+1.4 Our Vulkan device today (FACT / NOT FOUND)
+- VulkanDevice : public GPUDevice (src/device/vulkan/device_impl.h:23) — it owns image_info and inherits load_image_info.
+- VulkanDevice::mem_copy_to (src/device/vulkan/device.cpp:485) handles MEM_GLOBAL and sends everything else to generic_copy_to(mem) (:534). So a MEM_IMAGE_TEXTURE would be treated as a plain buffer; info.data is never set, image_info is never filled, need_image_info is never set. NOT FOUND: any image_alloc/image_copy_to/MEM_IMAGE_TEXTURE handling in src/device/vulkan/* (grep gave only a comment at device.cpp:567); no load_image_info in the vulkan queue (grep -rn 'load_image_info' src/device output has no vulkan entry).
+- The Slang globals mirror already has the slots. Command: sed -n '325,345p' src/kernel/device/vulkan/vulkan_data.slang →
+336:    uint64_t image_textures;                         // offset 2944
+337:    uint64_t image_texture_tile_descriptors;         // offset 2952
+338:    uint64_t image_texture_tile_access_state;        // offset 2960
+339:    uint64_t image_texture_udims;                    // offset 2968
+340:    uint64_t image_info;                             // offset 2976
+2. Kernel path: SVM node → sample function
+#	Function	File:line	Role	~Lines
+0	surface_shader_eval → svm_eval_nodes	src/kernel/integrator/surface_shader.h:1285	runs SVM for hit shader	-
+1	svm_eval_nodes loop	src/kernel/svm/svm.h:102; NODE_TEX_IMAGE case svm.h:281-283	dispatch	-
+2	svm_node_tex_image<Float3Type>	src/kernel/svm/image.h:60-77	stack in/out, projection	~18
+3	svm_node_tex_image_mapping	svm/image.h:47-55	sphere/tube; flat = make_float2(co)	~9
+4	svm_image_texture	svm/image.h:22-38	alpha un-associate + sRGB flag	~17
+5	kernel_image_interp_with_udim	CPU src/kernel/device/cpu/image.h:395-410; GPU gpu/image.h:160-173	UDIM remap	~15
+6	kernel_image_interp	CPU cpu/image.h:328-393; GPU gpu/image.h:88-158	full vs tiled branch + type switch	~65
+6a	kernel_image_tile_wrap (tiled)	src/kernel/util/image_2d.h:48-74	UV wrap	~27
+6b	kernel_image_tile_map (tiled)	image_2d.h:76-191	mip + tile lookup + miss	~115
+7	ImageInterpolator<TexT,OutT> (software)	cpu/image.h:37-324 (interp_closest :135, interp_linear :170, interp_cubic :224, dispatcher :313-324)	reads + wrap + weights	~290
+7g	ccl_gpu_image_object_read_2D<T> (hw sampler)	cuda/compat.h:79-82, hip/compat.h:81-84, metal/context_begin.h:27-46, oneapi/compat.h:203-220	one hw fetch	small
+8	kernel_image_interp_bicubic	gpu/image.h:61-86	cubic via 4 bilinear taps	~26
+CPU full-image branch + type dispatch (excerpt of sed -n '328,410p' src/kernel/device/cpu/image.h):
+341:  if (tex.tile_descriptor_offset != UINT_MAX) {
+349:  else {
+350:    /* Full image sampling. */
+353:    info = &kernel_data_fetch(image_info, tex.image_info_id);
+355:    xy = make_float2(uv.val.x * info->width, uv.val.y * info->height);
+362:  switch (info->data_type) {
+387:    case IMAGE_DATA_TYPE_BYTE4:
+388:      return ImageInterpolator<uchar4>::interp(*info, xy.x, xy.y);
+Must port for fully resident + bilinear/closest (INFERENCE from above): (1) svm_node_tex_image + svm_image_texture (+ color_srgb_to_linear_v4, src/util/color.h:347); (2) kernel_image_interp full branch only; (3) interp_closest + interp_linear with wrap helpers wrap_periodic/clamp/mirror (cpu/image.h:113-133) and the read() conversions uchar4*1/255, uchar*1/255, half4_to_float4_image, ushort*1/65535 (cpu/image.h:57-91; half at src/util/half.h:289,294). The float3 SVM variant (svm.h:281-283) needs no dual2 machinery (dual2 is built from plain float2 at svm/image.h:66). Defer: tile path, UDIM, cubic/bicubic, box projection (svm/image.h:79-166), environment (svm/image.h:188-204).
+Blender main differs: CPU sampler moved to kernel/util/image.h in main (grep -rln 'ImageInterpolator' /e/blender-git/blender/intern/cycles/kernel → .../kernel/util/image.h; kernel/device/cpu/image.h doesn't exist there — ls shows only bvh/compat/globals/kernel*). Main's kernel_image_interp gained a missing_rgba parameter and SD_CACHE_MISS became SR_CACHE_MISS runtime flag (diff -u output: sd->runtime_flag |= SR_CACHE_MISS in main's image_2d.h). We port THIS fork.
+3. The tile cache — the key question
+3.1 Protocol in plain terms (FACT)
+src/util/types_image.h:120-142 (pasted):
+120:#define KERNEL_TILE_LOAD_NONE 0xFFFFFFFFU
+121:#define KERNEL_TILE_LOAD_REQUEST (KERNEL_TILE_LOAD_NONE - 1)
+122:#define KERNEL_TILE_LOAD_FAILED (KERNEL_TILE_LOAD_NONE - 2)
+136:#define KERNEL_TILE_ACCESS_NONE 0
+137:#define KERNEL_TILE_ACCESS_REQUESTED (1 << 0)
+138:#define KERNEL_TILE_ACCESS_USED (1 << 1)
+Flow:
+1. Host pre-allocates a descriptor array per image (ImageCache::load_image_tiled, src/scene/image_cache.cpp:495-563, pasted): sets tile_descriptor_offset, tile_levels, tile_num; all descriptors = KERNEL_TILE_LOAD_NONE.
+2. In-kernel sample (kernel_image_tile_map, image_2d.h:76-191): mip level from UV derivatives (16:1 anisotropy clamp image_2d.h:93; stochastic dither via LCG image_2d.h:102-111; kernel_data.image.mip_bias at :112), locate descriptor.
+3. GPU miss (image_2d.h:141-156, pasted):
+144:      tile_descriptor = KERNEL_TILE_LOAD_REQUEST;
+147:      kernel_data_write(image_texture_tile_descriptors, ..., tile_descriptor);
+152:          image_texture_tile_access_state)[access_index] = KERNEL_TILE_ACCESS_REQUESTED;
+155:      sd->flag |= SD_CACHE_MISS;
+shader returns tex.average_color as placeholder (gpu/image.h:117-119).
+4. Path is NOT terminated: LABEL_CACHE_MISS (src/kernel/integrator/shade_surface.h:791-792,855-856) → integrator_path_cache_miss_sorted keeps the path queued and sets queue_counter->cache_miss = true (src/kernel/integrator/state_flow.h:107-115).
+5. Host retry loop: PathTraceWorkGPU::update_queue_counter_and_cache (src/integrator/path_trace_work_gpu.cpp:323-347); command grep -n 'queue_counter->cache_miss' src/integrator/path_trace_work_gpu.cpp →
+338:  if (queue_counter->cache_miss) {
+340:    device_->image_load_requested_gpu(*queue_);
+341:    queue_counter->cache_miss = 0;
+→ ImageManager::device_gpu_load_requested (image.cpp:567-601, pasted): reads access-state back, loads tiles via ImageCache::load_requested_tiles (image_cache.cpp:655-716, pasted), uploads via copy_to_device(dscene, queue) which ends with queue.load_image_info() (image_cache.cpp:952).
+6. Re-executed kernels find loaded descriptors, mark USED (image_2d.h:178-180). Eviction: evict_unused from src/session/session.cpp:379 (ImageCache::evict_unused at image_cache.cpp:812).
+CPU differs (FACT): misses load synchronously inside the kernel via a host callback (image_2d.h:158-171: 163: kg->image_load_requested_cpu(...)) → ImageManager::device_cpu_load_requested (image.cpp:540-564). CPU never aborts/retries.
+3.2 The tile cache is optional — YES for normal image files (FACT)
+Tiled path only when all three hold (src/scene/image.cpp:493, pasted):
+493:  if (use_texture_cache && img->metadata.has_tiles_and_mipmaps && img->metadata.tile_size) {
+- use_texture_cache: SceneParams flag, default true (src/scene/scene.h:85 /* Use tx files if they exist. */ bool use_texture_cache = true;), copied at image.cpp:219. NOT FOUND: any CLI/XML setter (grep -rn 'use_texture_cache' src/app src/device → no output; full CLI list in cycles_standalone.cpp:414-449: --device, --shadingsys, --background, --quiet, --samples, --output, --threads, --width, --height, --tile-size, --list-devices, --profile, --log-level, --help, --version — no texture option; no --set/--resolution exist).
+- has_tiles_and_mipmaps: set only in ImageMetaData::detect_tiles (src/util/image_metadata.cpp:252-352, pasted) for square, power-of-two tiled files with a complete mip chain:
+328:  has_tiles_and_mipmaps = has_tiles && tile_size;
+348:      has_tiles_and_mipmaps = false;   /* missing mip levels */
+- tile_size (image_metadata.cpp:323: tile_size = spec.tile_width;) stays 0 for scanline files (PNG/JPEG): detect_tiles bails at "tile size not power of two" (image_metadata.cpp:296-299) (INFERENCE from the pasted if/else chain :294-326).
+Such tiled files come only from .tx files, resolved in OIIOImageLoader::load_metadata (src/scene/image_oiio.cpp:35-56, pasted):
+35:  if (params.use_texture_cache) {
+37:    const bool found = resolve_tx(filepath, params.texture_cache_path, ...);
+44:    if (params.auto_texture_cache) { ... make_tx(...) ... }
+resolve_tx (src/util/image_maketx.cpp:401-460, pasted) looks for <image>.<version>-<md5>.tx in texture_cache_path or a blender_tx/ subfolder next to the image, or accepts the file itself if it's already a tiled tx/tiff/exr (:448-455). auto_texture_cache defaults false (scene.h:86), texture_cache_path empty (scene.h:89), neither set anywhere in the app (grep → no output). Auto-generated tx uses spec.tile_width = 64; (src/util/image_maketx.cpp:763).
+Size threshold (FACT): images smaller than the tile size are never tiled even in a tx — src/util/image_metadata.cpp:314-325 (pasted):
+314:  else if (width < spec.tile_width && height < spec.tile_width) {
+315:    /* We don't currently support using tiles for images smaller than the tile
+316:     * size, and it's also unnecessary. ... */
+320:    is_small_image = true;
+There tile_size stays 0 → has_tiles_and_mipmaps false → full path (image.cpp:493 also checks tile_size). For auto-generated tx the threshold is < 64×64 (image_maketx.cpp:763).
+3.3 Conclusion for M6 v1 (INFERENCE, high confidence)
+Yes — v1 can avoid the tile protocol entirely. Use plain PNG/JPEG/EXR with no blender_tx dir and no .tx sibling: use_texture_cache stays true, but image.cpp:493 is false → load_image_full → tex.tile_descriptor_offset keeps its default KERNEL_TILE_LOAD_NONE (types_image.h:149) → both CPU (cpu/image.h:349-358) and GPU (gpu/image.h:126-136) take the "Full image sampling" branch. No descriptor arrays, no access-state readback, no shader abort/retry, no image_load_requested_gpu dependency. The tile cache is only needed for .tx (Blender production) flows and can be added later without redesign.
+4. Formats and modes
+ImageDataType actually used (FACT): src/util/types_image.h:34-56 — FLOAT4=0, BYTE4=1, HALF4=2, FLOAT=3, BYTE=4, HALF=5, USHORT4=6, USHORT=7, NANOVDB 8..13. Chosen from OIIO spec (src/util/image_metadata.cpp:415-425, pasted: half→HALF4/HALF, float→FLOAT4/FLOAT, USHORT→USHORT4/USHORT, else BYTE4/BYTE). 1-channel stays scalar; 2/3-channel are expanded to RGBA at load (conform_pixels, image_metadata.cpp:496-556, pasted). Typical PNG/JPEG → BYTE4; EXR → HALF4/FLOAT4. Kernel type dispatch: gpu/image.h:127-155, cpu/image.h:362-393. Normalization (pasted cpu/image.h:57-91): uchar→*1/255, uint16_t→*1/65535, half→half_to_float_image (src/util/half.h:289,294).
+sRGB vs linear — conversion in the KERNEL per sample for 8-bit sRGB (FACT):
+- ImageMetaData::finalize (image_metadata.cpp:131-135, pasted): colorspace == u_colorspace_scene_linear_srgb → is_compressible_as_srgb = true; ("Keep sRGB colorspace stored as sRGB, to save memory").
+- Compiler sets NODE_IMAGE_COMPRESS_AS_SRGB (src/scene/shader_nodes.cpp:441-447, pasted).
+- Kernel converts after sampling (src/kernel/svm/image.h:33-35): if (flags & NODE_IMAGE_COMPRESS_AS_SRGB) { r = color_srgb_to_linear_v4(r); } (src/util/color.h:347).
+- Other colorspaces are converted on the host at load (image_metadata.cpp:558-570, pasted ColorSpaceManager::to_scene_linear(...)).
+Alpha (FACT): associated-alpha conversion is host-side at load (image_metadata.cpp:488-497, pasted: if (channels == 4 && metadata.is_unassociated_alpha) { pixel[0] = util_image_multiply_native(pixel[0], alpha); ... }); kernel un-associate per sample when Alpha is linked (svm/image.h:28-31; flag set shader_nodes.cpp:448-456). Enum types_image.h:60-70.
+Wrap/extension (FACT): enum types_image.h:79-88 REPEAT=0/EXTEND=1/CLIP=2/MIRROR=3; XML names periodic/clamp/black/mirror (shader_nodes.cpp:270-273, pasted). Software implementation = CPU wrap helpers (cpu/image.h:113-133); CUDA/HIP use sampler address modes (hip/device_impl.cpp:708-727, pasted: Wrap/Clamp/Border/Mirror). Tiled path wraps in-kernel (image_2d.h:48-74). A software Vulkan sampler follows the CPU implementation (INFERENCE).
+Interpolation (FACT): enum types_image.h:23-31 (NONE=~0, LINEAR=0, CLOSEST=1, CUBIC=2, SMART=3); XML closest/linear/cubic/smart, default LINEAR (shader_nodes.cpp:261-266, pasted). CPU: interp() switch (cpu/image.h:313-324) — CLOSEST, LINEAR, everything else → cubic. GPU: CLOSEST→point filter else linear (hip/device_impl.cpp:729-736, pasted); CUBIC/SMART → kernel_image_interp_bicubic over 4 bilinear taps (gpu/image.h:135-137).
+Mip levels & anisotropy (FACT): full-resident images have no mip chain (single device_image::alloc; neither full branch picks a level: cpu/image.h:349-358, gpu/image.h:126-136). Mips exist only in the tiled path (image_2d.h:76-125): derivative-footprint log2, aniso clamped to 16:1 (image_2d.h:93), stochastic dither (:102-111), kernel_data.image.mip_bias (:112; member at src/kernel/data_template.h:244; computed image.cpp:646-649). CLOSEST builds only one mip level (image_cache.cpp:507: max_miplevels = interpolation != INTERPOLATION_CLOSEST ? 1 : INT_MAX).
+5. Texture coordinate paths
+- Projections: src/kernel/svm/types.h:408-411 (pasted) FLAT=0/BOX=1/SPHERE=2/TUBE=3.
+- flat/sphere/tube in svm_node_tex_image_mapping (svm/image.h:47-55); sphere/tube use map_to_sphere/map_to_tube (src/util/math_float3.h:801,817; dual2 variants src/util/math_dual.h:398,412).
+- box is a separate node NODE_TEX_IMAGE_BOX / svm_node_tex_image_box (svm/image.h:79-166), dispatched at svm.h:290-296, uses object_inverse_normal_transform + blend weights.
+- UDIM: kernel kernel_image_udim_map (image_2d.h:17-46, pasted); host device_update_udims (image.cpp:611-629); tiles socket (shader_nodes.cpp:285).
+- 3D transform: use_transform_3d set ONLY by the VDB loader (grep -rn 'use_transform_3d' src → src/scene/image_vdb.cpp:111, rest are struct/field/object.cpp:367), consumed only in src/kernel/util/image_3d.h:214. Not needed for 2D textures (FACT).
+- Needed for plain UV-mapped image on a mesh: projection="flat" (default); Vector input defaults to the UV attribute via SocketType::LINK_TEXTURE_UV (shader_nodes.cpp:287, pasted; graph side src/scene/shader_graph.cpp:163,892). Nothing else.
+6. Hazards for Slang (FACT unless marked)
+1. uint64→pointer casts: const TexT *data = (const TexT *)info.data; (cpu/image.h:166,180,291); (ccl_gpu_image_object_2D)info.data (gpu/image.h:64). In Slang: BDA uint64 → typed base pointer.
+2. 8-bit loads (BYTE4 = the common PNG case): reading uchar/uchar4 from a PhysicalStorageBuffer needs Int8 on RX 570; SwiftShader has neither Int8 nor Int16 (FACT from lastsession.txt STAGE A ITEM 1: "RX 570: shaderInt16=1 ... shaderInt8=1; SwiftShader: all 0"). Portable repo pattern = word loads + mask/shift (src/kernel/device/vulkan/subword_word.slang header, pasted: "This file uses ONLY uint32 ... no Int16/Int8 capability"). For read-only pixels: load one uint (4 RGBA8888 bytes) per texel — no atomics needed.
+3. DEVICE RULE (dynamic indexing): RX 570 miscompiles dynamic indexing on fixed array members behind BDA structs (AGENTS.md). The image code indexes kernel_data_fetch(image_info, dynamic) and image_textures[dynamic] (gpu/image.h:105,128; cpu/image.h:344,353) — in Slang always go through a raw base pointer (params.image_info[i] as uint64*), never a fixed-array member.
+4. Templates/C++: ImageInterpolator is a template with if constexpr (std::is_same_v<...>) (cpu/image.h:37-47); port as an explicit switch(data_type). kernel_image_interp_bicubic is a ccl_device_noinline template (gpu/image.h:60-61).
+5. half loads: half_to_float_image/half4_to_float4_image (src/util/half.h:289,294). Whether Float16-typed pointers are accepted on PhysicalStorageBuffer by the validation layer on both devices is UNVERIFIED; safe fallback = load uint/uint64 bits and decode manually.
+6. Function pointers: only host-side (types_image.h:193-195, guarded #ifndef __KERNEL_GPU__, pasted). No shader hazard.
+7. No recursion/dynamic allocation in the sampler (fixed 4×4 cubic loop, cpu/image.h:271-310). Don't port the CPU load-request callback.
+8. Full-resident sampling is read-only over image_info + pixels (FACT) — fits our BDA discipline.
+9. Y orientation: OIIO loads flipped (oiio_load_pixels(..., flip_y = true) default, src/util/image_metadata.h:77); CPU full path samples xy = uv * (w,h) without further flip (cpu/image.h:365), tiled path flips (image_2d.h:128). Match the CPU full-path convention or the gate image is vertically mirrored (negative-test candidate).
+7. Test scene XML (all attributes verified in the loader)
+Loader facts (FACT, pasted): tag = node type name (shader_nodes.cpp:246 NodeType::add("image_texture",...); :2596 NodeType::add("diffuse_bsdf",...)); XML attribute names = socket identifiers, because xml_read_node does xml_node.attribute(socket.name.c_str()) (src/graph/node_xml.cpp:68) and socket.name is ustring(#name) (src/graph/node_type.h:231-235). So the attributes are exactly: filename, colorspace, alpha_type, interpolation, extension, projection, projection_blend, tiles, animated, vector (shader_nodes.cpp:250-287). Enum values (pasted :252-280): interpolation closest|linear|cubic|smart; extension periodic|clamp|black|mirror; projection flat|box|sphere|tube; alpha_type auto|unassociated|associated|channel_packed|ignore. Filename resolved relative to the XML directory (src/app/cycles_xml.cpp:286-290, pasted). Connections <connect from="node socket" to="node socket"/>, case-insensitive (cycles_xml.cpp:175-229). <film/>/<integrator/> are scene nodes (cycles_xml.cpp:721-727). Mesh UVs: <mesh ... UV="u0 v0 ...">, one float2 per triangle corner (cycles_xml.cpp:425-441, pasted). Working structural pattern: instance2.xml (pasted in full this session).
+<cycles>
+  <transform translate="0 -6 3">
+    <camera type="perspective" fov="0.8" full_width="800" full_height="600" />
+  </transform>
+
+  <shader name="texshader">
+    <image_texture name="tex" filename="checker.png"
+                   interpolation="linear" extension="periodic" projection="flat" />
+    <diffuse_bsdf name="diff" />
+    <connect from="tex color" to="diff color" />
+    <connect from="diff bsdf" to="output surface" />
+  </shader>
+
+  <mesh name="plane"
+         P="-2 2 0 2 2 0 2 -2 0 -2 -2 0"
+         nverts="4"
+         verts="0 1 2 3"
+         UV="0 0 1 0 1 1 0 1" />
+  <state shader="texshader">
+    <object mesh="plane" />
+  </state>
+</cycles>
+Leave colorspace unset (default u_colorspace_auto, shader_nodes.cpp:251 → auto-detect → the sRGB-in-kernel path we must port). The diffuse_bsdf output socket is BSDF (shader_nodes.cpp:2606) but matching is case-insensitive (cycles_xml.cpp:195), so bsdf is fine (instance2.xml proves the pattern). Render this on CPU first and look at the image — the scene's axis conventions were not re-checked (the user flagged that the existing geometry looks Y-up while the camera looks Z-up).
+8. Task split (dependency order, ≤~400 lines Slang each)
+Common gate method (AGENTS.md §6): slangc -target spirv + spirv-val --target-env vulkan1.2, RX 570 (+SwiftShader where features allow), validation layer on, pixel-compare vs the Cycles CPU render of the same XML.
+T1 — Host: MEM_IMAGE_TEXTURE path in VulkanDevice. Add a MEM_IMAGE_TEXTURE branch in mem_copy_to (src/device/vulkan/device.cpp:485, before the generic_copy_to fallback at :534): allocate a VkBuffer via the existing generic_alloc/alloc_device, upload pixels with copy_host_to_device, set mem.device_pointer=BDA; fill device->image_info[id] = mem.info; .data = (uint64_t)BDA (CPU model, cpu/device_impl.cpp:258-259); set need_image_info; flush image_info from VulkanQueue before enqueue (mirror src/device/cuda/queue.cpp:71-96) — image_info is a MEM_GLOBAL device_vector (device.h:389), so its own BDA reaches the kernel slot (vulkan_data.slang:340) through the already-working MEM_GLOBAL path. Host references: CPUDevice::image_alloc (cpu/device_impl.cpp:227-260), GPUDevice::load_image_info (device.cpp:631-651), device_image::alloc (memory.cpp:287-307). Gate: probe reading image_info[0] (width/height/inv_*/data) via BDA base pointer, MATCH/MISMATCH, including a non-constant index (DEVICE RULE). Negatives: data==0 must yield an error code not a crash; wrong byte offset on inv_width; dynamic-index-returns-element-0.
+T2 — Slang: byte4/float4 texel fetch + closest interpolation (fully resident). image_sample.slang under src/kernel/device/vulkan/: word-load RGBA8888 (pattern subword_word.slang), frac (cpu/image.h:30-35), interp_closest with all four wraps (cpu/image.h:113-168), *1/255. Gate: probe sampling a known 8×8 image at UVs −0.3..1.3 for each extension vs a host C++ reference; plus plane_texture.xml with interpolation="closest" vs Cycles CPU. Negatives: wrap_periodic with negative u (off-by-one); CLIP outside region; byte-extraction order (RGBA vs BGRA channel swap must be detectable).
+T3 — Slang: bilinear + sRGB + alpha flags. interp_linear (cpu/image.h:170-223, incl. the CLIP read_clip path), color_srgb_to_linear_v4 (src/util/color.h:347), un-associate (svm/image.h:26-31). Gate: plane_texture.xml linear, 16 spp, pixel-compare vs Cycles CPU; plus a UV-gradient probe. Negatives: missing the −0.5 texel-center offset (cpu/image.h:176); flipped Y.
+T4 — Slang: half/float/ushort + scalar images. Type switch for HALF/HALF4 (manual fp16 decode unless Float16 BDA is proven), FLOAT/FLOAT4, USHORT/USHORT4 (cpu/image.h:362-393, conversions :57-91). Gate: EXR/half + float EXR + 16-bit PNG scenes vs CPU; bit-pattern decode probe (0x3C00=1.0 etc.). Negatives: fp16 denormals/NaN; grayscale alpha must be 1.0 (make_float4(f,f,f,1.0f), cpu/image.h:365-366).
+T5 — End-to-end wiring. Upload dscene.image_textures like other MEM_GLOBALs (BDA slot vulkan_data.slang:336); add the minimal per-hit UV plumbing in the current monolithic kernel (path_trace.slang still uses shade_stub; bsdf_diffuse.slang exists standalone — grep -n 'bsdf_diffuse' *.slang shows no include of it in path_trace.slang) and call the T2/T3 sampler through an svm_image_texture-equivalent wrapper. Host reference: ImageTextureNode::compile (shader_nodes.cpp:432-485), svm_node_tex_image (svm/image.h:60-77). Gate: plane_texture.xml at 16 spp vs Cycles CPU. Negatives: wrong image_info_id (sampling another image); per-corner UV interpolation bug (skew); clamp-edge colors.
+T6 (optional, v1+) — cubic/smart (interp_cubic cpu/image.h:224-311, faithful CPU shape), box projection (svm/image.h:79-166), or the tile cache (only for .tx flows; then port kernel_image_tile_map miss path + host load_requested_tiles glue + the queue-counter retry loop — this touches integrator scheduling and is a much bigger milestone).
+CPU-side Vulkan host work summary: the T1 branch is the only host change needed for v1; scene arrays flow through the existing MEM_GLOBAL path. 2 GB single-allocation cap: 4K RGBA8 ≈ 33 MB, 8K RGBA-half ≈ 134 MB — no realistic v1 image hits it; only huge FLOAT4 textures would (the cap itself is a design constraint from the task brief, not found in code: UNVERIFIED).
+9. Options and decision points
+USER DECISION 1 — Tile cache in M6 v1?
+(a) Fully resident only (RECOMMENDED): no tile protocol, no abort/retry, no access-state readback, no eviction; covers every v1 gate; images without a .tx sibling always take this path. (b) Include tile cache: only needed to match Blender production .tx/UDIM flows; much larger cost (kernel protocol + host retry loop + eviction + per-tile OIIO loading) and it touches integrator scheduling. The fork's clean split at image.cpp:493 means (b) can be added later without redesign.
+USER DECISION 2 — Interpolation modes in v1?
+linear + closest (RECOMMENDED, ~200 lines, covers the default and the deterministic reference); + cubic/smart later (~120 lines; if added, port the CPU SET_CUBIC_SPLINE_WEIGHTS form for faithfulness, not the GPU bicubic).
+USER DECISION 3 — Formats in v1?
+byte4 + float4 minimum (RECOMMENDED: PNG/JPEG + float EXR); add half4 if any EXR is in scope; ushort/1-channel last (rare). Only tricky part is fp16 decode without Int16/Float16 features — decode from 32-bit words to stay portable.
+UNVERIFIED ASSUMPTIONS
+1. KernelImageInfo.data = BDA of the pixel buffer for Vulkan is an INFERENCE from the CPU design; no Vulkan code does it yet (NOT FOUND in src/device/vulkan/).
+2. Word-load RGBA8888 (one uint per texel) assumes tightly packed 4-byte rows from OIIO through conform_pixels (image_metadata.cpp:503-533 strongly implies it); row stride/alignment not verified pixel-by-pixel — T2 probe must confirm.
+3. SwiftShader cannot run fp16/Int16/Int8 BDA loads (from lastsession.txt device facts) → HALF/USHORT probes would be RX 570-only unless decoded from 32-bit words — T4 must measure.
+4. The proposed plane_texture.xml axis orientation was NOT rendered; render on CPU first.
+5. The 2 GB cap / 4 GB VRAM are design constraints given in the task brief; no code constant found (grep for 2 GB / 0x80000000 in src/device/vulkan/device.cpp → no output).
+NOT FOUND (checked, absent)
+1. No CLI flag or XML attribute for use_texture_cache / auto_texture_cache / texture_cache_path (grep -rn 'use_texture_cache' src/app src/device → no output; CLI list cycles_standalone.cpp:414-449).
+2. No image_alloc / image_copy_to / load_image_info override / MEM_IMAGE_TEXTURE handling in src/device/vulkan/.
+3. No mip support anywhere in the full-resident sampling path (both full branches pasted).
+4. No size threshold that forces tiling for normal files; only the "< tile size in a tx file" exemption (image_metadata.cpp:314-325).
+5. map_to_sphere / map_to_tube have no Slang equivalent yet (grep in src/kernel/device/vulkan/*.slang → not present).
+Note for you (plan mode)
+The deliverable file could not be written: plan mode blocked write to researcher/m6-image-textures.md ("Cannot use write to modify files outside the Plan directory"). If you want it saved, either switch to execute mode, or copy the text above — the intended path was researcher/m6-image-textures.md. The headline result stands: question 3 resolves in favor of a small M6 v1 — plain image files never enter the tile protocol, so v1 can be fully resident + software-sampled, with the tile cache deferred.
