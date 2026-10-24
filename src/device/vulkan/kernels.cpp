@@ -752,6 +752,17 @@ bool vulkan_state_access_probe(VulkanDevice *dev)
   LOG_INFO << "Vulkan: state access gate starting "
               "(CYCLES_VULKAN_STATE_ACCESS_PROBE=1, " << modes.size() << " mode(s)).";
 
+  /* Opt-in step trace (CYCLES_VULKAN_GATE_TRACE=1). LOG_WARNING goes to the
+   * UNBUFFERED stderr branch of log.cpp:93-101 and fflushes stdout first, so
+   * when a device crashes mid-run (e.g. SwiftShader 0xC00000FD) the trace
+   * still shows the exact step that was in flight — plain LOG_INFO output is
+   * block-buffered and lost on a crash. */
+  const bool trace = getenv("CYCLES_VULKAN_GATE_TRACE") != nullptr;
+  auto step = [&](const char *what) {
+    if (trace)
+      LOG_WARNING << "Vulkan: state access gate: trace: " << what;
+  };
+
   /* 1. SPIR-V: compiled by hand with slangc (no build-system Slang rule). */
   std::vector<char> spirv;
   const char *env_path = getenv("CYCLES_VULKAN_STATE_ACCESS_PROBE_SPV");
@@ -774,6 +785,7 @@ bool vulkan_state_access_probe(VulkanDevice *dev)
     LOG_ERROR << "Vulkan: state access gate: '" << found << "' is not a valid SPIR-V module.";
     return false;
   }
+  step("spirv loaded");
 
   /* 2. Slice table: one slice per Cycles SoA member the gate reaches.
    *    Cycles sizes every member to max_num_paths elements and allocates EVERY
@@ -974,6 +986,7 @@ bool vulkan_state_access_probe(VulkanDevice *dev)
 
   uint64_t soa_addr = 0, ist_addr = 0, out_addr = 0;
   if (!make_buffer(soa_size, res.soa_buffer, res.soa_memory, soa_addr, "SoA")) return false;
+  step("buffers allocated");
   if (!make_buffer(sizeof(IntegratorStateGPU), res.ist_buffer, res.ist_memory, ist_addr,
                    "mirror"))
     return false;
@@ -997,6 +1010,7 @@ bool vulkan_state_access_probe(VulkanDevice *dev)
     memcpy(mapped, &ist, sizeof(ist));
     vkUnmapMemory(vk_dev, res.ist_memory);
   }
+  step("mirror uploaded");
 
   /* 5. Shader module + pipeline (entry point is SPIR-V "main"; see the ABI
    *    probe's note at its step 6). No descriptor sets: push constants + BDA. */
@@ -1013,6 +1027,7 @@ bool vulkan_state_access_probe(VulkanDevice *dev)
     LOG_ERROR << "Vulkan: state access gate: vkCreateShaderModule failed.";
     return false;
   }
+  step("shader module created");
   VkPushConstantRange pcr{};
   pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
   pcr.offset = 0;
@@ -1024,6 +1039,7 @@ bool vulkan_state_access_probe(VulkanDevice *dev)
     LOG_ERROR << "Vulkan: state access gate: pipeline layout creation failed.";
     return false;
   }
+  step("pipeline layout created");
   VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
   cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
   cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
@@ -1036,6 +1052,7 @@ bool vulkan_state_access_probe(VulkanDevice *dev)
                  "(bad entry point name?).";
     return false;
   }
+  step("compute pipeline created");
 
   /* 6. Command pool/buffer + fence, on the device's own family/queue. */
   const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
@@ -1062,6 +1079,7 @@ bool vulkan_state_access_probe(VulkanDevice *dev)
   }
   VkQueue queue = VK_NULL_HANDLE;
   vkGetDeviceQueue(vk_dev, family, 0, &queue);
+  step("command pool/buffer/fence ready");
 
   /* 7. Helpers: payload init / readback / byte formatting. */
   auto soa_init = [&]() {
@@ -1244,6 +1262,11 @@ bool vulkan_state_access_probe(VulkanDevice *dev)
       return false;
     }
     bool submitted = false;
+    if (trace) {
+      char m[64];
+      snprintf(m, sizeof(m), "submitting mode %u", mode);
+      step(m);
+    }
     if (vkQueueSubmit(queue, 1, &si, res.fence) == VK_SUCCESS) {
       submitted = vkWaitForFences(vk_dev, 1, &res.fence, VK_TRUE, 10000000000ull) ==
                   VK_SUCCESS;
@@ -1253,12 +1276,22 @@ bool vulkan_state_access_probe(VulkanDevice *dev)
                 << ").";
       return false;
     }
+    if (trace) {
+      char m[64];
+      snprintf(m, sizeof(m), "fence signaled mode %u", mode);
+      step(m);
+    }
 
     std::vector<uint8_t> got;
     uint32_t out[GATE_OUT_WORDS] = {0};
     if (!soa_read(got) || !out_read(out)) {
       LOG_ERROR << "Vulkan: state access gate: readback failed (mode " << mode << ").";
       return false;
+    }
+    if (trace) {
+      char m[64];
+      snprintf(m, sizeof(m), "readback done mode %u", mode);
+      step(m);
     }
 
     /* --- verify payload: expected bytes, canaries, and (for faults) the

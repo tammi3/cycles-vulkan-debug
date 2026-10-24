@@ -20,8 +20,10 @@
  * layout value by value.
  *
  * Device pointers are uint64_t Buffer Device Addresses, exactly like the
- * host's uint64_t slots (source: src/kernel/device/vulkan/params.h:40-41).
- * Raw pointer members and pointer arithmetic are only formed at the use
+ * host's uint64_t slots (source: src/kernel/device/vulkan/params.h:40-41)
+ * — true for the KernelParamsVulkan slots below; the integrator_state
+ * mirror uses typed pointers instead (see the M4e S1b-7 note). Raw pointer
+ * members and pointer arithmetic are only formed at the use
  * site, in the style of the M2c spike (agentreference/bvh_traverse.slang),
  * the only Slang code known to compile and run on the RX 570.
  *
@@ -48,7 +50,9 @@ struct KernelDataBlob
  * state.h:170 expands each KERNEL_STRUCT_MEMBER to `ccl_global type *name;`
  * and `ccl_global` is empty in host C++ (Apple-only packed layout,
  * __INTEGRATOR_GPU_PACKED_STATE__, is not active here: src/kernel/types.h:626).
- * We mirror each pointer as a uint64_t Buffer Device Address.
+ * We mirror each pointer as its TYPED device pointer (see the M4e S1b-7 note
+ * below); the KernelParamsVulkan slots further down keep uint64_t for now —
+ * they are retyped when a consumer lands (retype-on-landing policy).
  *
  * The C++ struct uses C-style anonymous nested structs
  * (`struct { ... } path;`); Slang gets explicit type names instead, which
@@ -56,17 +60,27 @@ struct KernelDataBlob
  * src/kernel/integrator/state_template.h and shadow_state_template.h; the
  * offsets in the comments are relative to the start of IntegratorStateGPU. */
 
-/* M4e S1b-6: SoA address members that the state ACCESSORS index (see
- * integrator_state.slang) are declared as TYPED device pointers instead of
- * uint64_t. A typed pointer is 8 bytes with 8-byte alignment — identical to
- * uint64_t — so every offset and sizeof in this file is UNCHANGED (the M4b/M4e
- * host static_asserts and the runtime ABI probe lock that). Members not yet
- * reached by an accessor stay uint64_t. Note: even an UNREAD uint64_t member
- * forces SPIR-V OpCapability Int64 (proven: a struct with one unused uint64
- * member still emits %ulong + Int64), so kernels that load through this mirror
- * are RX 570-only, exactly like the ABI probe. SwiftShader would additionally
- * require every uint64_t in the reachable structs to become a typed pointer —
- * a milestone-level decision, recorded in lastsession.txt (M4e S1b-6). */
+/* M4e S1b-6/S1b-7: SoA address members are declared as TYPED device
+ * pointers instead of uint64_t. A typed pointer is 8 bytes with 8-byte
+ * alignment — identical to uint64_t — so every offset and sizeof in this
+ * file is UNCHANGED (the M4b/M4e host static_asserts and the runtime ABI
+ * probe lock that). state.h:170 expands each KERNEL_STRUCT_MEMBER to
+ * `ccl_global type *name`, so the host member is always a POINTER to an
+ * array of `type`, and the mirror's element type follows state_template.h
+ * / shadow_state_template.h exactly:
+ *     uint32_t -> uint*,     int    -> int*,      float -> float*,
+ *     packed_float3 / PackedSpectrum (== packed_float3, util/types_spectrum.h:14)
+ *                        -> float3*   (12-byte elements),
+ *     uint16_t -> Subword16T*,  uint8_t / bool -> Subword8T*  (macro-dependent
+ *     word vs element view, see below).
+ * WHY the full retype (M4e S1b-7, user decision): even an UNREAD uint64_t
+ * member forces SPIR-V OpCapability Int64, and SwiftShader neither exposes
+ * shaderInt64 nor supports OpConvertPtrToU (observed 2026-10-24:
+ * gate_swiftshader.log -> 0xC00000FD). With every reachable uint64 gone, a
+ * kernel that only LOADS through this mirror compiles Int64-free and runs on
+ * both reference devices. Members whose pointed-to element really is 8 bytes
+ * of opaque data use uint2* (same 8-byte stride, no Int64): see
+ * path_segment below. */
 
 /* Sub-word (uint16/uint8/bool) SoA view type, switched by the same macro the
  * accessors use (VULKAN_SUBWORD_NARROW, default 0). Default: a uint* WORD view
@@ -94,30 +108,30 @@ struct IntegratorStatePath
     uint*    sample;                     // offset   8
     Subword16T* bounce;                  // offset  16
     Subword16T* transparent_bounce;      // offset  24
-    uint64_t diffuse_bounce;             // offset  32
-    uint64_t glossy_bounce;              // offset  40
-    uint64_t transmission_bounce;        // offset  48
-    uint64_t volume_bounce;              // offset  56
-    uint64_t volume_bounds_bounce;       // offset  64
-    uint64_t portal_bounce;              // offset  72
+    Subword16T* diffuse_bounce;          // offset  32 (uint16_t, state_template.h:21)
+    Subword16T* glossy_bounce;           // offset  40 (uint16_t, :23)
+    Subword16T* transmission_bounce;     // offset  48 (uint16_t, :25)
+    Subword16T* volume_bounce;           // offset  56 (uint16_t, :27)
+    Subword16T* volume_bounds_bounce;    // offset  64 (uint16_t, :29)
+    Subword16T* portal_bounce;           // offset  72 (uint16_t, :31)
     Subword16T* queued_kernel;           // offset  80
-    uint64_t rng_pixel;                  // offset  88
+    uint*    rng_pixel;                  // offset  88 (uint32_t, state_template.h:35)
     Subword16T* rng_offset;              // offset  96
     Subword8T*  visibility;              // offset 104
     uint*    flag;                       // offset 112
     Subword8T*  mnee;                    // offset 120
-    uint64_t mnee_shadow_state;          // offset 128
+    int*   mnee_shadow_state;            // offset 128 (int, state_template.h:45)
     float*   optical_depth;              // offset 136
     float*   mis_ray_pdf;                // offset 144
-    uint64_t mis_ray_object;             // offset 152
+    int*   mis_ray_object;               // offset 152 (int, state_template.h:54)
     float3*  mis_origin_n;               // offset 160
     float*   min_ray_pdf;                // offset 168
     float*   continuation_probability;   // offset 176
     float3*  throughput;                 // offset 184
-    uint64_t unguided_throughput;        // offset 192
+    float* unguided_throughput;          // offset 192 (float, state_template.h:65)
     float3*  pass_diffuse_weight;        // offset 200
-    uint64_t pass_glossy_weight;         // offset 208
-    uint64_t denoising_feature_throughput;// offset 216
+    float3*  pass_glossy_weight;         // offset 208 (PackedSpectrum, :68)
+    float3*  denoising_feature_throughput;// offset 216 (PackedSpectrum, :70)
     uint*    shader_sort_key;            // offset 224
 };                                       // size 232
 
@@ -131,15 +145,15 @@ struct IntegratorStateRay
     float*  tmin;        // offset 32
     float*  tmax;        // offset 40
     float*  time;        // offset 48
-    uint64_t previous_dt; // offset 56
+    float* previous_dt; // offset 56 (state_template.h:86)
 };                        // size 64
 
 /* state_template.h:92-99, 6 pointer members -> 48 bytes */
 struct IntegratorStateIsect
 {
     float* t;      // offset 0
-    uint64_t u;    // offset 8
-    uint64_t v;    // offset 16
+    float* u;      // offset 8  (state_template.h:94)
+    float* v;      // offset 16 (state_template.h:95)
     int*  prim;    // offset 24
     int*  object;  // offset 32
     int*  type;    // offset 40
@@ -148,10 +162,10 @@ struct IntegratorStateIsect
 /* state_template.h:103-108, 4 pointer members -> 32 bytes */
 struct IntegratorStateSubsurface
 {
-    uint64_t albedo;   // offset 0
-    uint64_t radius;   // offset 8
-    uint64_t anisotropy;// offset 16
-    uint64_t N;        // offset 24
+    float3* albedo;   // offset 0  (PackedSpectrum, state_template.h:104)
+    float3* radius;   // offset 8  (PackedSpectrum, state_template.h:105)
+    float*  anisotropy;// offset 16 (float, state_template.h:106)
+    float3* N;        // offset 24 (packed_float3, state_template.h:107)
 };                     // size 32
 
 /* state_template.h:112-117, 2 array members x MAX_VOLUME_STACK_SIZE (32,
@@ -181,51 +195,58 @@ struct IntegratorStateVolumeStack
  * defined: state_template.h:123-129) */
 struct IntegratorStateGuiding
 {
-    uint64_t path_segment;                    // offset 0
-    uint64_t use_surface_guiding;             // offset 8
-    uint64_t sample_surface_guiding_rand;     // offset 16
-    uint64_t surface_guiding_sampling_prob;   // offset 24
-    uint64_t bssrdf_sampling_prob;            // offset 32
-    uint64_t use_volume_guiding;              // offset 40
-    uint64_t sample_volume_guiding_rand;      // offset 48
-    uint64_t volume_guiding_sampling_prob;    // offset 56
+    /* path_segment: state.h:170 makes the host member `uint64_t *path_segment`
+     * (state_template.h:129, non-openpgl branch) — a device pointer to 8-byte
+     * elements. uint2* keeps that exact 8-byte element stride without
+     * OpCapability Int64 (SwiftShader has no shaderInt64). The element is
+     * never dereferenced: KERNEL_FEATURE_PATH_GUIDING gates all users off. */
+    uint2*  path_segment;                    // offset 0
+    Subword8T*  use_surface_guiding;         // offset 8  (bool, state_template.h:132)
+    float*  sample_surface_guiding_rand;     // offset 16 (float, :135)
+    float*  surface_guiding_sampling_prob;   // offset 24 (float, :137)
+    float*  bssrdf_sampling_prob;            // offset 32 (float, :139)
+    Subword8T*  use_volume_guiding;          // offset 40 (bool, :141)
+    float*  sample_volume_guiding_rand;      // offset 48 (float, :144)
+    float*  volume_guiding_sampling_prob;    // offset 56 (float, :146)
 };                                             // size 64
 
 /* state_template.h:151-156, 3 pointer members -> 24 bytes */
 struct IntegratorStateShadowLink
 {
-    uint64_t dedicated_light_weight; // offset 0
-    uint64_t last_isect_prim;        // offset 8
-    uint64_t last_isect_object;      // offset 16
+    float* dedicated_light_weight; // offset 0  (state_template.h:152)
+    int*   last_isect_prim;        // offset 8  (state_template.h:154)
+    int*   last_isect_object;      // offset 16 (state_template.h:155)
 };                                   // size 24
 
 /* shadow_state_template.h:7-74, 24 pointer members -> 192 bytes */
 struct IntegratorStateShadowPath
 {
     uint*    render_pixel_index;               // offset   0
-    uint64_t sample;                           // offset   8
-    uint64_t rng_pixel;                        // offset  16
-    uint64_t rng_offset;                       // offset  24
-    uint64_t bounce;                           // offset  32
-    uint64_t transparent_bounce;               // offset  40
-    uint64_t diffuse_bounce;                   // offset  48
-    uint64_t glossy_bounce;                    // offset  56
-    uint64_t transmission_bounce;              // offset  64
-    uint64_t volume_bounds_bounce;             // offset  72
-    uint64_t portal_bounce;                    // offset  80
+    uint*    sample;                          // offset   8 (uint32_t, shadow_state_template.h:11)
+    uint*    rng_pixel;                       // offset  16 (uint32_t, :13)
+    Subword16T* rng_offset;                   // offset  24 (uint16_t, :15)
+    Subword16T* bounce;                       // offset  32 (uint16_t, :17)
+    Subword16T* transparent_bounce;           // offset  40 (uint16_t, :19)
+    Subword16T* diffuse_bounce;               // offset  48 (uint16_t, :21)
+    Subword16T* glossy_bounce;                // offset  56 (uint16_t, :23)
+    Subword16T* transmission_bounce;          // offset  64 (uint16_t, :25)
+    Subword16T* volume_bounds_bounce;         // offset  72 (uint16_t, :27)
+    Subword16T* portal_bounce;                // offset  80 (uint16_t, :29)
     Subword16T* queued_kernel;                 // offset  88
-    uint64_t visibility;                       // offset  96
+    Subword8T*  visibility;                    // offset  96 (uint8_t, :33)
     uint*    flag;                             // offset 104
     float3*  throughput;                       // offset 112
-    uint64_t unshadowed_throughput;            // offset 120
-    uint64_t pass_diffuse_weight;              // offset 128
-    uint64_t pass_glossy_weight;               // offset 136
-    uint64_t packed_num_hits;                  // offset 144
+    float3*  unshadowed_throughput;            // offset 120 (PackedSpectrum, :40)
+    float3*  pass_diffuse_weight;              // offset 128 (PackedSpectrum, :44)
+    float3*  pass_glossy_weight;               // offset 136 (PackedSpectrum, :45)
+    Subword16T* packed_num_hits;               // offset 144 (uint16_t, :51)
     Subword8T*  lightgroup;                    // offset 152
-    uint64_t unlit_throughput;                 // offset 160
-    uint64_t path_segment;                     // offset 168
-    uint64_t guiding_light_linking_mis_weight; // offset 176
-    uint64_t bsdf_eval_average;                // offset 184
+    float3*  unlit_throughput;                 // offset 160 (PackedSpectrum, :55)
+    /* Same uint64_t-element pointer as guiding.path_segment (state.h:170 with
+     * shadow_state_template.h:62) -> uint2* keeps the 8-byte stride, no Int64. */
+    uint2*  path_segment;                      // offset 168
+    float*  guiding_light_linking_mis_weight;  // offset 176 (float, :65)
+    float*  bsdf_eval_average;                 // offset 184 (float, :72)
 };                                             // size 192
 
 /* shadow_state_template.h:78-88, 9 pointer members -> 72 bytes */
@@ -234,12 +255,12 @@ struct IntegratorStateShadowRay
     float3* P;                // offset 0
     float3* D;                // offset 8
     float*  tmin;             // offset 16
-    uint64_t tmax;            // offset 24
-    uint64_t time;            // offset 32
-    uint64_t dP;              // offset 40
-    uint64_t dD;              // offset 48
-    uint64_t self_light_object;// offset 56
-    uint64_t self_light_prim;  // offset 64
+    float* tmax;             // offset 24 (shadow_state_template.h:82)
+    float* time;             // offset 32 (shadow_state_template.h:83)
+    float3* dP;              // offset 40 (packed_float3, :84)
+    float3* dD;              // offset 48 (packed_float3, :85)
+    int*  self_light_object; // offset 56 (int, :86)
+    int*  self_light_prim;   // offset 64 (int, :87)
 };                             // size 72
 
 /* shadow_state_template.h:94-103, 6 array members x INTEGRATOR_SHADOW_ISECT_SIZE_GPU
@@ -254,11 +275,11 @@ struct IntegratorStateShadowRay
 struct IntegratorStateShadowIsectElement
 {
     float*  t;      // offset 0  (device_ptr -> float[])
-    uint64_t u;     // offset 8  (device_ptr -> float[])
-    uint64_t v;     // offset 16 (device_ptr -> float[])
-    uint64_t prim;  // offset 24 (device_ptr -> int[])
+    float*  u;      // offset 8  (device_ptr -> float[], shadow_state_template.h:96)
+    float*  v;      // offset 16 (device_ptr -> float[], :97)
+    int*    prim;   // offset 24 (device_ptr -> int[],    :98)
     int*  object;   // offset 32 (device_ptr -> int[])
-    uint64_t type;  // offset 40 (device_ptr -> int[])
+    int*    type;   // offset 40 (device_ptr -> int[],    :100)
 };                   // size 48
 
 struct IntegratorStateShadowIsect
@@ -279,6 +300,17 @@ struct IntegratorStateShadowVolumeStack
     IntegratorStateShadowVolumeStackElement slot[32]; // offset 0, 32*16 = 512 bytes
 };                                                    // size 512
 
+/* state.h:100-103: struct IntegratorQueueCounter { int num_queued[18];
+ * int cache_miss; }. Mirrored so queue_counter below can be a TYPED pointer
+ * (a uint64_t* pointee would re-introduce OpCapability Int64). The pointee is
+ * never touched by the gate. DEVICE_GPU_KERNEL_INTEGRATOR_NUM = 18
+ * (types.h:1745-1763,1827). */
+struct IntegratorQueueCounter
+{
+    int num_queued[18]; // offset 0, 72 bytes
+    int cache_miss;     // offset 72, size 76
+};
+
 /* IntegratorStateGPU itself (source: src/kernel/integrator/state.h:140-213).
  * 265 pointer members = 2120 bytes + uint sort_partition_divisor (state.h:212)
  * = 2124, padded to 2128 by the struct's 8-byte alignment. Locked by
@@ -296,11 +328,11 @@ struct IntegratorStateGPU
     IntegratorStateShadowRay shadow_ray;              // offset 1168
     IntegratorStateShadowIsect shadow_isect;          // offset 1240
     IntegratorStateShadowVolumeStack shadow_volume_stack;// offset 1432
-    uint64_t queue_counter;                           // offset 1944 // state.h:197
-    uint64_t sort_key_counter[18];                    // offset 1952 // state.h:200, DEVICE_GPU_KERNEL_INTEGRATOR_NUM = 18 (types.h:1745-1763,1827)
-    uint64_t next_shadow_path_index;                  // offset 2096 // state.h:203
-    uint64_t next_main_path_index;                    // offset 2104 // state.h:206
-    uint64_t sort_partition_key_offsets;              // offset 2112 // state.h:209
+    IntegratorQueueCounter* queue_counter;    // offset 1944 // state.h:197
+    int*    sort_key_counter[18];             // offset 1952 // state.h:200: `int *sort_key_counter[18]` — an ARRAY OF 18 int pointers (18*8 = 144 bytes)
+    int*    next_shadow_path_index;           // offset 2096 // state.h:203
+    int*    next_main_path_index;             // offset 2104 // state.h:206
+    int*    sort_partition_key_offsets;       // offset 2112 // state.h:209
     uint sort_partition_divisor;                      // offset 2120 // state.h:212
     /* MSVC pads the struct to its 8-byte alignment (2124 -> 2128); slangc
      * 2026.17 reports sizeof WITHOUT that tail padding (observed: 2124), so

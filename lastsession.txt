@@ -192,7 +192,10 @@ OPEN ITEMS / NEXT SESSION:
     probe (tracked file, modified, uncommitted).
   - researcher/ shows tracked DELETIONS (m5kernel.txt, roadmap.md,
     upscaler.md, m7-*notes.md, m8-upscaler.txt, LASTOUTPUT1023.txt) —
-    NOT made by this session; left alone for the user to review.
+    INTENTIONAL, per the user 2026-10-24: those files contained
+    HALLUCINATED research. Do not restore or flag them. The surviving
+    files (m5-area_light.md, m6-image_texture.txt,
+    m6_materials_texture_lights.md, m7-blender_integration.md) were kept.
   - INIT_FROM_CAMERA port was NOT part of this task (still pending).
 
 FILES (as of end of session — `git status --porcelain`, nothing committed):

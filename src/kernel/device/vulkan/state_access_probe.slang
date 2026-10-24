@@ -136,9 +136,15 @@ void state_access_main(uint3 tid : SV_DispatchThreadID)
      * a float4* view of the SAME address -> elements land at byte 16*s
      * instead of 12*s, and bytes 12s+12..15 clobber the next element. */
     if (mode == 1u) {
-        uint64_t a = uint64_t(ist->path.throughput);
+        /* M4e S1b-7: bitcast the POINTER directly (float3* -> float4*).
+         * The previous form went through uint64_t(ist->path.throughput), which
+         * emits OpConvertPtrToU + OpCapability Int64 — SwiftShader supports
+         * neither (gate_swiftshader.log: "Unsupported capability 11",
+         * "UNREACHABLE ... ConvertPtrToU" -> 0xC00000FD). A pointer-to-pointer
+         * OpBitcast is valid SPIR-V on its own and needs no 64-bit type. */
+        float3* p = ist->path.throughput;
         float4* f4 = spirv_asm {
-            result: $$float4* = OpBitcast $a;
+            result: $$float4* = OpBitcast $p;
         };
         f4[s] = float4(gbits3(15u, 0u, s), 0.0);            // FAULT: stride 16
     }
