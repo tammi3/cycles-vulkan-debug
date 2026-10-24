@@ -1,11 +1,111 @@
-M4e S1b-6 SESSION (Stage B: state accessors + gate) — 2026-10-23
+M4e S1b-6 SESSION (Stage B: state accessors + gate) — 2026-10-23/24
 ========================================================================
-STATUS: TASK 1 DESIGN PROVEN + DOCUMENTED, but integrator_state.slang DOES
-NOT COMPILE YET (uses unavailable cast<>). Tasks 2-6 NOT started (DIVERGENCES
-entry, gate, negatives, validation). Context ran short per the escape hatch;
-stopped cleanly at a well-defined next step. NEG1 waiver (S1b-2) still below.
+STATUS: ALL STEPS A-F COMPLETE. Tasks 1-6 done: mirror retyped; 42+42
+accessors compile + validate; ABI probe re-run after retype = ALL MATCH;
+DIVERGENCES.md created; GATE (task 3) PASSED on RX 570; all 4 negatives
+(a-d) DETECTED (task 4); validation/layer proof captured (task 5);
+report delivered (task 6).
+NEG1 waiver (S1b-2): its text is no longer in this file's tail — recovered
+from git blob 38b623985 and summarized in the NOTE near the bottom of this
+block.
 
-*** CRITICAL DISCOVERY THIS SESSION (blocks task 1 compile) ***
+STEP F DONE THIS SESSION (tasks 3-6):
+  F1. kernels.cpp: vulkan_state_access_probe() (~line 721-1345), env
+      CYCLES_VULKAN_STATE_ACCESS_PROBE=1 + _SPV path,
+      CYCLES_VULKAN_STATE_ACCESS_MODE=0..4 optional restriction.
+      queue.cpp: declaration + call after vulkan_subword_check.
+      Host: 188 slices (9384 bytes) = one per Cycles SoA member the
+      accessors reach, each GATE_STATES(8) elements + 16-byte 0x5C canary,
+      payload 0xEE; real IntegratorStateGPU uploaded (pointers = slice
+      device addresses, memcpy shape of path_trace_work_gpu.cpp:153-155);
+      push {u64 ist, u64 out, u32 mode, u32 pad} = 24 bytes; mode loop
+      resets command pool AND fence each iteration.
+  F2. NEGATIVES ALL DETECTED on RX 570 (gate_run3.log, cycles.exe exit 0):
+      mode 0 clean: payload mismatches=0 / 188 slices x 8 states,
+        bad canaries=0, readback acc OK => PASS (negative precondition).
+      mode 1 (16-byte stride on packed3) : 58 bytes diff, canary hit,
+        stride-16 shift signature => DETECTED.
+      mode 2 (4-byte store into uint16)  : 27 bytes diff,
+        "expected 0103 got 0040" => DETECTED.
+      mode 3 (wrong AoS stride vol.stack): 184 bytes diff,
+        expected slots read eeeeeeee => DETECTED.
+      mode 4 (non-atomic sub-word RMW)   : 16 bytes diff,
+        lost-update signature (even states garbage, odd states eeee) => DETECTED.
+      Final line: "ALL CHECKS PASSED".
+  F3. Task 5: 0 lines matching VUID-|Validation Error|Validation Warning;
+      loader logged "Insert instance layer VK_LAYER_KHRONOS_validation
+      (...VkLayer_khronos_validation.dll)"; driver "Radeon RX 570 Series"
+      (amdvlk64.dll); slangc+spirv-val exit 0 for state_access_probe
+      (default AND narrow) and abi_probe; every VkResult in the new host
+      code checked (vkGetBufferDeviceAddress checked via addr==0, added
+      this session; void-returning vk* calls have no result to check).
+  F4. Report delivered: diff, UNVERIFIED ASSUMPTIONS, commands+output,
+      files left for git.
+  TWO HOST BUGS FOUND+FIXED during F (both in my new code, first run):
+    (1) canary init: whole buffer was memset 0xEE so canaries were never
+        0x5C -> soa_init() now fills payload and canary regions separately.
+    (2) reused fence stayed SIGNALED -> premature vkWaitForFences read
+        0xEE in modes 1-4 + VUID-vkQueueSubmit-fence-00063 x4 ->
+        vkResetFences before every submit.
+  CAPTURE TRAP (evidence): PowerShell `*>`/`Select-String` treats native
+    STDERR as error records and WORD-WRAPS them at ~120 cols (phantom
+    line breaks like "got \\r\\neeeeeeee"), and writes UTF-16 logs. Use
+    cmd /c "cycles.exe ... 1>\"log\" 2>&1" for raw ANSI logs.
+  RUN: CYCLES_VULKAN_STATE_ACCESS_PROBE=1, _SPV=<spv>,
+    CYCLES_VULKAN_ALLOW_NO_KERNELS=1, VK_INSTANCE_LAYERS=
+    VK_LAYER_KHRONOS_validation, VK_LOADER_DEBUG=layer, VK_ICD_FILENAMES
+    unset (RX 570). Logs: $env:LOCALAPPDATA\Temp\opencode\gate_run3.log
+    (final), gate_run2.log, abi_rerun.log.
+
+A-E DONE THIS SESSION (commands + output shown in-session):
+  A. vulkan_data.slang: members reached by the accessors retyped
+     uint64_t -> typed pointers (IntegratorStatePath/Ray/Isect/
+     VolumeStackElement/ShadowPath/ShadowRay/ShadowIsectElement/
+     ShadowVolumeStackElement). Members NOT yet reached stay uint64_t
+     (retype-on-landing rule). Added VULKAN_SUBWORD_NARROW macro
+     (default 0) + Subword16T/Subword8T typedefs (uint word view by
+     default, uint16_t/uint8_t element view when 1).
+  B. integrator_state.slang rewritten: 42 read + 42 write accessors
+     over IntegratorStateGPU* ist (verified by grep count); sub-word via
+     load/store_u16/u8/bool helpers (atomic AND/OR word fallback by
+     default); AoS via &ist-><group>.slot[0] then dynamic index on the
+     LOCAL base; aos_soa_ptr()/cast<> removed.
+  C. abi_probe.slang: the 4 typed reads wrapped in uint64_t(...).
+  D. state_access_probe.slang NEW (gate shader: calls ALL 42+42, 8
+     states on tid.x, AoS at non-zero slots, test_mode 1-4 faults).
+       default : slangc exit 0, spirv-val exit 0
+       narrow (-D VULKAN_SUBWORD_NARROW=1): slangc exit 0, spirv-val 0
+                 (2 warnings, both inside the intentional fault lines)
+       default disasm: capabilities = PhysicalStorageBufferAddresses,
+                 Int64, Shader (NO Int16/Int8); OpAtomicAnd=8 OpAtomicOr=8;
+                 ArrayStride 12 (v3float), 16 (volume_stack element),
+                 48 (shadow_isect element), 2128 (IntegratorStateGPU);
+                 OpPtrAccessChain = 109; 1510 disasm lines.
+       narrow disasm: + Int16 + Int8, OpAtomicAnd = 0.
+     abi_probe.slang also recompiles clean after the retype.
+  E. DIVERGENCES.md NEW — entry 1: atomic sub-word word-fallback (why:
+     RX 570 dyn-index-on-fixed-array driver rule + SwiftShader
+     Int16/Int8 crash + shared-word races; result-PRESERVING; speedup
+     NOT yet measured, narrow-vs-fallback timing deferred to post-M5;
+     flags the "faithful should be default" policy inversion for the
+     user to re-decide after measurement).
+  ABI PROBE RE-RUN on RX 570 with freshly compiled abi_probe.spv:
+     ALL VALUES MATCH; sizeof(KernelParamsVulkan) GPU=HOST=0x1400,
+     sizeof(IntegratorStateGPU) GPU=HOST=0x850; typed-vs-raw
+     @2984/3384/4304/4440 MATCH; sentinel MATCH; 0 lines matching
+     VUID-|Validation Error|Validation Warning|[ERROR]; loader logged
+     "Insert instance layer VK_LAYER_KHRONOS_validation"; exit 0.
+
+GATE DEVICE DECISION (evidence-based, user chose "decide after evidence"):
+  the gate probe is RX 570-ONLY. Even an UNREAD uint64_t member forces
+  OpCapability Int64 (%Path_natural = OpTypeStruct %ulong ... is emitted),
+  and SwiftShader crashes on Int64 (0xC00000FD). A full-mirror retype to
+  unlock SwiftShader is a MILESTONE-LEVEL decision, not taken here.
+  spirv_asm { result: $$float4* = OpBitcast $a; } DOES compile+validate
+  (used ONLY by negative mode 1); bitcast<>() is undefined (E30015) and
+  $float3* is a parse error.
+
+*** CRITICAL DISCOVERY (part 1 of this session; RESOLVED by steps A-C) ***
 `cast<T[]>` / `cast<T*>` are UNAVAILABLE in slangc 2026.17-25-gc7954ebd1
 (error[E30015]: undefined identifier 'cast'). bvh2.slang / path_trace.slang
 use cast<> and DO NOT COMPILE STANDALONE with this toolchain — treat them as
@@ -14,11 +114,11 @@ either: functional `T*(addr)` parses as multiplication (E39999); `T*(addr)`
 and reinterpret forms fail. Only the REVERSE works: `uint64_t(typed_ptr)`
 compiles (recover a raw address FROM a typed pointer).
 
-=> The SoA members in vulkan_data.slang are stored as `uint64_t`, but to INDEX
-   them as arrays they MUST be TYPED device pointers (uint*/float3*/float*/
-   int*/uint16_t*/uint8_t*). A typed pointer is 8 bytes = uint64_t, so byte
-   layout and ALL ABI-probe offsets are UNCHANGED. This retype is the exact
-   next step to make the accessors compile.
+=> RESOLVED (step A of this session): the SoA members in vulkan_data.slang
+   were stored as `uint64_t`, but to INDEX them as arrays they MUST be TYPED
+   device pointers (uint/float3/float/int/uint16_t/uint8_t POINTERS). A typed
+   pointer is 8 bytes = uint64_t, so byte layout and ALL ABI-probe offsets are
+   UNCHANGED (re-verified: ABI probe re-run after the retype = ALL MATCH).
 
 PROVEN PATTERNS (all slangc + spirv-val exit 0, cast_test.slang this session):
   1. Scalar/sub-word/packed3 SoA: load a TYPED pointer member from the struct
@@ -47,37 +147,91 @@ sizeof(IntegratorStateGPU)=0x850=2128, sizeof(KernelParamsVulkan)=0x1400=5120,
 0 VUID. (SwiftShader still crashes 0xC00000FD on OpCapability Int64 — pre-existing
 BDA limitation; ABI-probe-style kernels are RX 570-only by design.)
 
-NEXT TASK (exact steps to finish task 1):
-  A. Retype the SoA members used by the accessors in vulkan_data.slang from
-     uint64_t to typed pointers (uint*/float3*/float*/int*/uint16_t*/uint8_t*),
-     per the accessor file's usage. Layout unchanged.
-  B. In integrator_state.slang, replace every
-       `let data_ptr = params->...m; return cast<T[]>(data_ptr)[state];`
-     with `T* data_ptr = params->...m; return data_ptr[state];`
-     (and `cast<T[]>(data_ptr)[state] = v;` -> `data_ptr[state] = v;`).
-     AoS members use the &slot[0] base-pointer pattern (proven #2).
-     Sub-word (uint16/uint8/bool) keep the atomic AND/OR word fallback via a
-     `uint*` word view (default portable); load via 32-bit load+shift/mask.
-     Remove the aos_soa_ptr() helper (it uses cast<uint64_t[]>); replace with
-     the &slot[0] pattern.
-  C. Fix the 3 ABI-probe reads in abi_probe.slang (render_pixel_index@90,
-     shadow_isect.slot[1].object@108, shadow_volume_stack.slot[1].shader@115)
-     to wrap in `uint64_t(...)` so they still compile after the retype.
-  D. slangc + spirv-val integrator_state.slang (as a module; it has no entry —
-     compile it included by a small probe entry, or add a dummy probe entry).
-  E. Task 2: DIVERGENCES.md entry for the atomic sub-word fallback.
-  F. Tasks 3-6: gate (Cycles-sized state memory, distinct values at non-constant
-     indices / AoS non-zero slots / adjacent sub-word states from different
-     threads, exact byte offsets + canaries, float3 stride-12-from-struct),
-     negatives (a) 16-byte stride, (b) 4-byte store into uint16, (c) wrong AoS
-     stride, (d) non-atomic sub-word store, and full validation/layer proof.
+STEP F (tasks 3-6) COMPLETED — results + evidence are in the STATUS
+  block at the top of this file. What was done, in order:
+  F1. Task 3 host: replicate Cycles' state allocator sizing
+      (src/integrator/path_trace_work_gpu.cpp:143-201, one
+      device_only_memory<type> per KERNEL_STRUCT_MEMBER, max_num_paths
+      elements) for 8 paths; allocate each SoA buffer + the AoS slot
+      arrays; fill IntegratorStateGPU + KernelParamsVulkan via the SAME
+      byte offsets the static_asserts lock. Wire a dispatch exactly like
+      vulkan_abi_probe (kernels.cpp:356, queue.cpp:71-75): env gate
+      CYCLES_VULKAN_STATE_ACCESS_PROBE=1 (+ _SPV path), no C++ logic
+      changes. Recompute gbits/gbits3 on the host and compare RAW bytes
+      at every accessor's exact offset for state 0..7, AoS slots
+      1/2/31 (vs), plus canaries after each allocation; check pc.out[s].
+  F2. Task 4 negatives: run test_mode 1 (float4 stride-16 on
+      throughput), 2 (4-byte store into uint16 field), 3 (AoS element
+      i*2 = wrong stride), 4 (non-atomic RMW on shared uint16 word).
+      A negative counts as DETECTED only if its output differs from the
+      CLEAN run of the same configuration (AGENTS.md 11). Modes 2/4
+      spell their fault through Subword16T* => only valid in DEFAULT
+      mode (documented in the probe header); if any is NOT detected,
+      report it as such — do not tune it into detection.
+  F3. Task 5 validation: layer proven active (VK_LOADER_DEBUG=layer +
+      "Insert instance layer VK_LAYER_KHRONOS_validation" in log), 0
+      VUID-/Validation lines, slangc+spirv-val exit 0 (already have
+      these for the shaders), every VkResult checked in the NEW host
+      code.
+  F4. Report: diff, UNVERIFIED ASSUMPTIONS, exact commands + captured
+      output, files left for git — DELIVERED in-session.
+  BUILD NOTE: this session added host C++ (kernels.cpp gate +
+      queue.cpp wiring); `cmake --build build --config Release --target
+      cycles -- /m` exits 0; only those two files change => fast
+      incremental builds (slangc is NOT part of the build: compile the
+      probes by hand, see below).
 
-FILES (untracked, for git cleanup): integrator_state.slang (NEW, non-compiling),
-cast_test.slang, stride_probe.slang (throwaway probes), subword_word.slang,
-subword_narrow.slang, stride_check.slang, dynindex_repro*.slang, math_core/
-math_probe/kdata_probe/bsdf_probe.slang; MODIFIED kernels.cpp, queue.cpp,
-device.cpp, abi_probe.slang, vulkan_data.slang, traverse_probe.slang,
-device_impl.h, lastsession.txt; stale traverse_*.spv + path_trace/bvh2 slangs.
+OPEN ITEMS / NEXT SESSION:
+  - The gate is RX 570-ONLY: an UNREAD uint64_t mirror member still
+    forces OpCapability Int64, and SwiftShader crashes on Int64. A
+    full-mirror retype to unlock SwiftShader is a milestone-level
+    decision, NOT taken — ask the user.
+  - DIVERGENCES.md entry 1 has no timing yet (narrow vs atomic,
+    post-M5) and divergences from earlier milestones are not inventoried.
+  - cast_test.slang was REPURPOSED this session as the Int64-evidence
+    probe (tracked file, modified, uncommitted).
+  - researcher/ shows tracked DELETIONS (m5kernel.txt, roadmap.md,
+    upscaler.md, m7-*notes.md, m8-upscaler.txt, LASTOUTPUT1023.txt) —
+    NOT made by this session; left alone for the user to review.
+  - INIT_FROM_CAMERA port was NOT part of this task (still pending).
+
+FILES (as of end of session — `git status --porcelain`, nothing committed):
+  NEW untracked  : src/kernel/device/vulkan/state_access_probe.slang,
+                   DIVERGENCES.md
+  modified       : src/device/vulkan/kernels.cpp (gate host +),
+                   src/device/vulkan/queue.cpp (declaration + call),
+                   src/kernel/device/vulkan/vulkan_data.slang,
+                   src/kernel/device/vulkan/integrator_state.slang,
+                   src/kernel/device/vulkan/abi_probe.slang,
+                   src/kernel/device/vulkan/cast_test.slang (REPURPOSED
+                   as the Int64-evidence probe this session),
+                   lastsession.txt
+  deleted (NOT this session — user side, left alone):
+                   researcher/{LASTOUTPUT1023.txt, m5kernel.txt,
+                   m7-blender-integration-notes.md,
+                   m7-upscaling-notes.md, m8-upscaler.txt, roadmap.md,
+                   upscaler.md}
+  pre-existing tracked throwaways the user may want to clean later:
+                   stride_probe.slang, stride_check.slang,
+                   subword_word.slang, subword_narrow.slang,
+                   dynindex_repro*.slang, math_*/kdata_*/bsdf_probe.slang,
+                   stale traverse_*.spv + path_trace/bvh2 slangs.
+
+NOTE (recovered from git blob 38b623985, since this file's tail no longer
+contains the NEG1 waiver): NEG1 (M4c "skip instance pop") has NEVER been
+detected in any recorded run — instance2.xml (S1b-0: NOT DETECTED,
+TIES=886) and instance3.xml (NOT DETECTED, TIES=0); run9 showed 0/16384
+pixels changed by the fault. It is a negative-test-VISIBILITY limitation
+of the scene/camera (no ray traverses extra top-level nodes after an
+instance pop within post-hit tmax), NOT a traversal-correctness bug —
+traversal matched the reference exactly. Harness NOT touched; if it ever
+matters it needs its own task (a scene where skip-pop is observable).
+instance3.xml is the cleaner gate scene (TIES 0 vs 886).
+
+USER NOTES: files are unfrozen only to progress or fix glaring issues —
+never to brute-force a compile/debug pass; when in doubt STOP and ask.
+./researcher/m6-image-texute.txt holds research flagged by the user for
+future M6 (image/texture) milestones.
 
 ========================================================================
 M4e S1b-5 SESSION (Stage B: state accessors + gate) — 2026-10-23

@@ -56,62 +56,93 @@ struct KernelDataBlob
  * src/kernel/integrator/state_template.h and shadow_state_template.h; the
  * offsets in the comments are relative to the start of IntegratorStateGPU. */
 
+/* M4e S1b-6: SoA address members that the state ACCESSORS index (see
+ * integrator_state.slang) are declared as TYPED device pointers instead of
+ * uint64_t. A typed pointer is 8 bytes with 8-byte alignment — identical to
+ * uint64_t — so every offset and sizeof in this file is UNCHANGED (the M4b/M4e
+ * host static_asserts and the runtime ABI probe lock that). Members not yet
+ * reached by an accessor stay uint64_t. Note: even an UNREAD uint64_t member
+ * forces SPIR-V OpCapability Int64 (proven: a struct with one unused uint64
+ * member still emits %ulong + Int64), so kernels that load through this mirror
+ * are RX 570-only, exactly like the ABI probe. SwiftShader would additionally
+ * require every uint64_t in the reachable structs to become a typed pointer —
+ * a milestone-level decision, recorded in lastsession.txt (M4e S1b-6). */
+
+/* Sub-word (uint16/uint8/bool) SoA view type, switched by the same macro the
+ * accessors use (VULKAN_SUBWORD_NARROW, default 0). Default: a uint* WORD view
+ * (2 uint16 or 4 uint8 elements per 32-bit word) for the portable atomic
+ * AND/OR fallback — no Int16/Int8 capability needed. Narrow mode: the true
+ * element pointer (uint16_t or uint8_t POINTERS, requires shaderInt16/shaderInt8; the
+ * accessor layer's store/load_u16/u8 switch in lockstep). Both views address
+ * the same buffer the host allocated as uint16_t/uint8_t (path_trace_work_gpu.cpp),
+ * only the Slang-side VIEW differs. */
+#ifndef VULKAN_SUBWORD_NARROW
+#define VULKAN_SUBWORD_NARROW 0
+#endif
+#if VULKAN_SUBWORD_NARROW
+typedef uint16_t Subword16T;
+typedef uint8_t  Subword8T;
+#else
+typedef uint     Subword16T;
+typedef uint     Subword8T;
+#endif
+
 /* state_template.h:7-74, 29 pointer members -> 232 bytes */
 struct IntegratorStatePath
 {
-    uint64_t render_pixel_index;         // offset   0
-    uint64_t sample;                     // offset   8
-    uint64_t bounce;                     // offset  16
-    uint64_t transparent_bounce;         // offset  24
+    uint*    render_pixel_index;         // offset   0
+    uint*    sample;                     // offset   8
+    Subword16T* bounce;                  // offset  16
+    Subword16T* transparent_bounce;      // offset  24
     uint64_t diffuse_bounce;             // offset  32
     uint64_t glossy_bounce;              // offset  40
     uint64_t transmission_bounce;        // offset  48
     uint64_t volume_bounce;              // offset  56
     uint64_t volume_bounds_bounce;       // offset  64
     uint64_t portal_bounce;              // offset  72
-    uint64_t queued_kernel;              // offset  80
+    Subword16T* queued_kernel;           // offset  80
     uint64_t rng_pixel;                  // offset  88
-    uint64_t rng_offset;                 // offset  96
-    uint64_t visibility;                 // offset 104
-    uint64_t flag;                       // offset 112
-    uint64_t mnee;                       // offset 120
+    Subword16T* rng_offset;              // offset  96
+    Subword8T*  visibility;              // offset 104
+    uint*    flag;                       // offset 112
+    Subword8T*  mnee;                    // offset 120
     uint64_t mnee_shadow_state;          // offset 128
-    uint64_t optical_depth;              // offset 136
-    uint64_t mis_ray_pdf;                // offset 144
+    float*   optical_depth;              // offset 136
+    float*   mis_ray_pdf;                // offset 144
     uint64_t mis_ray_object;             // offset 152
-    uint64_t mis_origin_n;               // offset 160
-    uint64_t min_ray_pdf;                // offset 168
-    uint64_t continuation_probability;   // offset 176
-    uint64_t throughput;                 // offset 184
+    float3*  mis_origin_n;               // offset 160
+    float*   min_ray_pdf;                // offset 168
+    float*   continuation_probability;   // offset 176
+    float3*  throughput;                 // offset 184
     uint64_t unguided_throughput;        // offset 192
-    uint64_t pass_diffuse_weight;        // offset 200
+    float3*  pass_diffuse_weight;        // offset 200
     uint64_t pass_glossy_weight;         // offset 208
     uint64_t denoising_feature_throughput;// offset 216
-    uint64_t shader_sort_key;            // offset 224
+    uint*    shader_sort_key;            // offset 224
 };                                       // size 232
 
 /* state_template.h:78-87, 8 pointer members -> 64 bytes */
 struct IntegratorStateRay
 {
-    uint64_t P;           // offset 0
-    uint64_t dP;          // offset 8
-    uint64_t D;           // offset 16
-    uint64_t dD;          // offset 24
-    uint64_t tmin;        // offset 32
-    uint64_t tmax;        // offset 40
-    uint64_t time;        // offset 48
+    float3* P;           // offset 0
+    float*  dP;          // offset 8
+    float3* D;           // offset 16
+    float*  dD;          // offset 24
+    float*  tmin;        // offset 32
+    float*  tmax;        // offset 40
+    float*  time;        // offset 48
     uint64_t previous_dt; // offset 56
 };                        // size 64
 
 /* state_template.h:92-99, 6 pointer members -> 48 bytes */
 struct IntegratorStateIsect
 {
-    uint64_t t;      // offset 0
-    uint64_t u;      // offset 8
-    uint64_t v;      // offset 16
-    uint64_t prim;   // offset 24
-    uint64_t object; // offset 32
-    uint64_t type;   // offset 40
+    float* t;      // offset 0
+    uint64_t u;    // offset 8
+    uint64_t v;    // offset 16
+    int*  prim;    // offset 24
+    int*  object;  // offset 32
+    int*  type;    // offset 40
 };                   // size 48
 
 /* state_template.h:103-108, 4 pointer members -> 32 bytes */
@@ -136,8 +167,8 @@ struct IntegratorStateSubsurface
  * shape. Total size 32*16 = 512, unchanged from the old flat layout. */
 struct IntegratorStateVolumeStackElement
 {
-    uint64_t object; // offset 0 (device_ptr -> int[] for slot i)
-    uint64_t shader; // offset 8 (device_ptr -> int[] for slot i)
+    int* object; // offset 0 (device_ptr -> int[] for slot i)
+    int* shader; // offset 8 (device_ptr -> int[] for slot i)
 };                   // size 16
 
 struct IntegratorStateVolumeStack
@@ -171,7 +202,7 @@ struct IntegratorStateShadowLink
 /* shadow_state_template.h:7-74, 24 pointer members -> 192 bytes */
 struct IntegratorStateShadowPath
 {
-    uint64_t render_pixel_index;               // offset   0
+    uint*    render_pixel_index;               // offset   0
     uint64_t sample;                           // offset   8
     uint64_t rng_pixel;                        // offset  16
     uint64_t rng_offset;                       // offset  24
@@ -182,15 +213,15 @@ struct IntegratorStateShadowPath
     uint64_t transmission_bounce;              // offset  64
     uint64_t volume_bounds_bounce;             // offset  72
     uint64_t portal_bounce;                    // offset  80
-    uint64_t queued_kernel;                    // offset  88
+    Subword16T* queued_kernel;                 // offset  88
     uint64_t visibility;                       // offset  96
-    uint64_t flag;                             // offset 104
-    uint64_t throughput;                       // offset 112
+    uint*    flag;                             // offset 104
+    float3*  throughput;                       // offset 112
     uint64_t unshadowed_throughput;            // offset 120
     uint64_t pass_diffuse_weight;              // offset 128
     uint64_t pass_glossy_weight;               // offset 136
     uint64_t packed_num_hits;                  // offset 144
-    uint64_t lightgroup;                       // offset 152
+    Subword8T*  lightgroup;                    // offset 152
     uint64_t unlit_throughput;                 // offset 160
     uint64_t path_segment;                     // offset 168
     uint64_t guiding_light_linking_mis_weight; // offset 176
@@ -200,13 +231,13 @@ struct IntegratorStateShadowPath
 /* shadow_state_template.h:78-88, 9 pointer members -> 72 bytes */
 struct IntegratorStateShadowRay
 {
-    uint64_t P;                // offset 0
-    uint64_t D;                // offset 8
-    uint64_t tmin;             // offset 16
-    uint64_t tmax;             // offset 24
-    uint64_t time;             // offset 32
-    uint64_t dP;               // offset 40
-    uint64_t dD;               // offset 48
+    float3* P;                // offset 0
+    float3* D;                // offset 8
+    float*  tmin;             // offset 16
+    uint64_t tmax;            // offset 24
+    uint64_t time;            // offset 32
+    uint64_t dP;              // offset 40
+    uint64_t dD;              // offset 48
     uint64_t self_light_object;// offset 56
     uint64_t self_light_prim;  // offset 64
 };                             // size 72
@@ -222,12 +253,12 @@ struct IntegratorStateShadowRay
  * allocations, confirming the tuple-per-slot shape. Total size 4*48 = 192, unchanged. */
 struct IntegratorStateShadowIsectElement
 {
-    uint64_t t;      // offset 0  (device_ptr -> float[])
-    uint64_t u;      // offset 8  (device_ptr -> float[])
-    uint64_t v;      // offset 16 (device_ptr -> float[])
-    uint64_t prim;   // offset 24 (device_ptr -> int[])
-    uint64_t object; // offset 32 (device_ptr -> int[])
-    uint64_t type;   // offset 40 (device_ptr -> int[])
+    float*  t;      // offset 0  (device_ptr -> float[])
+    uint64_t u;     // offset 8  (device_ptr -> float[])
+    uint64_t v;     // offset 16 (device_ptr -> float[])
+    uint64_t prim;  // offset 24 (device_ptr -> int[])
+    int*  object;   // offset 32 (device_ptr -> int[])
+    uint64_t type;  // offset 40 (device_ptr -> int[])
 };                   // size 48
 
 struct IntegratorStateShadowIsect
@@ -239,8 +270,8 @@ struct IntegratorStateShadowIsect
  * struct { int *object; int *shader; } shadow_volume_stack[32]; 32*16 = 512 bytes. */
 struct IntegratorStateShadowVolumeStackElement
 {
-    uint64_t object; // offset 0 (device_ptr -> int[] for slot i)
-    uint64_t shader; // offset 8 (device_ptr -> int[] for slot i)
+    int* object; // offset 0 (device_ptr -> int[] for slot i)
+    int* shader; // offset 8 (device_ptr -> int[] for slot i)
 };                   // size 16
 
 struct IntegratorStateShadowVolumeStack

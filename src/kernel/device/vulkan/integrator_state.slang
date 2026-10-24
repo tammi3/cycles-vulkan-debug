@@ -1,26 +1,6 @@
 // SPDX-FileCopyrightText: 2011-2022 Blender Foundation
 // SPDX-License-Identifier: Apache-2.0
 
-/* !!! COMPILE STATUS: DOES NOT COMPILE YET (M4e S1b-6, context ran short) !!!
- *
- * Every accessor below currently uses `cast<T[]>`, which is UNAVAILABLE in
- * slangc 2026.17 (error E30015). To make this file compile, the next session
- * must, for each accessor:
- *   1. Retype the corresponding member in vulkan_data.slang from `uint64_t` to
- *      the TYPED device pointer (uint* / float3* / float* / int* / uint16_t* /
- *      uint8_t*). A typed pointer is 8 bytes = uint64_t, so byte layout and the
- *      ABI probe offsets are UNCHANGED.
- *   2. Replace `let data_ptr = params->...member; return cast<T[]>(data_ptr)[state];`
- *      with `T* data_ptr = params->...member; return data_ptr[state];`
- *      (load the typed pointer member, index it directly).
- *   3. For AoS members, use the proven base-pointer pattern:
- *        Elem* base = &params->...slot[0];  int* p = base[i].object;  p[state]=v;
- *   4. Fix the 3 ABI-probe reads in abi_probe.slang that load these members to
- *      wrap in `uint64_t(...)` (proven to compile).
- * The full proven design is documented in the header below and in
- * lastsession.txt (M4e S1b-6). float3* stride is 12 (confirmed by disassembly).
- */
-
 /* M4e S1b-6 Task 1: integrator state ACCESSORS (Slang equivalent of Cycles'
  * INTEGRATOR_STATE / INTEGRATOR_STATE_WRITE macros).
  *
@@ -39,749 +19,742 @@
  * 145-156, one device_only_memory<type> per KERNEL_STRUCT_MEMBER). Reading a
  * member = load its SoA data pointer, then index that pointer by `state`.
  *
- * addressing strategies, both chosen to satisfy the DEVICE RULE / SLANG RULE
- * (never inline-DYNAMIC-index a fixed array member reached through a device
- * pointer — that miscompiles to element 0 on the RX 570 driver):
+ * ADDRESSING (all three patterns compile+validate with slangc 2026.17 +
+ * spirv-val, proven in cast_test.slang, M4e S1b-6):
  *
- *  *** IMPORTANT, PROVEN THIS SESSION (M4e S1b-6) ***
- *  `cast<T[]>` / `cast<T*>` are UNAVAILABLE in slangc 2026.17 (error E30015,
- *  "undefined identifier 'cast'"). There is NO uint64->typed-pointer conversion
- *  in this Slang build (functional T*(addr) parses as multiplication). Therefore
- *  the SoA members in vulkan_data.slang MUST be declared as TYPED device
- *  pointers (`uint*`, `float3*`, `float*`, `int*`, `uint16_t*`, `uint8_t*`),
- *  NOT `uint64_t`. A typed pointer is 8 bytes, same as uint64_t, so the byte
- *  layout is IDENTICAL (ABI probe offsets unchanged). The M4b ABI probe reads
- *  the raw address back with `uint64_t(typed_ptr)` (proven to compile).
+ *  NOTE on cast<>: `cast<T[]>` / `cast<T*>` do NOT exist in this slangc build
+ *  (error E30015), and there is NO uint64->typed-pointer conversion (functional
+ *  `T*(addr)` parses as multiplication). The mirror (vulkan_data.slang) therefore
+ *  stores the SoA addresses of every member reached below as TYPED device
+ *  pointers (uint, float, float3, int, Subword16T and Subword8T POINTERS), and
+ *  each
+ *  accessor loads the typed pointer member and indexes it directly. A typed
+ *  pointer is 8 bytes with 8-byte alignment = uint64_t, so the byte layout and
+ *  every ABI-probe offset are unchanged (verified: RX 570 ABI probe still
+ *  ALL VALUES MATCH after the retype).
  *
- *  The PROVEN indexing pattern (cast_test.slang, slangc+spirv-val exit 0):
- *    IstSub ist = pc.params->ist;   // load struct via typed device pointer
- *    ist.throughput[s] = float3(...); // dynamic index on a TYPED pointer member
- *  emits `%_ptr_PhysicalStorageBuffer_v3float` + OpPtrAccessChain. SAFE.
+ *  (A) SCALAR / sub-word / packed3 members:
+ *        T* data_ptr = ist-><group>.<member>;   // scalar pointer member: safe
+ *        data_ptr[state] = v;                   // local ptr + dynamic index:
+ *                                               // OpPtrAccessChain, safe.
+ *      The SLANG RULE forbids only the INLINE form `ist-><group>.arr[i]` on a
+ *      fixed ARRAY member with a dynamic index (miscompiles to element 0 on the
+ *      RX 570 driver). Loading a scalar member first is the proven-safe shape.
  *
- *  float3* stride is 12 (ArrayStride 12 confirmed by disassembly) — correct for
- *  Cycles packed_float3/PackedSpectrum (types_float3.h:198). packed3 members use
- *  `float3*` directly; NO float*+3i workaround needed.
+ *  (B) AoS ARRAY members (volume_stack/shadow_isect/shadow_volume_stack,
+ *      layout proven M4e S1b-5: array-of-structs-of-pointers, base offsets
+ *      376/1240/1432, element strides 16/48/16, locked by host static_asserts
+ *      in kernels.cpp): take the address of slot 0 with a CONSTANT index, then
+ *      index that local base pointer with the DYNAMIC slot index:
+ *        IntegratorStateVolumeStackElement* base = &ist->volume_stack.slot[0];
+ *        int* soa = base[i].object;   // i dynamic -> OpPtrAccessChain (safe)
+ *        soa[state] = v;
+ *      `&slot[0]` on a device-pointer struct is allowed (constant index);
+ *      arrays do not decay automatically, and push-constant-embedded structs
+ *      are immutable, which is why the entry point passes IntegratorStateGPU*
+ *      (a device pointer), not an embedded struct.
  *
- *  (A) SCALAR / sub-word / packed3 members: the SoA pointer is a TYPED pointer
- *      field of the struct. Load it via the typed view
- *      `params->integrator_state.<group>.<member>` (a scalar pointer field, not a
- *      fixed array) and index it directly by `state` (dynamic). Proven byte-correct
- *      by the M4b ABI probe (render_pixel_index @2984 MATCH).
+ *  (C) packed3 stride: float3* indexes at ArrayStride 12 (confirmed from
+ *      disassembly of a typed float3* member), matching Cycles'
+ *      sizeof(packed_float3)==12 (types_float3.h:198 static_assert) and
+ *      PackedSpectrum==packed_float3 (types_spectrum.h:14). packed3/PackedSpectrum
+ *      members are therefore plain float3* arrays; no float*+3i workaround.
  *
- *  (B) AoS ARRAY members (volume_stack/shadow_isect/shadow_volume_stack): the
- *      runtime array_index is dynamic, and `slot` is a FIXED array inside a
- *      device-pointer struct. The PROVEN pattern (cast_test.slang) is:
- *        SlotElem* base = &params->integrator_state.volume_stack.slot[0];
- *        int* obj = base[i].object;   // i NON-constant -> OpPtrAccessChain
- *        obj[state] = value;
- *      `&slot[0]` (constant index) yields a typed base pointer; dynamic `base[i]`
- *      on that LOCAL base pointer is SAFE (OpPtrAccessChain), unlike the inline
- *      `params->...slot[i]` form.
+ *  Sub-word members (uint16_t/uint8_t/bool elements, sizes from the S1b-3
+ *  stride table, kernels.cpp:2105-2508) go through the accessor layer below:
+ *  atomic AND/OR-on-containing-word by DEFAULT (portable: no Int16/Int8
+ *  capability, race-free for adjacent states sharing a word — proven by the
+ *  Stage A probe subword_word.slang, modes 0/1 PASS on RX 570 AND SwiftShader;
+ *  the non-atomic RMW negative, modes 2/3, was DETECTED). The compile-time
+ *  macro VULKAN_SUBWORD_NARROW (defined in vulkan_data.slang, default 0)
+ *  switches the mirror member type AND these helpers in lockstep to true
+ *  narrow stores (Int16/Int8, RX 570-only) — the divergence entry in
+ *  DIVERGENCES.md documents that the narrow variant is to be measured on the
+ *  RX 570 after M5.
  *
- * Every `// source:` below cites the Cycles header that defines the member's type
- * and name. Members NOT covered here (and why) are listed at the bottom of this
- * file and in the M4e S1b-6 report.
+ * Every `// source:` below cites the Cycles header that defines the member's
+ * type and name. Members NOT covered here (and why) are listed at the bottom.
  *
- * The SoA DATA pointer is always LOADED from the IntegratorStateGPU struct (never
- * pushed as a raw address), so the gate can confirm packed3 stride stays 12 when
- * the pointer comes from the struct. Only the struct's own base address `ist_addr`
- * (case B) is passed in, because a struct field's address cannot be formed without
- * a base. */
+ * The SoA DATA pointers are always LOADED from the IntegratorStateGPU struct
+ * (never pushed as raw addresses), so the gate can confirm packed3 stride
+ * stays 12 when the pointer comes from the struct. The struct's own base
+ * address arrives as the IntegratorStateGPU* parameter, exactly the way
+ * Cycles kernels receive `kernel_integrator_state`. */
 
 #include "vulkan_data.slang"
 
-/* ------------------------------------------------------------------ *
- * Sub-word accessor layer (M4e S1b-4 item 4 DECISION, user):          *
- *   - writes: atomic AND/OR-on-containing-word fallback by DEFAULT,   *
- *     because it is feature-independent (runs on RX 570 AND            *
- *     SwiftShader) and was proven race-free by the Stage A probe.     *
- *   - reads: plain 32-bit load + shift/mask (no Int16/Int8 needed).   *
- *   - a compile-time macro switches writes to true narrow stores      *
- *     (shaderInt16/shaderInt8, RX 570-only; the narrow variant stays  *
- *     verified by the Stage A subword_narrow.slang probe).            *
+/* ==================================================================== *
+ * Sub-word accessor layer (M4e S1b-4 item 4 decision, user):           *
+ *   - writes: atomic AND/OR-on-containing-word by DEFAULT, portable    *
+ *     (feature-independent, runs on RX 570 and SwiftShader),           *
+ *     race-free: disjoint-bit atomics commute with a neighbour's.      *
+ *   - reads: plain 32-bit word load + shift/mask (no Int16/Int8).      *
+ *     Aligned 32-bit word loads do not tear; Stage A verified reads.   *
+ *   - VULKAN_SUBWORD_NARROW: true narrow element store/load            *
+ *     (RX 570-only; measurement of that variant deferred to post-M5    *
+ *     per the task; see DIVERGENCES.md).                               *
  *                                                                     *
- * Element t of a uint16 array lives in word k = t>>1 at shift         *
- * (t&1)*16; a uint8 element lives in word k = t>>2 at shift (t&3)*8.  *
- * Two adjacent states share one 32-bit word, so a store must not      *
- * clobber its neighbour. The atomic fallback clears then sets only    *
- * THIS element's bits: InterlockedAnd(mask) then InterlockedOr(value).*
- * Disjoint-bit atomics commute, so neighbours race-free (Stage A:     *
- * atomic16/8 PASS on both devices; non-atomic RMW NEGATIVE lost       *
- * ~half the updates and was DETECTED).                                *
- * ------------------------------------------------------------------ */
+ * Element t of a uint16 array lives in word k = t>>1 at shift          *
+ * (t&1)*16; a uint8 element lives in word k = t>>2 at shift (t&3)*8.   *
+ * Two adjacent states share one 32-bit word, so a store must not       *
+ * clobber its neighbour. Atomic form copied verbatim from the proven   *
+ * Stage A probe (subword_word.slang modes 0/1, PASS both devices):     *
+ *   InterlockedAnd(word, int(mask)); InterlockedOr(word, int(slot));   *
+ * The helpers take Subword16T and Subword8T POINTERS (vulkan_data.slang): *
+ * default = uint word view, narrow = uint16_t or uint8_t element view. *
+ * ==================================================================== */
 
-/* Set to 1 to use true narrow (Int16/Int8) stores instead of the atomic
- * fallback. Default 0 = atomic (portable). The narrow path is RX 570-only. */
-#ifndef VULKAN_SUBWORD_NARROW
-#define VULKAN_SUBWORD_NARROW 0
-#endif
-
-/* Read a uint16 element t from a uint16 SoA array at device address base_u64.
- * Plain 32-bit load of the containing word + shift/mask (no Int16 capability). */
-uint load_u16(uint64_t base_u64, uint t)
+/* Read a uint16 element t from the sub-word SoA array. */
+uint load_u16(Subword16T* base, uint t)
 {
-    let word_ptr = cast<uint[]>(base_u64);        // flat uint32 view of the array
-    uint k = t >> 1;                               // containing 32-bit word
-    uint shift = (t & 1u) * 16u;                   // low or high half
-    return (word_ptr[k] >> shift) & 0xFFFFu;
+#if VULKAN_SUBWORD_NARROW
+    return uint(base[t]);                    // direct 16-bit element load
+#else
+    uint k = t >> 1;                         // containing 32-bit word
+    uint shift = (t & 1u) * 16u;             // low or high half
+    return (base[k] >> shift) & 0xFFFFu;
+#endif
 }
 
-/* Write a uint16 element t. Atomic fallback by default. */
-void store_u16(uint64_t base_u64, uint t, uint value)
+/* Write a uint16 element t. Atomic word fallback by default. */
+void store_u16(Subword16T* base, uint t, uint value)
 {
     value &= 0xFFFFu;
 #if VULKAN_SUBWORD_NARROW
-    /* True narrow store (RX 570-only): single 16-bit write, no race because each
-     * element is its own 16-bit lane and the hardware handles sub-word writes to
-     * distinct lanes. Requires shaderInt16 (Stage A: true16 PASS on RX 570). */
-    let elem_ptr = cast<ushort[]>(base_u64);
-    elem_ptr[t] = (ushort)value;
+    base[t] = Subword16T(value);             // true 16-bit store (Int16)
 #else
-    /* Atomic AND/OR fallback (portable, default). */
-    let word_ptr = cast<uint[]>(base_u64);
     uint k = t >> 1;
     uint shift = (t & 1u) * 16u;
-    uint mask = ~(0xFFFFu << shift);               // all bits EXCEPT ours
-    uint slot = value << shift;                    // our value in place
-    InterlockedAnd(word_ptr[k], int(mask));        // clear our 16 bits
-    InterlockedOr(word_ptr[k], int(slot));         // set them
+    uint mask = ~(0xFFFFu << shift);         // all bits EXCEPT ours
+    uint slot = value << shift;              // our value in place
+    InterlockedAnd(base[k], int(mask));      // clear our 16 bits
+    InterlockedOr(base[k], int(slot));       // set them
 #endif
 }
 
 /* Read a uint8 element t (4 per word). */
-uint load_u8(uint64_t base_u64, uint t)
+uint load_u8(Subword8T* base, uint t)
 {
-    let word_ptr = cast<uint[]>(base_u64);
+#if VULKAN_SUBWORD_NARROW
+    return uint(base[t]);                    // direct 8-bit element load
+#else
     uint k = t >> 2;
     uint shift = (t & 3u) * 8u;
-    return (word_ptr[k] >> shift) & 0xFFu;
+    return (base[k] >> shift) & 0xFFu;
+#endif
 }
 
-/* Write a uint8 element t. Atomic fallback by default. */
-void store_u8(uint64_t base_u64, uint t, uint value)
+/* Write a uint8 element t. Atomic word fallback by default. */
+void store_u8(Subword8T* base, uint t, uint value)
 {
     value &= 0xFFu;
 #if VULKAN_SUBWORD_NARROW
-    let elem_ptr = cast<uchar[]>(base_u64);
-    elem_ptr[t] = (uchar)value;
+    base[t] = Subword8T(value);              // true 8-bit store (Int8)
 #else
-    let word_ptr = cast<uint[]>(base_u64);
     uint k = t >> 2;
     uint shift = (t & 3u) * 8u;
     uint mask = ~(0xFFu << shift);
     uint slot = value << shift;
-    InterlockedAnd(word_ptr[k], int(mask));
-    InterlockedOr(word_ptr[k], int(slot));
+    InterlockedAnd(base[k], int(mask));
+    InterlockedOr(base[k], int(slot));
 #endif
 }
 
-/* `bool` in the C++ state is 1 byte (source: state_template.h:132 uses `bool`).
- * We store it as a uint8 element and normalize to 0/1. */
-uint load_bool(uint64_t base_u64, uint t) { return load_u8(base_u64, t) & 1u; }
-void store_bool(uint64_t base_u64, uint t, bool value)
+/* `bool` members are 1 byte on the host (state_template.h:132 uses `bool`
+ * for the guiding flags; same 1-byte sub-word layout as uint8_t). Stored
+ * as a uint8 element, normalized to 0/1. */
+uint load_bool(Subword8T* base, uint t) { return load_u8(base, t) & 1u; }
+void store_bool(Subword8T* base, uint t, bool value)
 {
-    store_u8(base_u64, t, value ? 1u : 0u);
-}
-
-/* ------------------------------------------------------------------ *
- * AoS slot pointer loader (case B).                                   *
- * Reads the SoA data pointer for member `inner_off` of array slot `i` *
- * from a FLAT uint64_t* at ist_addr + base + i*stride + inner_off.    *
- * Flat pointer + dynamic offset => OpPtrAccessChain (safe).           *
- * ------------------------------------------------------------------ */
-uint64_t aos_soa_ptr(uint64_t ist_addr, uint base, uint stride,
-                     uint inner_off, uint i)
-{
-    let slots = cast<uint64_t[]>(ist_addr + base);  // flat view of the slot area
-    uint idx = (i * stride + inner_off) / 8u;       // 64-bit words
-    return slots[idx];
+    store_u8(base, t, value ? 1u : 0u);
 }
 
 /* ===================== path struct accessors ===================== */
 /* state_template.h:7-74. */
 
-uint read_path_render_pixel_index(KernelParamsVulkan* params, uint state)
+uint read_path_render_pixel_index(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:13 (uint32_t)
-    let data_ptr = params->integrator_state.path.render_pixel_index;
-    return cast<uint[]>(data_ptr)[state];
+    uint* data_ptr = ist->path.render_pixel_index;
+    return data_ptr[state];
 }
-void write_path_render_pixel_index(KernelParamsVulkan* params, uint state, uint v)
+void write_path_render_pixel_index(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.path.render_pixel_index;
-    cast<uint[]>(data_ptr)[state] = v;
+    uint* data_ptr = ist->path.render_pixel_index;
+    data_ptr[state] = v;
 }
 
-uint read_path_sample(KernelParamsVulkan* params, uint state)
+uint read_path_sample(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:15 (uint32_t)
-    let data_ptr = params->integrator_state.path.sample;
-    return cast<uint[]>(data_ptr)[state];
+    uint* data_ptr = ist->path.sample;
+    return data_ptr[state];
 }
-void write_path_sample(KernelParamsVulkan* params, uint state, uint v)
+void write_path_sample(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.path.sample;
-    cast<uint[]>(data_ptr)[state] = v;
+    uint* data_ptr = ist->path.sample;
+    data_ptr[state] = v;
 }
 
-uint read_path_bounce(KernelParamsVulkan* params, uint state)
+uint read_path_bounce(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:17 (uint16_t) -> sub-word
-    let data_ptr = params->integrator_state.path.bounce;
+    Subword16T* data_ptr = ist->path.bounce;
     return load_u16(data_ptr, state);
 }
-void write_path_bounce(KernelParamsVulkan* params, uint state, uint v)
+void write_path_bounce(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.path.bounce;
+    Subword16T* data_ptr = ist->path.bounce;
     store_u16(data_ptr, state, v);
 }
 
-uint read_path_transparent_bounce(KernelParamsVulkan* params, uint state)
+uint read_path_transparent_bounce(IntegratorStateGPU* ist, uint state)
 {
-    // source: state_template.h:19 (uint16_t)
-    let data_ptr = params->integrator_state.path.transparent_bounce;
+    // source: state_template.h:19 (uint16_t) -> sub-word
+    Subword16T* data_ptr = ist->path.transparent_bounce;
     return load_u16(data_ptr, state);
 }
-void write_path_transparent_bounce(KernelParamsVulkan* params, uint state, uint v)
+void write_path_transparent_bounce(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.path.transparent_bounce;
+    Subword16T* data_ptr = ist->path.transparent_bounce;
     store_u16(data_ptr, state, v);
 }
 
-uint read_path_queued_kernel(KernelParamsVulkan* params, uint state)
+uint read_path_queued_kernel(IntegratorStateGPU* ist, uint state)
 {
-    // source: state_template.h:33 (uint16_t) -> queue path
-    let data_ptr = params->integrator_state.path.queued_kernel;
+    // source: state_template.h:33 (uint16_t) -> queue path (kernel.h:66,422)
+    Subword16T* data_ptr = ist->path.queued_kernel;
     return load_u16(data_ptr, state);
 }
-void write_path_queued_kernel(KernelParamsVulkan* params, uint state, uint v)
+void write_path_queued_kernel(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.path.queued_kernel;
+    Subword16T* data_ptr = ist->path.queued_kernel;
     store_u16(data_ptr, state, v);
 }
 
-uint read_path_rng_offset(KernelParamsVulkan* params, uint state)
+uint read_path_rng_offset(IntegratorStateGPU* ist, uint state)
 {
-    // source: state_template.h:37 (uint16_t)
-    let data_ptr = params->integrator_state.path.rng_offset;
+    // source: state_template.h:37 (uint16_t) -> sub-word
+    Subword16T* data_ptr = ist->path.rng_offset;
     return load_u16(data_ptr, state);
 }
-void write_path_rng_offset(KernelParamsVulkan* params, uint state, uint v)
+void write_path_rng_offset(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.path.rng_offset;
+    Subword16T* data_ptr = ist->path.rng_offset;
     store_u16(data_ptr, state, v);
 }
 
-uint read_path_visibility(KernelParamsVulkan* params, uint state)
+uint read_path_visibility(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:39 (uint8_t) -> sub-word
-    let data_ptr = params->integrator_state.path.visibility;
+    Subword8T* data_ptr = ist->path.visibility;
     return load_u8(data_ptr, state);
 }
-void write_path_visibility(KernelParamsVulkan* params, uint state, uint v)
+void write_path_visibility(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.path.visibility;
+    Subword8T* data_ptr = ist->path.visibility;
     store_u8(data_ptr, state, v);
 }
 
-uint read_path_flag(KernelParamsVulkan* params, uint state)
+uint read_path_flag(IntegratorStateGPU* ist, uint state)
 {
-    // source: state_template.h:41 (uint32_t)
-    let data_ptr = params->integrator_state.path.flag;
-    return cast<uint[]>(data_ptr)[state];
+    // source: state_template.h:41 (uint32_t); OR-updates: intersect_closest.h:40,44,72,77
+    uint* data_ptr = ist->path.flag;
+    return data_ptr[state];
 }
-void write_path_flag(KernelParamsVulkan* params, uint state, uint v)
+void write_path_flag(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.path.flag;
-    cast<uint[]>(data_ptr)[state] = v;
+    uint* data_ptr = ist->path.flag;
+    data_ptr[state] = v;
 }
 
-uint read_path_mnee(KernelParamsVulkan* params, uint state)
+uint read_path_mnee(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:43 (uint8_t) -> sub-word
-    let data_ptr = params->integrator_state.path.mnee;
+    Subword8T* data_ptr = ist->path.mnee;
     return load_u8(data_ptr, state);
 }
-void write_path_mnee(KernelParamsVulkan* params, uint state, uint v)
+void write_path_mnee(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.path.mnee;
+    Subword8T* data_ptr = ist->path.mnee;
     store_u8(data_ptr, state, v);
 }
 
-float read_path_mis_ray_pdf(KernelParamsVulkan* params, uint state)
+float read_path_mis_ray_pdf(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:52 (float)
-    let data_ptr = params->integrator_state.path.mis_ray_pdf;
-    return cast<float[]>(data_ptr)[state];
+    float* data_ptr = ist->path.mis_ray_pdf;
+    return data_ptr[state];
 }
-void write_path_mis_ray_pdf(KernelParamsVulkan* params, uint state, float v)
+void write_path_mis_ray_pdf(IntegratorStateGPU* ist, uint state, float v)
 {
-    let data_ptr = params->integrator_state.path.mis_ray_pdf;
-    cast<float[]>(data_ptr)[state] = v;
+    float* data_ptr = ist->path.mis_ray_pdf;
+    data_ptr[state] = v;
 }
 
-float read_path_min_ray_pdf(KernelParamsVulkan* params, uint state)
+float read_path_min_ray_pdf(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:58 (float)
-    let data_ptr = params->integrator_state.path.min_ray_pdf;
-    return cast<float[]>(data_ptr)[state];
+    float* data_ptr = ist->path.min_ray_pdf;
+    return data_ptr[state];
 }
-void write_path_min_ray_pdf(KernelParamsVulkan* params, uint state, float v)
+void write_path_min_ray_pdf(IntegratorStateGPU* ist, uint state, float v)
 {
-    let data_ptr = params->integrator_state.path.min_ray_pdf;
-    cast<float[]>(data_ptr)[state] = v;
+    float* data_ptr = ist->path.min_ray_pdf;
+    data_ptr[state] = v;
 }
 
-float read_path_continuation_probability(KernelParamsVulkan* params, uint state)
+float read_path_continuation_probability(IntegratorStateGPU* ist, uint state)
 {
-    // source: state_template.h:60 (float)
-    let data_ptr = params->integrator_state.path.continuation_probability;
-    return cast<float[]>(data_ptr)[state];
+    // source: state_template.h:60 (float); written by intersect_closest.h:62
+    float* data_ptr = ist->path.continuation_probability;
+    return data_ptr[state];
 }
-void write_path_continuation_probability(KernelParamsVulkan* params, uint state, float v)
+void write_path_continuation_probability(IntegratorStateGPU* ist, uint state, float v)
 {
-    let data_ptr = params->integrator_state.path.continuation_probability;
-    cast<float[]>(data_ptr)[state] = v;
-}
-
-float read_path_optical_depth(KernelParamsVulkan* params, uint state)
-{
-    // source: state_template.h:47 (float)
-    let data_ptr = params->integrator_state.path.optical_depth;
-    return cast<float[]>(data_ptr)[state];
-}
-void write_path_optical_depth(KernelParamsVulkan* params, uint state, float v)
-{
-    let data_ptr = params->integrator_state.path.optical_depth;
-    cast<float[]>(data_ptr)[state] = v;
+    float* data_ptr = ist->path.continuation_probability;
+    data_ptr[state] = v;
 }
 
-uint read_path_shader_sort_key(KernelParamsVulkan* params, uint state)
+float read_path_optical_depth(IntegratorStateGPU* ist, uint state)
 {
-    // source: state_template.h:73 (uint32_t) -> queue path
-    let data_ptr = params->integrator_state.path.shader_sort_key;
-    return cast<uint[]>(data_ptr)[state];
+    // source: state_template.h:47 (float); read by state_flow.h:62
+    float* data_ptr = ist->path.optical_depth;
+    return data_ptr[state];
 }
-void write_path_shader_sort_key(KernelParamsVulkan* params, uint state, uint v)
+void write_path_optical_depth(IntegratorStateGPU* ist, uint state, float v)
 {
-    let data_ptr = params->integrator_state.path.shader_sort_key;
-    cast<uint[]>(data_ptr)[state] = v;
-}
-
-/* PackedSpectrum == packed_float3, 12 bytes (source: types_spectrum.h:14,
- * types_float3.h:198 static_assert sizeof==12). SoA stride 12; float3* via
- * cast<float3[]>. The gate measures that the stride is 12, not 16. */
-float3 read_path_throughput(KernelParamsVulkan* params, uint state)
-{
-    // source: state_template.h:62 (PackedSpectrum)
-    let data_ptr = params->integrator_state.path.throughput;
-    return cast<float3[]>(data_ptr)[state];
-}
-void write_path_throughput(KernelParamsVulkan* params, uint state, float3 v)
-{
-    let data_ptr = params->integrator_state.path.throughput;
-    cast<float3[]>(data_ptr)[state] = v;
+    float* data_ptr = ist->path.optical_depth;
+    data_ptr[state] = v;
 }
 
-float3 read_path_mis_origin_n(KernelParamsVulkan* params, uint state)
+uint read_path_shader_sort_key(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:73 (uint32_t) -> queue path (state_flow.h:114,171)
+    uint* data_ptr = ist->path.shader_sort_key;
+    return data_ptr[state];
+}
+void write_path_shader_sort_key(IntegratorStateGPU* ist, uint state, uint v)
+{
+    uint* data_ptr = ist->path.shader_sort_key;
+    data_ptr[state] = v;
+}
+
+/* PackedSpectrum == packed_float3, 12 bytes (types_spectrum.h:14,
+ * types_float3.h:198 static_assert sizeof==12). float3* indexes at stride 12
+ * (disassembly: ArrayStride 12) — the gate re-confirms it when the pointer is
+ * LOADED from IntegratorStateGPU. */
+float3 read_path_throughput(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:62 (PackedSpectrum); read: shade_surface.h:107,243
+    float3* data_ptr = ist->path.throughput;
+    return data_ptr[state];
+}
+void write_path_throughput(IntegratorStateGPU* ist, uint state, float3 v)
+{
+    float3* data_ptr = ist->path.throughput;
+    data_ptr[state] = v;
+}
+
+float3 read_path_mis_origin_n(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:56 (packed_float3)
-    let data_ptr = params->integrator_state.path.mis_origin_n;
-    return cast<float3[]>(data_ptr)[state];
+    float3* data_ptr = ist->path.mis_origin_n;
+    return data_ptr[state];
 }
-void write_path_mis_origin_n(KernelParamsVulkan* params, uint state, float3 v)
+void write_path_mis_origin_n(IntegratorStateGPU* ist, uint state, float3 v)
 {
-    let data_ptr = params->integrator_state.path.mis_origin_n;
-    cast<float3[]>(data_ptr)[state] = v;
+    float3* data_ptr = ist->path.mis_origin_n;
+    data_ptr[state] = v;
 }
 
-float3 read_path_pass_diffuse_weight(KernelParamsVulkan* params, uint state)
+float3 read_path_pass_diffuse_weight(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:67 (PackedSpectrum)
-    let data_ptr = params->integrator_state.path.pass_diffuse_weight;
-    return cast<float3[]>(data_ptr)[state];
+    float3* data_ptr = ist->path.pass_diffuse_weight;
+    return data_ptr[state];
 }
-void write_path_pass_diffuse_weight(KernelParamsVulkan* params, uint state, float3 v)
+void write_path_pass_diffuse_weight(IntegratorStateGPU* ist, uint state, float3 v)
 {
-    let data_ptr = params->integrator_state.path.pass_diffuse_weight;
-    cast<float3[]>(data_ptr)[state] = v;
+    float3* data_ptr = ist->path.pass_diffuse_weight;
+    data_ptr[state] = v;
 }
 
 /* ===================== ray struct accessors ===================== */
-/* state_template.h:78-87. Packed: P/D are packed_float3 (stride 12). */
+/* state_template.h:78-87. init_from_camera writes via
+ * integrator_state_write_ray (state_util.h:53-59); shade_surface rewrites
+ * the next bounce ray (shade_surface.h:181-190). */
 
-float3 read_ray_P(KernelParamsVulkan* params, uint state)
+float3 read_ray_P(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:79 (packed_float3)
-    let data_ptr = params->integrator_state.ray.P;
-    return cast<float3[]>(data_ptr)[state];
+    float3* data_ptr = ist->ray.P;
+    return data_ptr[state];
 }
-void write_ray_P(KernelParamsVulkan* params, uint state, float3 v)
+void write_ray_P(IntegratorStateGPU* ist, uint state, float3 v)
 {
-    let data_ptr = params->integrator_state.ray.P;
-    cast<float3[]>(data_ptr)[state] = v;
+    float3* data_ptr = ist->ray.P;
+    data_ptr[state] = v;
 }
 
-float3 read_ray_D(KernelParamsVulkan* params, uint state)
+float3 read_ray_D(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:81 (packed_float3)
-    let data_ptr = params->integrator_state.ray.D;
-    return cast<float3[]>(data_ptr)[state];
+    float3* data_ptr = ist->ray.D;
+    return data_ptr[state];
 }
-void write_ray_D(KernelParamsVulkan* params, uint state, float3 v)
+void write_ray_D(IntegratorStateGPU* ist, uint state, float3 v)
 {
-    let data_ptr = params->integrator_state.ray.D;
-    cast<float3[]>(data_ptr)[state] = v;
+    float3* data_ptr = ist->ray.D;
+    data_ptr[state] = v;
 }
 
-float read_ray_dP(KernelParamsVulkan* params, uint state)
+float read_ray_dP(IntegratorStateGPU* ist, uint state)
 {
-    // source: state_template.h:80 (float)
-    let data_ptr = params->integrator_state.ray.dP;
-    return cast<float[]>(data_ptr)[state];
+    // source: state_template.h:80 (float; differential compact scale)
+    float* data_ptr = ist->ray.dP;
+    return data_ptr[state];
 }
-void write_ray_dP(KernelParamsVulkan* params, uint state, float v)
+void write_ray_dP(IntegratorStateGPU* ist, uint state, float v)
 {
-    let data_ptr = params->integrator_state.ray.dP;
-    cast<float[]>(data_ptr)[state] = v;
+    float* data_ptr = ist->ray.dP;
+    data_ptr[state] = v;
 }
 
-float read_ray_dD(KernelParamsVulkan* params, uint state)
+float read_ray_dD(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:82 (float)
-    let data_ptr = params->integrator_state.ray.dD;
-    return cast<float[]>(data_ptr)[state];
+    float* data_ptr = ist->ray.dD;
+    return data_ptr[state];
 }
-void write_ray_dD(KernelParamsVulkan* params, uint state, float v)
+void write_ray_dD(IntegratorStateGPU* ist, uint state, float v)
 {
-    let data_ptr = params->integrator_state.ray.dD;
-    cast<float[]>(data_ptr)[state] = v;
+    float* data_ptr = ist->ray.dD;
+    data_ptr[state] = v;
 }
 
-float read_ray_tmin(KernelParamsVulkan* params, uint state)
+float read_ray_tmin(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:83 (float)
-    let data_ptr = params->integrator_state.ray.tmin;
-    return cast<float[]>(data_ptr)[state];
+    float* data_ptr = ist->ray.tmin;
+    return data_ptr[state];
 }
-void write_ray_tmin(KernelParamsVulkan* params, uint state, float v)
+void write_ray_tmin(IntegratorStateGPU* ist, uint state, float v)
 {
-    let data_ptr = params->integrator_state.ray.tmin;
-    cast<float[]>(data_ptr)[state] = v;
+    float* data_ptr = ist->ray.tmin;
+    data_ptr[state] = v;
 }
 
-float read_ray_tmax(KernelParamsVulkan* params, uint state)
+float read_ray_tmax(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:84 (float)
-    let data_ptr = params->integrator_state.ray.tmax;
-    return cast<float[]>(data_ptr)[state];
+    float* data_ptr = ist->ray.tmax;
+    return data_ptr[state];
 }
-void write_ray_tmax(KernelParamsVulkan* params, uint state, float v)
+void write_ray_tmax(IntegratorStateGPU* ist, uint state, float v)
 {
-    let data_ptr = params->integrator_state.ray.tmax;
-    cast<float[]>(data_ptr)[state] = v;
+    float* data_ptr = ist->ray.tmax;
+    data_ptr[state] = v;
 }
 
-float read_ray_time(KernelParamsVulkan* params, uint state)
+float read_ray_time(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:85 (float)
-    let data_ptr = params->integrator_state.ray.time;
-    return cast<float[]>(data_ptr)[state];
+    float* data_ptr = ist->ray.time;
+    return data_ptr[state];
 }
-void write_ray_time(KernelParamsVulkan* params, uint state, float v)
+void write_ray_time(IntegratorStateGPU* ist, uint state, float v)
 {
-    let data_ptr = params->integrator_state.ray.time;
-    cast<float[]>(data_ptr)[state] = v;
+    float* data_ptr = ist->ray.time;
+    data_ptr[state] = v;
 }
 
 /* ===================== isect struct accessors ===================== */
-/* state_template.h:92-99. INTERSECT_CLOSEST writes all six. */
+/* state_template.h:92-99. INTERSECT_CLOSEST fills all six through
+ * bvh_intersection / triangle_intersect writes. */
 
-float read_isect_t(KernelParamsVulkan* params, uint state)
+float read_isect_t(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:93 (float)
-    let data_ptr = params->integrator_state.isect.t;
-    return cast<float[]>(data_ptr)[state];
+    float* data_ptr = ist->isect.t;
+    return data_ptr[state];
 }
-void write_isect_t(KernelParamsVulkan* params, uint state, float v)
+void write_isect_t(IntegratorStateGPU* ist, uint state, float v)
 {
-    let data_ptr = params->integrator_state.isect.t;
-    cast<float[]>(data_ptr)[state] = v;
+    float* data_ptr = ist->isect.t;
+    data_ptr[state] = v;
 }
 
-int read_isect_prim(KernelParamsVulkan* params, uint state)
+int read_isect_prim(IntegratorStateGPU* ist, uint state)
 {
-    // source: state_template.h:96 (int)
-    let data_ptr = params->integrator_state.isect.prim;
-    return cast<int[]>(data_ptr)[state];
+    // source: state_template.h:96 (int); read: intersect_closest.h:363
+    int* data_ptr = ist->isect.prim;
+    return data_ptr[state];
 }
-void write_isect_prim(KernelParamsVulkan* params, uint state, int v)
+void write_isect_prim(IntegratorStateGPU* ist, uint state, int v)
 {
-    let data_ptr = params->integrator_state.isect.prim;
-    cast<int[]>(data_ptr)[state] = v;
-}
-
-int read_isect_object(KernelParamsVulkan* params, uint state)
-{
-    // source: state_template.h:97 (int)
-    let data_ptr = params->integrator_state.isect.object;
-    return cast<int[]>(data_ptr)[state];
-}
-void write_isect_object(KernelParamsVulkan* params, uint state, int v)
-{
-    let data_ptr = params->integrator_state.isect.object;
-    cast<int[]>(data_ptr)[state] = v;
+    int* data_ptr = ist->isect.prim;
+    data_ptr[state] = v;
 }
 
-int read_isect_type(KernelParamsVulkan* params, uint state)
+int read_isect_object(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:97 (int); read: intersect_closest.h:364;
+    // written OBJECT_NONE by shade_surface.h:180
+    int* data_ptr = ist->isect.object;
+    return data_ptr[state];
+}
+void write_isect_object(IntegratorStateGPU* ist, uint state, int v)
+{
+    int* data_ptr = ist->isect.object;
+    data_ptr[state] = v;
+}
+
+int read_isect_type(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:98 (int)
-    let data_ptr = params->integrator_state.isect.type;
-    return cast<int[]>(data_ptr)[state];
+    int* data_ptr = ist->isect.type;
+    return data_ptr[state];
 }
-void write_isect_type(KernelParamsVulkan* params, uint state, int v)
+void write_isect_type(IntegratorStateGPU* ist, uint state, int v)
 {
-    let data_ptr = params->integrator_state.isect.type;
-    cast<int[]>(data_ptr)[state] = v;
+    int* data_ptr = ist->isect.type;
+    data_ptr[state] = v;
 }
 
 /* ===================== volume_stack (AoS) accessors ===================== */
-/* state_template.h:112-117. layout: struct { int*object; int*shader; }[32].
- * base offset 376, stride 16, inner object@0 / shader@8 (M4e S1b-5 static_asserts). */
-static const uint VS_BASE = 376u;
-static const uint VS_STRIDE = 16u;
+/* state_template.h:112-117. Layout: struct { int *object; int *shader; }[32],
+ * base offset 376, element stride 16, object@0 / shader@8 inside the slot
+ * (M4e S1b-5 host static_asserts in kernels.cpp). Pattern (B) from the header:
+ * constant-index address-of, then dynamic index on the LOCAL base pointer. */
 
-int read_volume_stack_object(KernelParamsVulkan* params, uint64_t ist_addr,
-                             uint i, uint state)
+int read_volume_stack_object(IntegratorStateGPU* ist, uint i, uint state)
 {
     // source: state_template.h:113 (int, AoS array member)
-    let data_ptr = aos_soa_ptr(ist_addr, VS_BASE, VS_STRIDE, 0u, i);
-    return cast<int[]>(data_ptr)[state];
+    IntegratorStateVolumeStackElement* base = &ist->volume_stack.slot[0];
+    int* soa = base[i].object;      // i NON-constant -> OpPtrAccessChain
+    return soa[state];
 }
-void write_volume_stack_object(KernelParamsVulkan* params, uint64_t ist_addr,
-                               uint i, uint state, int v)
+void write_volume_stack_object(IntegratorStateGPU* ist, uint i, uint state, int v)
 {
-    let data_ptr = aos_soa_ptr(ist_addr, VS_BASE, VS_STRIDE, 0u, i);
-    cast<int[]>(data_ptr)[state] = v;
+    IntegratorStateVolumeStackElement* base = &ist->volume_stack.slot[0];
+    int* soa = base[i].object;
+    soa[state] = v;
 }
 
-int read_volume_stack_shader(KernelParamsVulkan* params, uint64_t ist_addr,
-                             uint i, uint state)
+int read_volume_stack_shader(IntegratorStateGPU* ist, uint i, uint state)
 {
     // source: state_template.h:114 (int, AoS array member)
-    let data_ptr = aos_soa_ptr(ist_addr, VS_BASE, VS_STRIDE, 8u, i);
-    return cast<int[]>(data_ptr)[state];
+    IntegratorStateVolumeStackElement* base = &ist->volume_stack.slot[0];
+    int* soa = base[i].shader;
+    return soa[state];
 }
-void write_volume_stack_shader(KernelParamsVulkan* params, uint64_t ist_addr,
-                               uint i, uint state, int v)
+void write_volume_stack_shader(IntegratorStateGPU* ist, uint i, uint state, int v)
 {
-    let data_ptr = aos_soa_ptr(ist_addr, VS_BASE, VS_STRIDE, 8u, i);
-    cast<int[]>(data_ptr)[state] = v;
+    IntegratorStateVolumeStackElement* base = &ist->volume_stack.slot[0];
+    int* soa = base[i].shader;
+    soa[state] = v;
 }
 
 /* ===================== shadow_path accessors ===================== */
-/* shadow_state_template.h:7-74. SHADE_SURFACE (diffuse) writes these. */
+/* shadow_state_template.h:7-74. SHADE_SURFACE (diffuse) writes these when it
+ * spawns the shadow ray (shade_surface.h:247-261 and the bounce copies). */
 
-uint read_shadow_path_render_pixel_index(KernelParamsVulkan* params, uint state)
+uint read_shadow_path_render_pixel_index(IntegratorStateGPU* ist, uint state)
 {
-    // source: shadow_state_template.h:9 (uint32_t)
-    let data_ptr = params->integrator_state.shadow_path.render_pixel_index;
-    return cast<uint[]>(data_ptr)[state];
+    // source: shadow_state_template.h:9 (uint32_t); copy: shade_surface.h:250
+    uint* data_ptr = ist->shadow_path.render_pixel_index;
+    return data_ptr[state];
 }
-void write_shadow_path_render_pixel_index(KernelParamsVulkan* params, uint state, uint v)
+void write_shadow_path_render_pixel_index(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.shadow_path.render_pixel_index;
-    cast<uint[]>(data_ptr)[state] = v;
+    uint* data_ptr = ist->shadow_path.render_pixel_index;
+    data_ptr[state] = v;
 }
 
-uint read_shadow_path_queued_kernel(KernelParamsVulkan* params, uint state)
+uint read_shadow_path_queued_kernel(IntegratorStateGPU* ist, uint state)
 {
-    // source: shadow_state_template.h:31 (uint16_t) -> queue path
-    let data_ptr = params->integrator_state.shadow_path.queued_kernel;
+    // source: shadow_state_template.h:31 (uint16_t) -> queue path (state_flow.h:125)
+    Subword16T* data_ptr = ist->shadow_path.queued_kernel;
     return load_u16(data_ptr, state);
 }
-void write_shadow_path_queued_kernel(KernelParamsVulkan* params, uint state, uint v)
+void write_shadow_path_queued_kernel(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.shadow_path.queued_kernel;
+    Subword16T* data_ptr = ist->shadow_path.queued_kernel;
     store_u16(data_ptr, state, v);
 }
 
-uint read_shadow_path_flag(KernelParamsVulkan* params, uint state)
+uint read_shadow_path_flag(IntegratorStateGPU* ist, uint state)
 {
     // source: shadow_state_template.h:35 (uint32_t)
-    let data_ptr = params->integrator_state.shadow_path.flag;
-    return cast<uint[]>(data_ptr)[state];
+    uint* data_ptr = ist->shadow_path.flag;
+    return data_ptr[state];
 }
-void write_shadow_path_flag(KernelParamsVulkan* params, uint state, uint v)
+void write_shadow_path_flag(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.shadow_path.flag;
-    cast<uint[]>(data_ptr)[state] = v;
+    uint* data_ptr = ist->shadow_path.flag;
+    data_ptr[state] = v;
 }
 
-uint read_shadow_path_lightgroup(KernelParamsVulkan* params, uint state)
+uint read_shadow_path_lightgroup(IntegratorStateGPU* ist, uint state)
 {
     // source: shadow_state_template.h:53 (uint8_t) -> sub-word
-    let data_ptr = params->integrator_state.shadow_path.lightgroup;
+    Subword8T* data_ptr = ist->shadow_path.lightgroup;
     return load_u8(data_ptr, state);
 }
-void write_shadow_path_lightgroup(KernelParamsVulkan* params, uint state, uint v)
+void write_shadow_path_lightgroup(IntegratorStateGPU* ist, uint state, uint v)
 {
-    let data_ptr = params->integrator_state.shadow_path.lightgroup;
+    Subword8T* data_ptr = ist->shadow_path.lightgroup;
     store_u8(data_ptr, state, v);
 }
 
-float3 read_shadow_path_throughput(KernelParamsVulkan* params, uint state)
+float3 read_shadow_path_throughput(IntegratorStateGPU* ist, uint state)
 {
     // source: shadow_state_template.h:37 (PackedSpectrum)
-    let data_ptr = params->integrator_state.shadow_path.throughput;
-    return cast<float3[]>(data_ptr)[state];
+    float3* data_ptr = ist->shadow_path.throughput;
+    return data_ptr[state];
 }
-void write_shadow_path_throughput(KernelParamsVulkan* params, uint state, float3 v)
+void write_shadow_path_throughput(IntegratorStateGPU* ist, uint state, float3 v)
 {
-    let data_ptr = params->integrator_state.shadow_path.throughput;
-    cast<float3[]>(data_ptr)[state] = v;
+    float3* data_ptr = ist->shadow_path.throughput;
+    data_ptr[state] = v;
 }
 
 /* ===================== shadow_ray accessors ===================== */
-/* shadow_state_template.h:78-88. Packed: P/D are packed_float3 (stride 12). */
+/* shadow_state_template.h:78-88; filled by integrator_state_write_shadow_ray
+ * (state_util.h:83-87). */
 
-float3 read_shadow_ray_P(KernelParamsVulkan* params, uint state)
+float3 read_shadow_ray_P(IntegratorStateGPU* ist, uint state)
 {
     // source: shadow_state_template.h:79 (packed_float3)
-    let data_ptr = params->integrator_state.shadow_ray.P;
-    return cast<float3[]>(data_ptr)[state];
+    float3* data_ptr = ist->shadow_ray.P;
+    return data_ptr[state];
 }
-void write_shadow_ray_P(KernelParamsVulkan* params, uint state, float3 v)
+void write_shadow_ray_P(IntegratorStateGPU* ist, uint state, float3 v)
 {
-    let data_ptr = params->integrator_state.shadow_ray.P;
-    cast<float3[]>(data_ptr)[state] = v;
+    float3* data_ptr = ist->shadow_ray.P;
+    data_ptr[state] = v;
 }
 
-float3 read_shadow_ray_D(KernelParamsVulkan* params, uint state)
+float3 read_shadow_ray_D(IntegratorStateGPU* ist, uint state)
 {
     // source: shadow_state_template.h:80 (packed_float3)
-    let data_ptr = params->integrator_state.shadow_ray.D;
-    return cast<float3[]>(data_ptr)[state];
+    float3* data_ptr = ist->shadow_ray.D;
+    return data_ptr[state];
 }
-void write_shadow_ray_D(KernelParamsVulkan* params, uint state, float3 v)
+void write_shadow_ray_D(IntegratorStateGPU* ist, uint state, float3 v)
 {
-    let data_ptr = params->integrator_state.shadow_ray.D;
-    cast<float3[]>(data_ptr)[state] = v;
+    float3* data_ptr = ist->shadow_ray.D;
+    data_ptr[state] = v;
 }
 
-float read_shadow_ray_tmin(KernelParamsVulkan* params, uint state)
+float read_shadow_ray_tmin(IntegratorStateGPU* ist, uint state)
 {
     // source: shadow_state_template.h:81 (float)
-    let data_ptr = params->integrator_state.shadow_ray.tmin;
-    return cast<float[]>(data_ptr)[state];
+    float* data_ptr = ist->shadow_ray.tmin;
+    return data_ptr[state];
 }
-void write_shadow_ray_tmin(KernelParamsVulkan* params, uint state, float v)
+void write_shadow_ray_tmin(IntegratorStateGPU* ist, uint state, float v)
 {
-    let data_ptr = params->integrator_state.shadow_ray.tmin;
-    cast<float[]>(data_ptr)[state] = v;
+    float* data_ptr = ist->shadow_ray.tmin;
+    data_ptr[state] = v;
 }
 
 /* ===================== shadow_isect (AoS) accessors ===================== */
-/* shadow_state_template.h:94-103. layout: 6-pointer tuple [4], stride 48.
- * base 1240, t@0/u@8/v@16/prim@24/object@32/type@40 (M4e S1b-5 static_asserts). */
-static const uint SI_BASE = 1240u;
-static const uint SI_STRIDE = 48u;
+/* shadow_state_template.h:94-103. Layout: 6-pointer tuple [4], base 1240,
+ * element stride 48, t@0/u@8/v@16/prim@24/object@32/type@40 (M4e S1b-5). */
 
-float read_shadow_isect_t(KernelParamsVulkan* params, uint64_t ist_addr,
-                          uint i, uint state)
+float read_shadow_isect_t(IntegratorStateGPU* ist, uint i, uint state)
 {
     // source: shadow_state_template.h:95 (float, AoS array member)
-    let data_ptr = aos_soa_ptr(ist_addr, SI_BASE, SI_STRIDE, 0u, i);
-    return cast<float[]>(data_ptr)[state];
+    IntegratorStateShadowIsectElement* base = &ist->shadow_isect.slot[0];
+    float* soa = base[i].t;
+    return soa[state];
 }
-void write_shadow_isect_t(KernelParamsVulkan* params, uint64_t ist_addr,
-                          uint i, uint state, float v)
+void write_shadow_isect_t(IntegratorStateGPU* ist, uint i, uint state, float v)
 {
-    let data_ptr = aos_soa_ptr(ist_addr, SI_BASE, SI_STRIDE, 0u, i);
-    cast<float[]>(data_ptr)[state] = v;
+    IntegratorStateShadowIsectElement* base = &ist->shadow_isect.slot[0];
+    float* soa = base[i].t;
+    soa[state] = v;
 }
 
-int read_shadow_isect_object(KernelParamsVulkan* params, uint64_t ist_addr,
-                             uint i, uint state)
+int read_shadow_isect_object(IntegratorStateGPU* ist, uint i, uint state)
 {
     // source: shadow_state_template.h:99 (int, AoS array member)
-    let data_ptr = aos_soa_ptr(ist_addr, SI_BASE, SI_STRIDE, 32u, i);
-    return cast<int[]>(data_ptr)[state];
+    IntegratorStateShadowIsectElement* base = &ist->shadow_isect.slot[0];
+    int* soa = base[i].object;
+    return soa[state];
 }
-void write_shadow_isect_object(KernelParamsVulkan* params, uint64_t ist_addr,
-                               uint i, uint state, int v)
+void write_shadow_isect_object(IntegratorStateGPU* ist, uint i, uint state, int v)
 {
-    let data_ptr = aos_soa_ptr(ist_addr, SI_BASE, SI_STRIDE, 32u, i);
-    cast<int[]>(data_ptr)[state] = v;
+    IntegratorStateShadowIsectElement* base = &ist->shadow_isect.slot[0];
+    int* soa = base[i].object;
+    soa[state] = v;
 }
 
 /* ===================== shadow_volume_stack (AoS) accessors ===================== */
-/* shadow_state_template.h:107-112. Same shape as volume_stack: stride 16.
- * base 1432, object@0 / shader@8 (M4e S1b-5 static_asserts). */
-static const uint SVS_BASE = 1432u;
-static const uint SVS_STRIDE = 16u;
+/* shadow_state_template.h:107-112. Same shape as volume_stack: base 1432,
+ * stride 16, object@0 / shader@8 (M4e S1b-5). */
 
-int read_shadow_volume_stack_object(KernelParamsVulkan* params, uint64_t ist_addr,
-                                    uint i, uint state)
+int read_shadow_volume_stack_object(IntegratorStateGPU* ist, uint i, uint state)
 {
     // source: shadow_state_template.h:108 (int, AoS array member)
-    let data_ptr = aos_soa_ptr(ist_addr, SVS_BASE, SVS_STRIDE, 0u, i);
-    return cast<int[]>(data_ptr)[state];
+    IntegratorStateShadowVolumeStackElement* base = &ist->shadow_volume_stack.slot[0];
+    int* soa = base[i].object;
+    return soa[state];
 }
-void write_shadow_volume_stack_object(KernelParamsVulkan* params, uint64_t ist_addr,
-                                      uint i, uint state, int v)
+void write_shadow_volume_stack_object(IntegratorStateGPU* ist, uint i, uint state, int v)
 {
-    let data_ptr = aos_soa_ptr(ist_addr, SVS_BASE, SVS_STRIDE, 0u, i);
-    cast<int[]>(data_ptr)[state] = v;
+    IntegratorStateShadowVolumeStackElement* base = &ist->shadow_volume_stack.slot[0];
+    int* soa = base[i].object;
+    soa[state] = v;
 }
 
-int read_shadow_volume_stack_shader(KernelParamsVulkan* params, uint64_t ist_addr,
-                                    uint i, uint state)
+int read_shadow_volume_stack_shader(IntegratorStateGPU* ist, uint i, uint state)
 {
     // source: shadow_state_template.h:109 (int, AoS array member)
-    let data_ptr = aos_soa_ptr(ist_addr, SVS_BASE, SVS_STRIDE, 8u, i);
-    return cast<int[]>(data_ptr)[state];
+    IntegratorStateShadowVolumeStackElement* base = &ist->shadow_volume_stack.slot[0];
+    int* soa = base[i].shader;
+    return soa[state];
 }
-void write_shadow_volume_stack_shader(KernelParamsVulkan* params, uint64_t ist_addr,
-                                      uint i, uint state, int v)
+void write_shadow_volume_stack_shader(IntegratorStateGPU* ist, uint i, uint state, int v)
 {
-    let data_ptr = aos_soa_ptr(ist_addr, SVS_BASE, SVS_STRIDE, 8u, i);
-    cast<int[]>(data_ptr)[state] = v;
+    IntegratorStateShadowVolumeStackElement* base = &ist->shadow_volume_stack.slot[0];
+    int* soa = base[i].shader;
+    soa[state] = v;
 }
 
 /* ====================================================================== *
- * MEMBERS NOT DONE HERE (and why).                                       *
- * These follow the identical patterns above (scalar/sub-word/packed3/AoS)*
- * and are NOT touched by INIT_FROM_CAMERA, INTERSECT_CLOSEST,             *
- * SHADE_SURFACE(diffuse) or the queue path, or are compile-time feature-  *
- * gated OFF in this build:                                               *
- *   - subsurface.* (albedo/radius/anisotropy/N; state_template.h:103-108)*
+ * MEMBERS NOT DONE HERE (and why). These follow the identical patterns   *
+ * above (scalar / sub-word / packed3 / AoS) and are either not touched by *
+ * INIT_FROM_CAMERA, INTERSECT_CLOSEST, SHADE_SURFACE(diffuse) or the      *
+ * queue path, or are compile-time feature-gated OFF in this build:       *
+ *   - subsurface.* (albedo/radius/anisotropy/N; state_template.h:103-108) *
  *     -> only SUBSURFACE kernels.                                         *
  *   - shadow_link.* (dedicated_light_weight/last_isect_*;                 *
  *     state_template.h:151-156) -> only SHADOW_LINKING kernels.           *
  *   - guiding.* (path_segment/use_*_guiding/sampling probs;               *
- *     state_template.h:120-147) -> __PATH_GUIDING__ is OFF in this build,*
- *     so init_from_camera/shade_surface do not touch them.                *
+ *     state_template.h:120-147) -> __PATH_GUIDING__ is OFF in this build.*
  *   - path.unguided_throughput (state_template.h:65) -> PATH_GUIDING only.*
  *   - path.mnee_shadow_state (state_template.h:45) -> MNEE only.          *
  *   - path.rng_pixel (state_template.h:35) and path.denoising_feature_    *
- *     throughput (state_template.h:70) -> same scalar/packed3 pattern as  *
- *     members above; left for the INIT_FROM_CAMERA port to add if needed. *
+ *     throughput (state_template.h:70) -> same scalar/packed3 pattern;    *
+ *     added when the INIT_FROM_CAMERA port needs them.                    *
  *   - ray.previous_dt (state_template.h:86) -> LIGHT_TREE only.           *
- *   - isect.u / isect.v (state_template.h:94-95) -> same float pattern as  *
- *     isect.t above; not read/written by the diffuse path until M5.       *
- *   - shadow_path.rng_pixel/rng_offset/sample/bounce/transparent_bounce/  *
- *     volume_bounds_bounce/glossy_bounce/transmission_bounce/diffuse_     *
- *     bounce/visibility/unshadowed_throughput/pass_diffuse_weight/        *
- *     pass_glossy_weight/packed_num_hits/unlit_throughput/path_segment/   *
- *     guiding_light_linking_mis_weight/bsdf_eval_average                  *
- *     (shadow_state_template.h:11-73) -> same sub-word/packed3/scalar     *
- *     patterns as shadow_path above; added per-kernel during M5 shadow    *
- *     work.                                                               *
- *   - shadow_ray.time/dP/dD/self_light_object/self_light_prim             *
+ *   - isect.u / isect.v (state_template.h:94-95) -> same float pattern as *
+ *     isect.t; not needed by the diffuse path until M5.                   *
+ *   - shadow_path.sample/rng_pixel/rng_offset/bounce/transparent_bounce/  *
+ *     volume_bounds_bounce/visibility/unshadowed_throughput/              *
+ *     pass_diffuse_weight/pass_glossy_weight/packed_num_hits/             *
+ *     unlit_throughput/path_segment/guiding_light_linking_mis_weight/     *
+ *     bsdf_eval_average (shadow_state_template.h:11-73) -> the            *
+ *     shade_surface shadow-copy set, added per-kernel during M5 shadow    *
+ *     work (mirror members stay uint64_t until then — each retyped when   *
+ *     its accessor lands, keeping the file's rule: retype = reached).     *
+ *   - shadow_ray.time/dP/dD/tmax/self_light_object/self_light_prim        *
  *     (shadow_state_template.h:82-87) -> same float/int pattern.          *
  *   - shadow_isect.u/v/prim/type (shadow_state_template.h:96-100) -> same *
- *     float/int AoS pattern as shadow_isect.t above.                      *
+ *     float/int AoS pattern as shadow_isect.t.                            *
  *   - the IntegratorStateGPU scalars (queue_counter/sort_key_counter/     *
  *     next_*_path_index/sort_partition_*; state.h:197-212) are NOT SoA    *
  *     members and are host-managed; not needed by these kernels.          *

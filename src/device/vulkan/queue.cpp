@@ -48,6 +48,11 @@ bool vulkan_stride_check(VulkanDevice *device);
  * Runs at most once, no-op unless CYCLES_VULKAN_SUBWORD_PROBE=1. */
 bool vulkan_subword_check(VulkanDevice *device);
 
+/* M4e S1b-6 state-accessor gate hook, implemented in kernels.cpp. Runs at
+ * most once, no-op unless CYCLES_VULKAN_STATE_ACCESS_PROBE=1; runs the clean
+ * mode plus the Task-4 fault modes 1..4 (see kernels.cpp for the full doc). */
+bool vulkan_state_access_probe(VulkanDevice *device);
+
 VulkanQueue::VulkanQueue(VulkanDevice *d) : DeviceQueue(d), vulkan_device_(d) {}
 
 int VulkanQueue::num_concurrent_states(const size_t s) const {
@@ -97,6 +102,9 @@ bool VulkanQueue::enqueue(DeviceKernel k, const int n, const DeviceKernelArgumen
   /* M4e S1b-4 Stage A: optional one-shot sub-word access probe (env
    * CYCLES_VULKAN_SUBWORD_PROBE=1), same no-op-unless-set semantics. */
   vulkan_subword_check(vulkan_device_);
+  /* M4e S1b-6: optional one-shot integrator-state accessor gate (env
+   * CYCLES_VULKAN_STATE_ACCESS_PROBE=1), same no-op-unless-set semantics. */
+  vulkan_state_access_probe(vulkan_device_);
   vulkan_device_->set_error("Vulkan: kernel dispatch not implemented yet (M4)");
   debug_enqueue_end();
   return false;

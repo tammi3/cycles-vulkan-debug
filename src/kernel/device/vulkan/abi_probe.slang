@@ -87,7 +87,9 @@ void abi_probe_main(uint3 tid : SV_DispatchThreadID)
 
     /* First integrator_state member (path.render_pixel_index): typed view
      * vs raw words at OFF_INTEGRATOR_STATE. */
-    uint64_t typed_ist = probe.params->integrator_state.path.render_pixel_index;
+    /* M4e S1b-6: these members are now TYPED pointers in the mirror (layout
+     * identical), so the raw device address is recovered with uint64_t(...). */
+    uint64_t typed_ist = uint64_t(probe.params->integrator_state.path.render_pixel_index);
     probe.out[7] = uint(typed_ist);
     probe.out[8] = uint(typed_ist >> 32);
     probe.out[9] = probe.params_raw[OFF_INTEGRATOR_STATE / 4];
@@ -98,21 +100,21 @@ void abi_probe_main(uint3 tid : SV_DispatchThreadID)
      * byte offset. If the mirror were still flat-SoA, these would MISMATCH. */
 
     /* volume_stack[1].shader */
-    uint64_t vs1s = probe.params->integrator_state.volume_stack.slot[1].shader;
+    uint64_t vs1s = uint64_t(probe.params->integrator_state.volume_stack.slot[1].shader);
     probe.out[12] = uint(vs1s);
     probe.out[13] = uint(vs1s >> 32);
     probe.out[14] = probe.params_raw[(OFF_IST + OFF_VS_ELEM1_SHADER) / 4];
     probe.out[15] = probe.params_raw[(OFF_IST + OFF_VS_ELEM1_SHADER) / 4 + 1];
 
     /* shadow_isect[1].object */
-    uint64_t si1o = probe.params->integrator_state.shadow_isect.slot[1].object;
+    uint64_t si1o = uint64_t(probe.params->integrator_state.shadow_isect.slot[1].object);
     probe.out[16] = uint(si1o);
     probe.out[17] = uint(si1o >> 32);
     probe.out[18] = probe.params_raw[(OFF_IST + OFF_SI_ELEM1_OBJECT) / 4];
     probe.out[19] = probe.params_raw[(OFF_IST + OFF_SI_ELEM1_OBJECT) / 4 + 1];
 
     /* shadow_volume_stack[1].shader */
-    uint64_t svs1s = probe.params->integrator_state.shadow_volume_stack.slot[1].shader;
+    uint64_t svs1s = uint64_t(probe.params->integrator_state.shadow_volume_stack.slot[1].shader);
     probe.out[20] = uint(svs1s);
     probe.out[21] = uint(svs1s >> 32);
     probe.out[22] = probe.params_raw[(OFF_IST + OFF_SVS_ELEM1_SHADER) / 4];

@@ -607,6 +607,742 @@ bool vulkan_abi_probe(VulkanDevice *dev)
 }
 
 /* =========================================================================
+ * M4e S1b-6 Task 3: integrator-state ACCESSOR GATE
+ * (optional, env CYCLES_VULKAN_STATE_ACCESS_PROBE=1; runs at most once.
+ *  CYCLES_VULKAN_STATE_ACCESS_MODE restricts the FAULT modes that run after
+ *  the mandatory clean mode-0 baseline: unset = run 1..4, "0" = clean only,
+ *  "1".."4" = clean + that single fault mode.)
+ * =========================================================================
+ *
+ * WHAT IT PROVES, byte for byte, on the GPU:
+ *  - every read_/write_ accessor in integrator_state.slang addresses the exact
+ *    SoA byte offset Cycles uses. Cycles allocates ONE array of max_num_paths
+ *    elements per KERNEL_STRUCT_MEMBER and per array slot
+ *    (path_trace_work_gpu.cpp:143-201); this gate allocates GATE_STATE_COUNT
+ *    elements per slice (stand-in for max_num_paths) and fills a REAL
+ *    IntegratorStateGPU - layout locked by the static_asserts above - with the
+ *    slice device addresses, exactly the way the Cycles allocator memcpy's its
+ *    device pointers in (path_trace_work_gpu.cpp:153-155).
+ *  - packed3 members stride 12 (float3*), AoS slots stride 16/48/16.
+ *  - sub-word (uint16/uint8) members pack two/four per 32-bit word without
+ *    clobbering the neighbouring state (adjacent states run in DIFFERENT
+ *    threads of one workgroup), and members/slots no accessor touches keep
+ *    their 0xEE init pattern.
+ *  - out[s] equals the host's recomputation of the shader's readback
+ *    accumulator (mode 0), i.e. every accessor's READ returns what was written.
+ *
+ * TASK-4 NEGATIVES: modes 1..4 inject one fault each (see the probe's header).
+ * Per AGENTS.md 11 a negative counts as DETECTED only if the fault CHANGES THE
+ * OUTPUT relative to the clean run of the same configuration, so mode 0 runs
+ * first, its bytes are snapshotted, and each fault mode is compared against
+ * that snapshot (payload bytes AND readback words).
+ *
+ * Composes with the M4b ABI probe: that probe proved the Slang mirror at
+ * KernelParamsVulkan+2984 is byte-identical to IntegratorStateGPU, so
+ * uploading the struct here exercises the same reading path the kernels will
+ * use. Neither probe writes the live params buffer. */
+namespace {
+
+/* Gate sizing: matches numthreads(8,1,1) in state_access_probe.slang. */
+constexpr uint32_t GATE_STATES = 8;
+/* PushGate = { IntegratorStateGPU* ist; uint* out; uint test_mode; } with
+ * Slang scalar layout: 8 + 8 + 4, padded to 8-byte alignment -> 24. */
+constexpr uint32_t GATE_PUSH_BYTES = 24;
+constexpr uint32_t GATE_OUT_WORDS = GATE_STATES;
+constexpr uint32_t GATE_CANARY_BYTES = 16; /* guard after every slice */
+constexpr uint32_t GATE_CANARY_BYTE = 0x5C;
+constexpr uint32_t GATE_INIT_BYTE = 0xEE;  /* fill for slices/bytes never written */
+constexpr uint32_t GATE_MAX_REPORT = 8;    /* mismatch detail lines logged per mode */
+
+/* Exact host mirror of gbits()/gbits3() in state_access_probe.slang. */
+uint32_t gate_gbits(const uint32_t id, const uint32_t i, const uint32_t s)
+{
+  return 0x40000000u + (i << 20) + (id << 8) + s;
+}
+
+/* What the accessors should have stored in a slice (their write formula). */
+enum GateExpect {
+  GATE_UNTOUCHED = 0, /* no accessor writes here: must keep the 0xEE pattern */
+  GATE_U32,           /* uint, or float BITS: gbits(id,slot,s) */
+  GATE_U16,           /* sub-word: (gbits & 0xFFFF) */
+  GATE_U8,            /* sub-word: (gbits & 0xFF) */
+  GATE_I32_NEG,       /* -int(gbits(id,slot,s)): the int accessors' value */
+  GATE_F32X3,         /* packed3: gbits(id), gbits(id+64), gbits(id+128) */
+};
+
+/* One SoA slice of the gate buffer: GATE_STATES elements + a canary guard.
+ * `mirror` is the byte offset of the POINTER for this member inside
+ * IntegratorStateGPU (the struct's own layout, not the payload's). */
+struct GateSlice {
+  std::string name;   /* log label */
+  size_t      off;    /* payload byte offset inside the SoA buffer */
+  size_t      mirror; /* pointer byte offset inside IntegratorStateGPU */
+  uint32_t    elem;   /* element size in bytes */
+  int         expect; /* GateExpect */
+  uint32_t    id;     /* gbits id (first component for GATE_F32X3) */
+  uint32_t    slot;   /* gbits `i` argument: the AoS slot, 0 for scalars */
+};
+
+/* RAII for every Vulkan handle the gate creates, so any early return still
+ * destroys what was created and the validation layer reports nothing. */
+struct GateResources {
+  VkDevice device = VK_NULL_HANDLE;
+  VkShaderModule module = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkBuffer soa_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory soa_memory = VK_NULL_HANDLE;
+  VkBuffer ist_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory ist_memory = VK_NULL_HANDLE;
+  VkBuffer out_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory out_memory = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+
+  ~GateResources()
+  {
+    if (device == VK_NULL_HANDLE) return;
+    if (fence) vkDestroyFence(device, fence, nullptr);
+    if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+    if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+    if (module) vkDestroyShaderModule(device, module, nullptr);
+    if (pool) vkDestroyCommandPool(device, pool, nullptr);
+    if (soa_buffer) vkDestroyBuffer(device, soa_buffer, nullptr);
+    if (soa_memory) vkFreeMemory(device, soa_memory, nullptr);
+    if (ist_buffer) vkDestroyBuffer(device, ist_buffer, nullptr);
+    if (ist_memory) vkFreeMemory(device, ist_memory, nullptr);
+    if (out_buffer) vkDestroyBuffer(device, out_buffer, nullptr);
+    if (out_memory) vkFreeMemory(device, out_memory, nullptr);
+  }
+};
+
+} /* namespace */
+
+bool vulkan_state_access_probe(VulkanDevice *dev)
+{
+  /* Run at most once per process, and only when the env hook is set. */
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+  const char *mode_env = getenv("CYCLES_VULKAN_STATE_ACCESS_MODE");
+  if (getenv("CYCLES_VULKAN_STATE_ACCESS_PROBE") == nullptr) return true;
+
+  /* Which modes run: 0 (clean baseline) always; faults unless restricted. */
+  int only_mode = -1; /* -1 = all */
+  if (mode_env) {
+    only_mode = atoi(mode_env);
+    if (only_mode < 0 || only_mode > 4) {
+      LOG_ERROR << "Vulkan: state access gate: invalid "
+                   "CYCLES_VULKAN_STATE_ACCESS_MODE='" << mode_env << "' (0..4).";
+      return false;
+    }
+  }
+  std::vector<int> modes;
+  modes.push_back(0);
+  if (only_mode >= 1 && only_mode <= 4) {
+    modes.push_back(only_mode);
+  }
+  else if (only_mode < 0) {
+    modes.push_back(1);
+    modes.push_back(2);
+    modes.push_back(3);
+    modes.push_back(4);
+  }
+
+  LOG_INFO << "Vulkan: state access gate starting "
+              "(CYCLES_VULKAN_STATE_ACCESS_PROBE=1, " << modes.size() << " mode(s)).";
+
+  /* 1. SPIR-V: compiled by hand with slangc (no build-system Slang rule). */
+  std::vector<char> spirv;
+  const char *env_path = getenv("CYCLES_VULKAN_STATE_ACCESS_PROBE_SPV");
+  const char *candidates[3] = {env_path,
+                               "state_access_probe.spv",
+                               "src/kernel/device/vulkan/state_access_probe.spv"};
+  const char *found = nullptr;
+  for (const char *c : candidates) {
+    if (c && probe_read_whole_file(c, spirv)) {
+      found = c;
+      break;
+    }
+  }
+  if (!found) {
+    LOG_ERROR << "Vulkan: state access gate: cannot find state_access_probe.spv "
+                 "(compile it with slangc or set CYCLES_VULKAN_STATE_ACCESS_PROBE_SPV).";
+    return false;
+  }
+  if (spirv.size() % 4 != 0) {
+    LOG_ERROR << "Vulkan: state access gate: '" << found << "' is not a valid SPIR-V module.";
+    return false;
+  }
+
+  /* 2. Slice table: one slice per Cycles SoA member the gate reaches.
+   *    Cycles sizes every member to max_num_paths elements and allocates EVERY
+   *    array slot (path_trace_work_gpu.cpp:143-201), so the gate does too -
+   *    fault mode 3 writes volume_stack slots 2..16 and must find them there. */
+  std::vector<GateSlice> slices;
+  IntegratorStateGPU ist{}; /* zero-init: unreachable members stay null */
+
+#define GATE_OFF(member) (offsetof(IntegratorStateGPU, member))
+
+  auto member = [&](const std::string &name, const size_t mirror, const uint32_t elem,
+                    const int kind, const uint32_t id, const uint32_t slot) -> size_t {
+    GateSlice sl;
+    sl.name = name;
+    sl.off = 0;
+    sl.mirror = mirror;
+    sl.elem = elem;
+    sl.expect = kind;
+    sl.id = id;
+    sl.slot = slot;
+    slices.push_back(std::move(sl));
+    return slices.size() - 1;
+  };
+
+  /* --- path (state_template.h:7-74), gbits ids 1..17 as in the shader --- */
+  member("path.render_pixel_index", GATE_OFF(path.render_pixel_index), 4, GATE_U32, 1, 0);
+  member("path.sample", GATE_OFF(path.sample), 4, GATE_U32, 2, 0);
+  member("path.bounce", GATE_OFF(path.bounce), 2, GATE_U16, 3, 0);
+  member("path.transparent_bounce", GATE_OFF(path.transparent_bounce), 2, GATE_U16, 4, 0);
+  member("path.queued_kernel", GATE_OFF(path.queued_kernel), 2, GATE_U16, 5, 0);
+  member("path.rng_offset", GATE_OFF(path.rng_offset), 2, GATE_U16, 6, 0);
+  member("path.visibility", GATE_OFF(path.visibility), 1, GATE_U8, 7, 0);
+  member("path.flag", GATE_OFF(path.flag), 4, GATE_U32, 8, 0);
+  member("path.mnee", GATE_OFF(path.mnee), 1, GATE_U8, 9, 0);
+  /* float members are compared as their BITS (GATE_U32): same bytes. */
+  member("path.mis_ray_pdf", GATE_OFF(path.mis_ray_pdf), 4, GATE_U32, 10, 0);
+  member("path.min_ray_pdf", GATE_OFF(path.min_ray_pdf), 4, GATE_U32, 11, 0);
+  member("path.continuation_probability",
+         GATE_OFF(path.continuation_probability), 4, GATE_U32, 12, 0);
+  member("path.optical_depth", GATE_OFF(path.optical_depth), 4, GATE_U32, 13, 0);
+  member("path.shader_sort_key", GATE_OFF(path.shader_sort_key), 4, GATE_U32, 14, 0);
+  member("path.throughput", GATE_OFF(path.throughput), 12, GATE_F32X3, 15, 0);
+  member("path.mis_origin_n", GATE_OFF(path.mis_origin_n), 12, GATE_F32X3, 16, 0);
+  member("path.pass_diffuse_weight",
+         GATE_OFF(path.pass_diffuse_weight), 12, GATE_F32X3, 17, 0);
+
+  /* --- ray (state_template.h:78-87), ids 18..24 --- */
+  member("ray.P", GATE_OFF(ray.P), 12, GATE_F32X3, 18, 0);
+  member("ray.D", GATE_OFF(ray.D), 12, GATE_F32X3, 19, 0);
+  member("ray.dP", GATE_OFF(ray.dP), 4, GATE_U32, 20, 0);
+  member("ray.dD", GATE_OFF(ray.dD), 4, GATE_U32, 21, 0);
+  member("ray.tmin", GATE_OFF(ray.tmin), 4, GATE_U32, 22, 0);
+  member("ray.tmax", GATE_OFF(ray.tmax), 4, GATE_U32, 23, 0);
+  member("ray.time", GATE_OFF(ray.time), 4, GATE_U32, 24, 0);
+
+  /* --- isect (state_template.h:92-99), ids 25..28 --- */
+  member("isect.t", GATE_OFF(isect.t), 4, GATE_U32, 25, 0);
+  member("isect.prim", GATE_OFF(isect.prim), 4, GATE_I32_NEG, 26, 0);
+  member("isect.object", GATE_OFF(isect.object), 4, GATE_I32_NEG, 27, 0);
+  member("isect.type", GATE_OFF(isect.type), 4, GATE_I32_NEG, 28, 0);
+
+  /* --- volume_stack[32] AoS (state_template.h:112-117; stride 16, object@0,
+   *     shader@8 per the static_asserts above). All 32 slots allocated. --- */
+  const size_t vs0 = slices.size();
+  for (uint32_t i = 0; i < 32; i++) {
+    const size_t base = GATE_OFF(volume_stack) + i * sizeof(VolumeStackElem);
+    member(string_printf("volume_stack[%u].object", i),
+           base + offsetof(VolumeStackElem, object), 4, GATE_UNTOUCHED, 0, 0);
+    member(string_printf("volume_stack[%u].shader", i),
+           base + offsetof(VolumeStackElem, shader), 4, GATE_UNTOUCHED, 0, 0);
+  }
+  /* The probe writes object@1, shader@2 and BOTH members of slot 31. */
+  slices[vs0 + 1 * 2 + 0].expect = GATE_I32_NEG; /* object[1]  = -gbits(29,1,s) */
+  slices[vs0 + 1 * 2 + 0].id = 29;
+  slices[vs0 + 1 * 2 + 0].slot = 1;
+  slices[vs0 + 2 * 2 + 1].expect = GATE_I32_NEG; /* shader[2]  = -gbits(30,2,s) */
+  slices[vs0 + 2 * 2 + 1].id = 30;
+  slices[vs0 + 2 * 2 + 1].slot = 2;
+  slices[vs0 + 31 * 2 + 0].expect = GATE_I32_NEG; /* object[31] = -gbits(29,31,s) */
+  slices[vs0 + 31 * 2 + 0].id = 29;
+  slices[vs0 + 31 * 2 + 0].slot = 31;
+  slices[vs0 + 31 * 2 + 1].expect = GATE_I32_NEG; /* shader[31] = -gbits(30,31,s) */
+  slices[vs0 + 31 * 2 + 1].id = 30;
+  slices[vs0 + 31 * 2 + 1].slot = 31;
+
+  /* --- shadow_path (shadow_state_template.h), ids 31..35 --- */
+  member("shadow_path.render_pixel_index", GATE_OFF(shadow_path.render_pixel_index),
+         4, GATE_U32, 31, 0);
+  member("shadow_path.queued_kernel", GATE_OFF(shadow_path.queued_kernel),
+         2, GATE_U16, 32, 0);
+  member("shadow_path.flag", GATE_OFF(shadow_path.flag), 4, GATE_U32, 33, 0);
+  member("shadow_path.lightgroup", GATE_OFF(shadow_path.lightgroup), 1, GATE_U8, 34, 0);
+  member("shadow_path.throughput", GATE_OFF(shadow_path.throughput),
+         12, GATE_F32X3, 35, 0);
+
+  /* --- shadow_ray (shadow_state_template.h:78-88), ids 36..38 --- */
+  member("shadow_ray.P", GATE_OFF(shadow_ray.P), 12, GATE_F32X3, 36, 0);
+  member("shadow_ray.D", GATE_OFF(shadow_ray.D), 12, GATE_F32X3, 37, 0);
+  member("shadow_ray.tmin", GATE_OFF(shadow_ray.tmin), 4, GATE_U32, 38, 0);
+
+  /* --- shadow_isect[4] AoS (stride 48, six 4-byte members per slot).
+   *     The probe writes t[3] and object[2]; all six x four are allocated
+   *     because Cycles allocates them all. --- */
+  const size_t si0 = slices.size();
+  for (uint32_t i = 0; i < 4; i++) {
+    const size_t base = GATE_OFF(shadow_isect) + i * sizeof(ShadowIsectElem);
+    member(string_printf("shadow_isect[%u].t", i),
+           base + offsetof(ShadowIsectElem, t), 4, GATE_UNTOUCHED, 0, 0);
+    member(string_printf("shadow_isect[%u].u", i),
+           base + offsetof(ShadowIsectElem, u), 4, GATE_UNTOUCHED, 0, 0);
+    member(string_printf("shadow_isect[%u].v", i),
+           base + offsetof(ShadowIsectElem, v), 4, GATE_UNTOUCHED, 0, 0);
+    member(string_printf("shadow_isect[%u].prim", i),
+           base + offsetof(ShadowIsectElem, prim), 4, GATE_UNTOUCHED, 0, 0);
+    member(string_printf("shadow_isect[%u].object", i),
+           base + offsetof(ShadowIsectElem, object), 4, GATE_UNTOUCHED, 0, 0);
+    member(string_printf("shadow_isect[%u].type", i),
+           base + offsetof(ShadowIsectElem, type), 4, GATE_UNTOUCHED, 0, 0);
+  }
+  slices[si0 + 3 * 6 + 0].expect = GATE_U32;   /* t[3]      = gbits(39,3,s) */
+  slices[si0 + 3 * 6 + 0].id = 39;
+  slices[si0 + 3 * 6 + 0].slot = 3;
+  slices[si0 + 2 * 6 + 4].expect = GATE_I32_NEG; /* object[2] = -gbits(40,2,s) */
+  slices[si0 + 2 * 6 + 4].id = 40;
+  slices[si0 + 2 * 6 + 4].slot = 2;
+
+  /* --- shadow_volume_stack[32] AoS (same shape as volume_stack) --- */
+  const size_t svs0 = slices.size();
+  for (uint32_t i = 0; i < 32; i++) {
+    const size_t base = GATE_OFF(shadow_volume_stack) + i * sizeof(ShadowVolumeStackElem);
+    member(string_printf("shadow_volume_stack[%u].object", i),
+           base + offsetof(ShadowVolumeStackElem, object), 4, GATE_UNTOUCHED, 0, 0);
+    member(string_printf("shadow_volume_stack[%u].shader", i),
+           base + offsetof(ShadowVolumeStackElem, shader), 4, GATE_UNTOUCHED, 0, 0);
+  }
+  slices[svs0 + 1 * 2 + 0].expect = GATE_I32_NEG; /* object[1] = -gbits(41,1,s) */
+  slices[svs0 + 1 * 2 + 0].id = 41;
+  slices[svs0 + 1 * 2 + 0].slot = 1;
+  slices[svs0 + 3 * 2 + 1].expect = GATE_I32_NEG; /* shader[3] = -gbits(42,3,s) */
+  slices[svs0 + 3 * 2 + 1].id = 42;
+  slices[svs0 + 3 * 2 + 1].slot = 3;
+
+#undef GATE_OFF
+
+  /* Payload offsets: every slice = GATE_STATES elements + canary guard. */
+  size_t soa_size = 0;
+  for (auto &sl : slices) {
+    sl.off = soa_size;
+    soa_size += (size_t)sl.elem * GATE_STATES + GATE_CANARY_BYTES;
+  }
+
+  GateResources res;
+  const VkDevice vk_dev = dev->vk_device();
+  res.device = vk_dev;
+
+  /* 3. Buffers: host-visible + coherent so the host can init and read back
+   *    without a transfer; STORAGE | SHADER_DEVICE_ADDRESS because the shader
+   *    reaches them through raw device pointers (same pair the ABI probe uses). */
+  auto make_buffer = [&](const size_t size, VkBuffer &buf, VkDeviceMemory &mem,
+                         uint64_t &addr, const char *what) -> bool {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(vk_dev, &bci, nullptr, &buf) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: state access gate: " << what << " buffer creation failed.";
+      return false;
+    }
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(vk_dev, buf, &reqs);
+    VkMemoryAllocateFlagsInfo flags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &flags;
+    ai.allocationSize = reqs.size;
+    ai.memoryTypeIndex = dev->find_memory_type(
+        reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vkAllocateMemory(vk_dev, &ai, nullptr, &mem) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: state access gate: " << what << " memory allocation failed.";
+      return false;
+    }
+    if (vkBindBufferMemory(vk_dev, buf, mem, 0) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: state access gate: " << what << " bind failed.";
+      return false;
+    }
+    VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    bai.buffer = buf;
+    addr = vkGetBufferDeviceAddress(vk_dev, &bai);
+    /* No VkResult here: vkGetBufferDeviceAddress signals failure by returning 0. */
+    if (addr == 0) {
+      LOG_ERROR << "Vulkan: state access gate: " << what
+                << " buffer device address query failed (returned 0).";
+      return false;
+    }
+    return true;
+  };
+
+  uint64_t soa_addr = 0, ist_addr = 0, out_addr = 0;
+  if (!make_buffer(soa_size, res.soa_buffer, res.soa_memory, soa_addr, "SoA")) return false;
+  if (!make_buffer(sizeof(IntegratorStateGPU), res.ist_buffer, res.ist_memory, ist_addr,
+                   "mirror"))
+    return false;
+  if (!make_buffer(GATE_OUT_WORDS * sizeof(uint32_t), res.out_buffer, res.out_memory,
+                   out_addr, "readback"))
+    return false;
+
+  /* 4. Fill the mirror: one device address per SoA member (the same memcpy
+   *    shape Cycles uses, path_trace_work_gpu.cpp:153-155), then upload it. */
+  for (const auto &sl : slices) {
+    const uint64_t addr = soa_addr + sl.off;
+    memcpy(reinterpret_cast<char *>(&ist) + sl.mirror, &addr, sizeof(addr));
+  }
+  {
+    void *mapped = nullptr;
+    if (vkMapMemory(vk_dev, res.ist_memory, 0, sizeof(IntegratorStateGPU), 0, &mapped) !=
+        VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: state access gate: mapping mirror buffer failed.";
+      return false;
+    }
+    memcpy(mapped, &ist, sizeof(ist));
+    vkUnmapMemory(vk_dev, res.ist_memory);
+  }
+
+  /* 5. Shader module + pipeline (entry point is SPIR-V "main"; see the ABI
+   *    probe's note at its step 6). No descriptor sets: push constants + BDA. */
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(dev->vk_physical_device(), &props);
+  if (props.limits.maxPushConstantsSize < GATE_PUSH_BYTES) {
+    LOG_ERROR << "Vulkan: state access gate: maxPushConstantsSize too small.";
+    return false;
+  }
+  VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = spirv.size();
+  smi.pCode = reinterpret_cast<const uint32_t *>(spirv.data());
+  if (vkCreateShaderModule(vk_dev, &smi, nullptr, &res.module) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: state access gate: vkCreateShaderModule failed.";
+    return false;
+  }
+  VkPushConstantRange pcr{};
+  pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pcr.offset = 0;
+  pcr.size = GATE_PUSH_BYTES;
+  VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pli.pushConstantRangeCount = 1;
+  pli.pPushConstantRanges = &pcr;
+  if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &res.layout) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: state access gate: pipeline layout creation failed.";
+    return false;
+  }
+  VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  cpi.stage.module = res.module;
+  cpi.stage.pName = "main";
+  cpi.layout = res.layout;
+  if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &res.pipeline) !=
+      VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: state access gate: compute pipeline creation failed "
+                 "(bad entry point name?).";
+    return false;
+  }
+
+  /* 6. Command pool/buffer + fence, on the device's own family/queue. */
+  const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
+  VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  cpci.queueFamilyIndex = family;
+  if (vkCreateCommandPool(vk_dev, &cpci, nullptr, &res.pool) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: state access gate: command pool creation failed.";
+    return false;
+  }
+  VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = res.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(vk_dev, &cbai, &cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: state access gate: command buffer allocation failed.";
+    return false;
+  }
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (vkCreateFence(vk_dev, &fci, nullptr, &res.fence) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: state access gate: fence creation failed.";
+    return false;
+  }
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(vk_dev, family, 0, &queue);
+
+  /* 7. Helpers: payload init / readback / byte formatting. */
+  auto soa_init = [&]() {
+    void *p = nullptr;
+    if (vkMapMemory(vk_dev, res.soa_memory, 0, soa_size, 0, &p) != VK_SUCCESS) return false;
+    uint8_t *b = static_cast<uint8_t *>(p);
+    memset(b, GATE_INIT_BYTE, soa_size); /* payload: "never written" pattern */
+    for (const auto &sl : slices) /* canary guard after each payload */
+      memset(b + sl.off + (size_t)sl.elem * GATE_STATES, GATE_CANARY_BYTE,
+             GATE_CANARY_BYTES);
+    vkUnmapMemory(vk_dev, res.soa_memory);
+    return true;
+  };
+  auto soa_read = [&](std::vector<uint8_t> &dst) {
+    void *p = nullptr;
+    dst.resize(soa_size);
+    if (vkMapMemory(vk_dev, res.soa_memory, 0, soa_size, 0, &p) != VK_SUCCESS) return false;
+    memcpy(dst.data(), p, soa_size);
+    vkUnmapMemory(vk_dev, res.soa_memory);
+    return true;
+  };
+  auto out_read = [&](uint32_t *dst) {
+    void *p = nullptr;
+    if (vkMapMemory(vk_dev, res.out_memory, 0, GATE_OUT_WORDS * sizeof(uint32_t), 0, &p) !=
+        VK_SUCCESS)
+      return false;
+    memcpy(dst, p, GATE_OUT_WORDS * sizeof(uint32_t));
+    vkUnmapMemory(vk_dev, res.out_memory);
+    return true;
+  };
+  auto hex_bytes = [](const uint8_t *b, const size_t n) {
+    std::string s;
+    char buf[4];
+    for (size_t i = 0; i < n; i++) {
+      snprintf(buf, sizeof(buf), "%02x", b[i]);
+      s += buf;
+    }
+    return s;
+  };
+
+  /* Expected bytes of one slice for state s: mirror of the shader's write. */
+  auto expected_bytes = [](const GateSlice &sl, const uint32_t s, uint8_t *out) {
+    switch (sl.expect) {
+      case GATE_U32: {
+        const uint32_t v = gate_gbits(sl.id, sl.slot, s);
+        memcpy(out, &v, 4);
+        break;
+      }
+      case GATE_U16: {
+        const uint16_t v = (uint16_t)(gate_gbits(sl.id, sl.slot, s) & 0xFFFFu);
+        memcpy(out, &v, 2);
+        break;
+      }
+      case GATE_U8: {
+        const uint8_t v = (uint8_t)(gate_gbits(sl.id, sl.slot, s) & 0xFFu);
+        memcpy(out, &v, 1);
+        break;
+      }
+      case GATE_I32_NEG: {
+        const int32_t v = -(int32_t)gate_gbits(sl.id, sl.slot, s);
+        memcpy(out, &v, 4);
+        break;
+      }
+      case GATE_F32X3: {
+        const uint32_t v0 = gate_gbits(sl.id, sl.slot, s);
+        const uint32_t v1 = gate_gbits(sl.id + 64u, sl.slot, s);
+        const uint32_t v2 = gate_gbits(sl.id + 128u, sl.slot, s);
+        memcpy(out, &v0, 4);
+        memcpy(out + 4, &v1, 4);
+        memcpy(out + 8, &v2, 4);
+        break;
+      }
+      default:
+        memset(out, GATE_INIT_BYTE, sl.elem); /* untouched: init pattern */
+        break;
+    }
+  };
+
+  /* Expected out[s] for mode 0: term-for-term mirror of the shader's `acc`
+   * (state_access_probe.slang), i.e. every accessor's READ returns exactly
+   * what the preceding WRITE stored. */
+  auto expected_acc = [](const uint32_t s) {
+    const auto G = [s](const uint32_t id, const uint32_t i) {
+      return gate_gbits(id, i, s);
+    };
+    const auto NEG = [s](const uint32_t id, const uint32_t i) {
+      return (uint32_t)(-(int32_t)gate_gbits(id, i, s));
+    };
+    uint32_t acc = 0;
+    acc ^= G(1, 0);
+    acc ^= G(2, 0);
+    acc ^= G(3, 0) & 0xFFFFu;
+    acc ^= G(4, 0) & 0xFFFFu;
+    acc ^= G(5, 0) & 0xFFFFu;
+    acc ^= G(6, 0) & 0xFFFFu;
+    acc ^= G(7, 0) & 0xFFu;
+    acc ^= G(8, 0);
+    acc ^= G(9, 0) & 0xFFu;
+    acc ^= G(10, 0);
+    acc ^= G(11, 0);
+    acc ^= G(12, 0);
+    acc ^= G(13, 0);
+    acc ^= G(14, 0);
+    acc ^= G(15, 0);
+    acc ^= G(16, 0);
+    acc ^= G(17, 0);
+    acc ^= G(18, 0);
+    acc ^= G(19, 0);
+    acc ^= G(20, 0);
+    acc ^= G(21, 0);
+    acc ^= G(22, 0);
+    acc ^= G(23, 0);
+    acc ^= G(24, 0);
+    acc ^= G(25, 0);
+    acc ^= NEG(26, 0);
+    acc ^= NEG(27, 0);
+    acc ^= NEG(28, 0);
+    acc ^= NEG(29, 1);
+    acc ^= NEG(30, 2);
+    acc ^= NEG(29, 31);
+    acc ^= G(31, 0);
+    acc ^= G(32, 0) & 0xFFFFu;
+    acc ^= G(33, 0);
+    acc ^= G(34, 0) & 0xFFu;
+    acc ^= G(35, 0);
+    acc ^= G(36, 0);
+    acc ^= G(37, 0);
+    acc ^= G(38, 0);
+    acc ^= G(39, 3);
+    acc ^= NEG(40, 2);
+    acc ^= NEG(41, 1);
+    acc ^= NEG(42, 3);
+    return acc;
+  };
+
+  LOG_INFO << "Vulkan: state access gate: " << slices.size() << " SoA slice(s), "
+           << soa_size << " bytes (payload + canaries), "
+           << sizeof(IntegratorStateGPU) << "-byte mirror at 0x" << probe_hex64(ist_addr);
+
+  /* 8. Mode loop: init payload, dispatch, read back, verify. */
+  bool mode0_ok = false;
+  bool faults_ok = true;
+  std::vector<uint8_t> clean; /* mode-0 payload snapshot (AGENTS.md 11 baseline) */
+  uint32_t clean_out[GATE_OUT_WORDS] = {0};
+
+  for (const int mode : modes) {
+    if (!soa_init()) {
+      LOG_ERROR << "Vulkan: state access gate: payload init failed (mode " << mode << ").";
+      return false;
+    }
+
+    if (vkResetCommandPool(vk_dev, res.pool, 0) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: state access gate: vkResetCommandPool failed.";
+      return false;
+    }
+    VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &begin_info) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: state access gate: vkBeginCommandBuffer failed.";
+      return false;
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.pipeline);
+    const uint64_t push[3] = {ist_addr, out_addr, (uint64_t)mode};
+    /* Layout: {u64 ist, u64 out, u32 mode, u32 pad}; mode occupies bytes 16..19. */
+    vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
+    vkCmdDispatch(cmd, 1, 1, 1); /* one workgroup of 8 threads -> states 0..7 */
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: state access gate: vkEndCommandBuffer failed.";
+      return false;
+    }
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    /* The fence is reused across modes: after the previous wait it is
+     * SIGNALED, and submitting a signaled fence violates
+     * VUID-vkQueueSubmit-fence-00063 (and makes the next wait return before
+     * the work is done). Reset it before every submit. */
+    if (vkResetFences(vk_dev, 1, &res.fence) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: state access gate: vkResetFences failed.";
+      return false;
+    }
+    bool submitted = false;
+    if (vkQueueSubmit(queue, 1, &si, res.fence) == VK_SUCCESS) {
+      submitted = vkWaitForFences(vk_dev, 1, &res.fence, VK_TRUE, 10000000000ull) ==
+                  VK_SUCCESS;
+    }
+    if (!submitted) {
+      LOG_ERROR << "Vulkan: state access gate: queue submit/wait failed (mode " << mode
+                << ").";
+      return false;
+    }
+
+    std::vector<uint8_t> got;
+    uint32_t out[GATE_OUT_WORDS] = {0};
+    if (!soa_read(got) || !out_read(out)) {
+      LOG_ERROR << "Vulkan: state access gate: readback failed (mode " << mode << ").";
+      return false;
+    }
+
+    /* --- verify payload: expected bytes, canaries, and (for faults) the
+     *     difference against the clean run, which is what DETECTED means --- */
+    uint32_t mismatches = 0, bad_canaries = 0, logged = 0;
+    for (const auto &sl : slices) {
+      const uint8_t *payload = got.data() + sl.off;
+      const uint8_t *canary = payload + (size_t)sl.elem * GATE_STATES;
+      for (uint32_t b = 0; b < GATE_CANARY_BYTES; b++) {
+        if (canary[b] != GATE_CANARY_BYTE) {
+          bad_canaries++;
+          if (logged < GATE_MAX_REPORT) {
+            LOG_ERROR << "Vulkan: state access gate: mode " << mode << " CANARY clobbered in "
+                      << sl.name;
+            logged++;
+          }
+          break;
+        }
+      }
+      for (uint32_t s = 0; s < GATE_STATES; s++) {
+        uint8_t exp[12];
+        expected_bytes(sl, s, exp);
+        const uint8_t *p = payload + (size_t)s * sl.elem;
+        if (memcmp(exp, p, sl.elem) != 0) {
+          mismatches++;
+          if (logged < GATE_MAX_REPORT) {
+            LOG_ERROR << "Vulkan: state access gate: mode " << mode << " MISMATCH " << sl.name
+                      << "[state " << s << "] expected " << hex_bytes(exp, sl.elem) << " got "
+                      << hex_bytes(p, sl.elem);
+            logged++;
+          }
+        }
+      }
+    }
+
+    uint32_t diff_bytes = 0, diff_out = 0;
+    if (mode == 0) {
+      bool acc_ok = true;
+      for (uint32_t s = 0; s < GATE_STATES; s++) {
+        if (out[s] != expected_acc(s)) {
+          acc_ok = false;
+          LOG_ERROR << "Vulkan: state access gate: mode 0 READBACK out[" << s
+                    << "] expected 0x" << probe_hex64(expected_acc(s)) << " got 0x"
+                    << probe_hex64(out[s]);
+        }
+      }
+      mode0_ok = (mismatches == 0) && (bad_canaries == 0) && acc_ok;
+      LOG_INFO << "Vulkan: state access gate: mode 0 (clean): payload mismatches="
+               << mismatches << ", bad canaries=" << bad_canaries << ", readback acc "
+               << (acc_ok ? "OK" : "WRONG") << " => " << (mode0_ok ? "PASS" : "FAIL");
+      clean = got;
+      memcpy(clean_out, out, sizeof(clean_out));
+    }
+    else {
+      for (size_t i = 0; i < got.size(); i++)
+        if (got[i] != clean[i]) diff_bytes++;
+      for (uint32_t s = 0; s < GATE_STATES; s++)
+        if (out[s] != clean_out[s]) diff_out++;
+      const bool detected = (diff_bytes > 0) || (diff_out > 0);
+      if (!detected) faults_ok = false;
+      LOG_INFO << "Vulkan: state access gate: mode " << mode
+               << " (fault): payload mismatches=" << mismatches
+               << ", bad canaries=" << bad_canaries
+               << ", bytes differing from clean run=" << diff_bytes
+               << ", out words differing=" << diff_out << " => "
+               << (detected ? "DETECTED" : "NOT DETECTED");
+    }
+  }
+
+  const bool ok = mode0_ok && faults_ok;
+  if (ok) {
+    LOG_INFO << "Vulkan: state access gate: ALL CHECKS PASSED (mode 0 clean PASS, every "
+                "requested fault DETECTED).";
+  }
+  else {
+    LOG_ERROR << "Vulkan: state access gate: FAILED (mode 0 "
+              << (mode0_ok ? "PASS" : "FAIL") << ", faults "
+              << (faults_ok ? "all DETECTED" : "at least one NOT DETECTED")
+              << "). See the lines above; details are per-mode.";
+  }
+  return ok;
+}
+
+/* =========================================================================
  * M4d diffuse-closure probe (optional, env CYCLES_VULKAN_BSDF_PROBE=1)
  * =========================================================================
  * Exercises the just-ported Lambertian closure (bsdf_diffuse.slang) on the
