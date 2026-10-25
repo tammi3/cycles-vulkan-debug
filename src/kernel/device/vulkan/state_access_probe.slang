@@ -22,8 +22,14 @@
 //     configuration). In narrow mode p[s] degenerates to a correct 16-bit
 //     store, so these two negatives would NOT fire there.
 //
-// Bitcast used by mode 1 is the spirv_asm form proven in M4e S1b-6:
+// Negative mode 1 (M4e S1b-7): it was originally written as a pointer bitcast
 //   float4* f4 = spirv_asm { result:$$float4* = OpBitcast $addr; };
+// but SwiftShader's JIT crashes (0xC00000FD in vkCreateComputePipelines) on
+// ANY PhysicalStorageBuffer pointer OpBitcast — the SPIR-V is spec-valid
+// (spirv-val passes) and the RX 570 runs it, so it is a SwiftShader bug
+// (bisected 2026-10-24: minimal shader +/- the bitcast). Mode 1 now writes
+// the identical bytes through a host-pushed uint* word view
+// (pc.throughput_words), so no bitcast is needed anywhere in this kernel.
 
 #include "integrator_state.slang"
 
@@ -48,6 +54,12 @@ struct PushGate
 {
     IntegratorStateGPU* ist;
     uint* out;
+    /* M4e S1b-7: uint* word view of the path.throughput slice (base address +
+     * byte offset pushed by the host). Mode 1's stride-16 fault goes through
+     * it so the kernel needs no pointer OpBitcast (SwiftShader JIT bug, see
+     * the header note). Layout matches GATE_PUSH_BYTES=32 in kernels.cpp:
+     * 8 + 8 + 8 + 4 padded -> 32, test_mode at byte 24. */
+    uint* throughput_words;
     uint test_mode;
 };
 
@@ -136,17 +148,22 @@ void state_access_main(uint3 tid : SV_DispatchThreadID)
      * a float4* view of the SAME address -> elements land at byte 16*s
      * instead of 12*s, and bytes 12s+12..15 clobber the next element. */
     if (mode == 1u) {
-        /* M4e S1b-7: bitcast the POINTER directly (float3* -> float4*).
-         * The previous form went through uint64_t(ist->path.throughput), which
-         * emits OpConvertPtrToU + OpCapability Int64 — SwiftShader supports
-         * neither (gate_swiftshader.log: "Unsupported capability 11",
-         * "UNREACHABLE ... ConvertPtrToU" -> 0xC00000FD). A pointer-to-pointer
-         * OpBitcast is valid SPIR-V on its own and needs no 64-bit type. */
-        float3* p = ist->path.throughput;
-        float4* f4 = spirv_asm {
-            result: $$float4* = OpBitcast $p;
-        };
-        f4[s] = float4(gbits3(15u, 0u, s), 0.0);            // FAULT: stride 16
+        /* FAULT: a stride-16 store into the stride-12 packed3 slice.
+         * Byte-identical to the original expression
+         *     float4* f4 = (bitcast) ist->path.throughput;  f4[s] = float4(...)
+         * which lands at byte 16*s: words {gbits(15), gbits(79), gbits(143),
+         * 0} — gbits3(15,0,s) is (asfloat(gbits(15,0,s)), asfloat(gbits(79,
+         * 0,s)), asfloat(gbits(143,0,s))) and asuint(asfloat(x)) == x.
+         * Written through the host-pushed uint* word view instead of a
+         * float3*->float4* pointer OpBitcast, because SwiftShader's JIT
+         * crashes on any PhysicalStorageBuffer pointer bitcast (valid SPIR-V,
+         * spirv-val passes; bisected 2026-10-24, tests gate_minimal_d/e).
+         * Same bytes -> same MISMATCH/canary verdict on every device. */
+        uint* w = pc.throughput_words;
+        w[4u * s + 0u] = gbits(15u, 0u, s);
+        w[4u * s + 1u] = gbits(79u, 0u, s);
+        w[4u * s + 2u] = gbits(143u, 0u, s);
+        w[4u * s + 3u] = 0u;                                // FAULT: stride 16
     }
     else {
         write_path_throughput(ist, s, gbits3(15u, 0u, s));

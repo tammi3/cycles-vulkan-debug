@@ -1,3 +1,66 @@
+M4e S1b-7 SESSION (SwiftShader re-verify -> retype committed -> GATE PASSES ON
+SwiftShader + divergence inventory) — 2026-10-24
+==========================================================================================
+STATUS: COMPLETE. Uncommitted diff = the mode-1 word-view fix ONLY (kernels.cpp
++ state_access_probe.slang, +59/-17). Repo is AHEAD of older notes: the user
+committed the retype + gate trace markers mid-session (fc82c8a37) — vulkan_data.slang
+state structs are typed, 53 uint64_t remain = params slots only (retype-on-landing).
+Trust the repo over any older summary.
+
+1. STEP 0 (pre-retype SwiftShader re-verify): 0xC00000FD with VUID-pCode-08740
+   (device exposes no shaderInt64), "Unsupported capability 11" (Int64),
+   "UNREACHABLE ConvertPtrToU". Retype was mandatory, not optional.
+2. POST-RETYPE the gate still crashed at vkCreateComputePipelines. Bisected with
+   minimal shaders in $env:LOCALAPPDATA\Temp\opencode (NOT in the repo):
+     A minimal/no bitcast -> RUNS (exit 0, all 5 dispatches)
+     B full gate, mode-1 bitcast removed -> RUNS (mode 0 PASS; 2/3/4 DETECTED)
+     D minimal + OpBitcast uint*->float4* -> CRASH 0xC00000FD
+     E minimal + OpBitcast uint*->float*  -> CRASH 0xC00000FD
+     F OpPtrAccessChain cast instead     -> INVALID SPIR-V (spirv-val rejects)
+   => SWIFTSHADER BUG: ANY pointer-to-pointer OpBitcast on PhysicalStorageBuffer
+   pointers is spec-valid (spirv-val OK) and runs on the RX 570, but crashes
+   SwiftShader's Subzero JIT silently inside vkCreateComputePipelines.
+3. FIX (user-approved): host pushes a 3rd pointer — uint* throughput_words
+   (= soa_addr + path.throughput slice off). PushGate 24 -> 32 bytes,
+   mode at byte 24 (GATE_PUSH_BYTES). Mode 1 now writes its stride-16 fault as
+   w[4s..4s+3] = {gbits(15,0,s), gbits(79,0,s), gbits(143,0,s), 0} —
+   BYTE-IDENTICAL to the old float4[s] bitcast write; 0 pointer OpBitcast left
+   (SPV has 77 OpBitcast, all scalar asfloat/asuint — proven safe by test B).
+
+GATE RESULTS (final, this session, layer proven, 0 VUID, exit 0 both):
+- RX 570 final_rx570.log: ABI probe ALL VALUES MATCH + gate ALL CHECKS PASSED;
+  mode-1 signature unchanged vs pre-fix: 58/27/184/16 bytes diff.
+- SwiftShader wordview_swiftshader.log (+rerun identical): ALL CHECKS PASSED,
+  mode 0 clean PASS, modes 1-4 DETECTED: 67/27/184/16 bytes diff.
+- Mode-1 count differs 67 vs 58 (9 vs 7 mismatches): PRE-EXISTING gate-geometry
+  artifact — mode-1 thread s=7's fault spills into the NEXT slice (mis_origin_n,
+  bytes 112..127) racing other threads' clean writes (same spill existed with
+  the old float4 form). Deterministic per device; verdict identical. Harness NOT
+  touched; recorded as observation only.
+
+OPEN / NEXT:
+- Divergence inventory (16 candidates + stub list + 6 contradictions) presented
+  to the user for review; NO DIVERGENCES.md writes until approved. Headline
+  candidates: traverse safety instrumentation, 0xFFFFFFFF visibility mask (Q5),
+  spike camera in gate, missing TABULATED_SOBOL branch, missing dP/dD, dyn-index
+  driver workaround, num_concurrent_states formula, mem_copy_from stride
+  heuristic, stale path_trace prototype, type==0 miss assertion.
+- Narrow-mode SPV still compile-only (never executed) — pre-flight before M5.
+- Narrow-vs-atomic timing = deferred M5 sub-step (user decision).
+- SwiftShader pointer-OpBitcast bug has minimal repros (tests D/E) — candidate
+  for an upstream report if the user wants.
+
+TRAPS/COMMANDS THAT WORKED:
+- SwiftShader run: same env as normal gate runs +
+  VK_ICD_FILENAMES=C:\Windows\System32\Microsoft-Edge-WebView\vk_swiftshader_icd.json;
+  capture `cmd /c "cycles.exe ... 1>log 2>&1"` (stdout is lost on crash — use
+  CYCLES_VULKAN_GATE_TRACE=1 markers, they go to unbuffered stderr).
+- shell tool calls do NOT persist env vars between calls; re-set every time.
+- Never PowerShell `*>` for logs (UTF-16 + word wrap at ~120 cols).
+- slangc -I <src/kernel/device/vulkan> works for temp-dir copies of gate slangs.
+
+==================== PREVIOUS SESSION (M4e S1b-6, kept below) ====================
+
 M4e S1b-6 SESSION (Stage B: state accessors + gate) — 2026-10-23/24
 ========================================================================
 STATUS: ALL STEPS A-F COMPLETE. Tasks 1-6 done: mirror retyped; 42+42

@@ -645,9 +645,14 @@ namespace {
 
 /* Gate sizing: matches numthreads(8,1,1) in state_access_probe.slang. */
 constexpr uint32_t GATE_STATES = 8;
-/* PushGate = { IntegratorStateGPU* ist; uint* out; uint test_mode; } with
- * Slang scalar layout: 8 + 8 + 4, padded to 8-byte alignment -> 24. */
-constexpr uint32_t GATE_PUSH_BYTES = 24;
+/* PushGate = { IntegratorStateGPU* ist; uint* out; uint* throughput_words;
+ * uint test_mode; } with Slang scalar layout: 8 + 8 + 8 + 4, padded to 8-byte
+ * alignment -> 32. M4e S1b-7: throughput_words (a uint* word view of the
+ * path.throughput slice) was added so negative mode 1 can inject its
+ * stride-16 fault WITHOUT a pointer OpBitcast — SwiftShader's JIT crashes
+ * (0xC00000FD) on ANY PhysicalStorageBuffer pointer bitcast, even though the
+ * SPIR-V is spec-valid; see state_access_probe.slang mode 1. */
+constexpr uint32_t GATE_PUSH_BYTES = 32;
 constexpr uint32_t GATE_OUT_WORDS = GATE_STATES;
 constexpr uint32_t GATE_CANARY_BYTES = 16; /* guard after every slice */
 constexpr uint32_t GATE_CANARY_BYTE = 0x5C;
@@ -1000,6 +1005,23 @@ bool vulkan_state_access_probe(VulkanDevice *dev)
     const uint64_t addr = soa_addr + sl.off;
     memcpy(reinterpret_cast<char *>(&ist) + sl.mirror, &addr, sizeof(addr));
   }
+  /* M4e S1b-7: device address of the path.throughput slice, pushed as a uint*
+   * word view so negative mode 1 can inject its stride-16 fault with plain
+   * uint stores. The shader cannot form that view itself (float3* -> uint*
+   * needs a pointer OpBitcast, which crashes SwiftShader's JIT at pipeline
+   * creation); the byte pattern it must produce is documented in
+   * state_access_probe.slang at mode 1. */
+  uint64_t throughput_words_addr = 0;
+  for (const auto &sl : slices) {
+    if (sl.name == "path.throughput") {
+      throughput_words_addr = soa_addr + sl.off;
+      break;
+    }
+  }
+  if (throughput_words_addr == 0) {
+    LOG_ERROR << "Vulkan: state access gate: path.throughput slice not found.";
+    return false;
+  }
   {
     void *mapped = nullptr;
     if (vkMapMemory(vk_dev, res.ist_memory, 0, sizeof(IntegratorStateGPU), 0, &mapped) !=
@@ -1242,8 +1264,11 @@ bool vulkan_state_access_probe(VulkanDevice *dev)
       return false;
     }
     vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.pipeline);
-    const uint64_t push[3] = {ist_addr, out_addr, (uint64_t)mode};
-    /* Layout: {u64 ist, u64 out, u32 mode, u32 pad}; mode occupies bytes 16..19. */
+    const uint64_t push[4] = {ist_addr, out_addr, throughput_words_addr,
+                              (uint64_t)mode};
+    /* Layout: {u64 ist, u64 out, u64 throughput_words, u32 mode, u32 pad};
+     * mode occupies bytes 24..27. (M4e S1b-7: third pointer = SwiftShader-safe
+     * mode-1 fault; GATE_PUSH_BYTES = 32.) */
     vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), push);
     vkCmdDispatch(cmd, 1, 1, 1); /* one workgroup of 8 threads -> states 0..7 */
     if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
