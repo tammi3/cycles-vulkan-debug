@@ -75,12 +75,64 @@ on the RX 570 **after the M5 gate passes** (AGENTS.md §4: no optimizing before
 M5 unless the user asks). This entry will be updated with both timings and the
 same-scene/same-run-conditions numbers.
 
+**Narrow-mode status (pre-flight, 2026-10-27):** the faithful variant cannot
+currently run on the RX 570 at all. The driver (amdvlk 31.0.21925.1001)
+sizes the `OpLoad` of a pointer-typed struct member by the **pointee** element
+width instead of 8 bytes: `uint32_t*` members load 4 bytes (correct here,
+addresses < 4 GB), `uint16_t*` members load 2, `uint8_t*` members load 1 —
+so every sub-word member loads a truncated pointer and narrow mode 0 fails
+with exactly 64 payload mismatches (8 sub-word slices × 8 states). Root cause
+proven by probes v1–v5; a **workaround is proven end-to-end by probe v6**
+(rebuild the pointer from a correctly-loading `uint32_t*` member + byte
+offset, convert with `OpConvertUToPtr` in a `spirv_asm` block — genuine 16-bit
+load and store verified, canaries intact, 0 VUID, layer active; details and
+raw output in `lastsession.txt`). Consequences, recorded as observations:
+- The planned narrow-vs-atomic timing comparison for this entry is
+  **impossible on this hardware** until the workaround is applied to
+  `integrator_state.slang`.
+- SwiftShader cannot run narrow mode at all (no `shaderInt16`/`shaderInt8`
+  → VUID + `UNSUPPORTED capability 22/39`), so word-view mode is its
+  configuration; narrow validation is RX 570-only.
+- The default (atomic word-view) mode is unaffected: it passes on both
+  devices and needs none of this.
+
 **Policy deviation to note:** AGENTS.md §4 item 3 says the *faithful* variant
 is the default. Here the default is the byte-equivalent atomic fallback and
 the faithful narrow variant is behind the macro — the inverse. Rationale:
 reasons 1–2 above make the faithful form the riskier one on the target
 hardware; the user decided this order (M4e S1b-4, item 4). Flagged here so the
 user can re-decide after the post-M5 measurement.
+
+---
+
+## PROPOSED entries — inventory presented 2026-10-24, NOT YET APPROVED
+
+**Nothing in this section is an active divergence decision.** During M4e
+S1b-7 a divergence inventory (16 candidates + a stub list + 6 contradictions)
+was presented to the user for review; no approval was recorded, and only the
+10 candidate titles below survived on disk (in `lastsession.txt`). They are
+written here so the inventory is not lost, clearly marked *proposed*. Each one
+still needs the full entry treatment required by AGENTS.md §4 (source citation
+of the original, what changed and why, measured RX 570 speedup,
+result-preserving vs result-changing) **and the user's approval** before it
+becomes an Entry.
+
+Proposed candidates (titles as recorded on 2026-10-24):
+
+1. Traverse safety instrumentation
+2. 0xFFFFFFFF visibility mask (Q5)
+3. Spike camera in gate
+4. Missing `TABULATED_SOBOL` branch
+5. Missing `dP/dD`
+6. Dynamic-index driver workaround
+7. `num_concurrent_states` formula
+8. `mem_copy_from` stride heuristic
+9. Stale `path_trace` prototype
+10. `type==0` miss assertion
+
+The remaining 6 candidates, the stub list and the 6 contradictions from the
+same presentation were never written to disk — recover them from the user or
+re-derive from the milestone records before this section can be completed.
 
 ---
 

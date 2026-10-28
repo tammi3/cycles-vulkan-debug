@@ -1,3 +1,101 @@
+M4e NARROW-MODE PRE-FLIGHT SESSION (root cause found + workaround proven on
+RX 570) - 2026-10-27
+========================================================================
+STATUS: COMPLETE. NO repo source files touched - all probes live in
+%LOCALAPPDATA%\Temp\opencode. Repo diff = this block + DIVERGENCES.md
+(Entry 1 narrow status + clearly-marked PROPOSED inventory section).
+
+ROOT CAUSE (probes v1-v6, all on RX 570, amdvlk 31.0.21925.1001):
+the driver sizes the OpLoad of a POINTER-TYPED struct member by the POINTEE
+element width instead of 8 bytes:
+  uint32_t* member -> 4-byte load -> CORRECT (every device address on this
+                      4 GB card is < 4 GB, e.g. base 0x18580000)
+  uint16_t* member -> 2-byte load -> TRUNCATED (v5: shadow_path.queued_kernel
+                      member holds 0x18581240, the load yields 0x1240)
+  uint8_t*  member -> 1-byte load -> TRUNCATED (v4: path.mnee holds
+                      0x18580128, the load yields 0x28)
+So path.bounce (uint16_t*, true value 0x18580060) loads as 0x60 -> the
+accessor addresses near physical page 0 -> reads return 0 (v2), writes vanish
+(v3 got=eeee), and the gate's NARROW mode 0 fails with exactly the 8 sub-word
+slices x 8 states = 64 mismatches. NOT a port bug: spirv-val passes and the
+narrow accessors are byte-identical in shape to default mode. Default
+(word-view, uint32_t*) mode works because its pointer loads are 4 bytes =
+full for this card; Stage A narrow probes work because their pointers come
+from PUSH CONSTANTS, not struct-member loads; SwiftShader cannot run narrow
+at all (no shaderInt16/Int8 -> VUID + UNSUPPORTED capability 22/39).
+
+HARD RULES (bisected this session, keep forever):
+- NEVER OpBitcast a PhysicalStorageBuffer pointer when a 16- or 8-BIT pointee
+  is involved: amdvlk crashes vkCreateComputePipelines with 0xC0000005.
+  Evidence: v1 (3 bitcasts) crash; noAB (uint16_t*->uint32_t*) crash;
+  noF (uint32_t*->uint16_t*/uint8_t* via push) crash; gate_minimal_e
+  (uint32_t*->float32*, 4-byte pointee both sides) RUNS.
+  (SwiftShader SEPARATELY crashes on ANY pointer bitcast - S1b-7; two
+  independent rules, both active.)
+- Safe on amdvlk: OpConvertPtrToU (integer cast of a pointer, 0 VUID),
+  pointer loads from push constants, u16/u8 ELEMENT load/store through a
+  correctly-valued pointer (Stage A true16/true8 PASS), OpConvertUToPtr (v6).
+
+PROBES (all slangc exit 0 + spirv-val exit 0; run env: CYCLES_VULKAN_STATE_ACCESS_PROBE=1,
+CYCLES_VULKAN_STATE_ACCESS_PROBE_SPV=<file>, CYCLES_VULKAN_STATE_ACCESS_MODE=0,
+CYCLES_VULKAN_ALLOW_NO_KERNELS=1, CYCLES_VULKAN_GATE_TRACE=1,
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation, VK_LOADER_DEBUG=layer;
+all exit 0, VUID 0, layer proven active):
+- v1/v2 (narrow_store_probe, _noAB, _noF): crash bisect above; v2 zero-bitcast
+  build runs - all sub-word reads return 0, pointers pairwise distinct.
+- v3 (narrow_store_probe3): u32-member gbits writes to render/sample LAND
+  (they match, keeping the 8-line report budget for bounce); bounce sentinel
+  via write_path_bounce -> got=eeee (value-independent); out[] pointer bits:
+  sub-word members truncated, u32/f32 members full, deltas EXACTLY the slice
+  table (render 0x18580000, sample +48, bounce +96, queued +160, rng +192,
+  visibility +224, flag +248, throughput +560).
+- v4/v5: width of truncation = pointee width (1 B for u8 member, 2 B for u16).
+- v6 (narrow_store_probe6) - WORKAROUND PROVEN:
+    base = ist->path.render_pixel_index         // u32-pointee member load: CORRECT
+    addr = (uint64_t)base + 96 + 2*s            // OpConvertPtrToU + scalar add
+    p    = spirv_asm { result:$$uint16_t* = OpConvertUToPtr $addr; }
+    old  = *p;                                  // genuine 16-bit load, PRE-store
+    *p   = 0x5C00|s;                            // genuine 16-bit store
+  REAL output: MISMATCH path.bounce[state s] got=005c..075c  (store LANDED;
+  v3's identical store through the member-loaded pointer gave eeee);
+  READBACK out[s]=0x0060EEEE for all 8 states (low16 EEEE = pre-store u16
+  load through p returned the 0xEE prefill -> READS work; a broken pointer
+  would return 0000 per v2; high16 0060 = broken member-load control);
+  bad canaries=0; exit 0; VUID 0; layer "Insert instance layer
+  VK_LAYER_KHRONOS_validation" in log. SPV shape: OpConvertUToPtr
+  %_ptr_PhysicalStorageBuffer_ushort, OpLoad %ushort %p Aligned 2,
+  OpStore %p ... Aligned 2, OpBitcast count 0.
+  TRAP: a post-store read-back is forwarded away by Slang's optimizer -
+  force memory reads with a PRE-store load (cannot be eliminated).
+
+WHAT THIS MEANS / STILL OPEN:
+- Narrow mode 0 still fails (64 mismatches) BY DESIGN until the workaround is
+  APPLIED to integrator_state.slang narrow accessors: pointer members with
+  u16/u8 pointees must be produced as u64 (scalar, 8-byte) + OpConvertUToPtr,
+  never loaded as pointer-typed members. Suggested as its own task before M5.
+- Narrow-vs-atomic M5 timing is IMPOSSIBLE on this hardware until that fix
+  lands (recorded by design of this pre-flight).
+- SwiftShader stays word-view-only (capability limits); it is the second
+  reference device, so the narrow fix can only be validated on RX 570.
+- spirv_asm syntax: bare `name : $$T = ...` fails with E29107 (parsed as an
+  opcode); use the reserved `result : $$T = ...` as the LAST instruction
+  (Slang user guide a1-04-interop).
+- Suggested next tasks: (1) apply the v6 workaround to the narrow accessors,
+  re-run narrow gate modes 0/1/3; (2) INIT_FROM_CAMERA port.
+
+COMMANDS THAT WORKED (v6, all from repo root):
+  slangc:  C:\VulkanSDK\1.4.363.0\Bin\slangc.exe <probe>.slang -target spirv
+           -stage compute -entry state_access_main -D VULKAN_SUBWORD_NARROW=1
+           -I src\kernel\device\vulkan -o <probe>.spv
+  val:     C:\VulkanSDK\1.4.363.0\Bin\spirv-val.exe --target-env vulkan1.2 <probe>.spv
+  dis:     ...\spirv-dis.exe <probe>.spv   (grep OpBitcast / OpConvertUToPtr)
+  run:     cmd /c "build\bin\Release\cycles.exe --device VULKAN --log-level info
+           --samples 1 --background instance2.xml 1>""<log>"" 2>&1"  with the
+           env above (shell tool env does NOT persist between calls; never
+           PowerShell `*>`; unset VK_ICD_FILENAMES for RX 570 runs).
+
+=================== PREVIOUS SESSION (M4e S1b-7, kept below) ====================
+
 M4e S1b-7 SESSION (SwiftShader re-verify -> retype committed -> GATE PASSES ON
 SwiftShader + divergence inventory) — 2026-10-24
 ==========================================================================================
