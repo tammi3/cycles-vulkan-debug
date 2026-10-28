@@ -169,6 +169,97 @@ void store_bool(Subword8T* base, uint t, bool value)
     store_u8(base, t, value ? 1u : 0u);
 }
 
+/* ==================================================================== *
+ * Sub-word SLICE-POINTER loader - narrow-mode driver-bug workaround   *
+ * (M4e narrow pre-flight, 2026-10-27; probe evidence v1-v7 in         *
+ * lastsession.txt).                                                   *
+ *                                                                     *
+ * A sub-word mirror member such as path.bounce is a uint16_t* SLOT     *
+ * inside the IntegratorStateGPU struct. Reading it as written          *
+ * (`ist->path.bounce`) lowers to OpAccessChain + OpLoad with a         *
+ * POINTER result type, and the amdvlk driver (31.0.21925.1001) sizes   *
+ * that load by the INNERMOST pointee element instead of 8 bytes:       *
+ *   uint32_t* member -> 4 B (full only because addresses < 4 GB here)  *
+ *   uint16_t* member -> 2 B  (v3: slice ptr loads as low 2 bytes)      *
+ *   uint8_t*  member -> 1 B  (v4: 0x...0128 loads as 0x28)             *
+ * The truncated pointer then addresses near physical page 0: reads     *
+ * return 0, writes vanish (v2/v3), and narrow gate mode 0 fails with   *
+ * 64 payload mismatches. The SPIR-V is spec-valid (spirv-val passes);  *
+ * it is purely an amdvlk miscompile. NOTE the double-pointer form      *
+ * `*(&member)` does NOT help: the direct load's operand already has an *
+ * 8-byte immediate element (ptr<ptr<ushort>>) and is still truncated to *
+ * 2 B - the driver recurses to the base element type, so the slot must *
+ * be read as a SCALAR of the full width.                               *
+ *                                                                     *
+ * SECOND DRIVER BUG (probe v7): taking the slot address as             *
+ * `&(m)` and converting it with OpConvertPtrToU DROPS the accesschain  *
+ * element offset - the address echo came back as the OUTER base        *
+ * (0x18600000 instead of 0x18600010), so every member read mirror+0    *
+ * and all 8 pointers resolved to the render slice. Therefore the slot  *
+ * address is built as plain INTEGER ARITHMETIC from the struct base:   *
+ *   slot = (uint64_t)ist + MEMBER_OFFSET   (no accesschain involved)   *
+ * v7 verified this form for offsets 16 / 104 / 1064 (bounce,           *
+ * visibility, shadow_path.queued_kernel) - each returned the exact    *
+ * slice address. Param->uint64_t, OpConvertUToPtr and the 8-byte       *
+ * SCALAR load were all proven correct in v6/v7 (0 VUID, canaries       *
+ * intact). Neither conversion is an OpBitcast: pointer OpBitcast with  *
+ * a 16/8-bit pointee crashes amdvlk at vkCreateComputePipelines        *
+ * (v1/noAB/noF bisect).                                               *
+ *                                                                     *
+ * Slot offsets (vulkan_data.slang member comments; byte positions of  *
+ * the pointer slots inside IntegratorStateGPU):                       *
+ *   path @ 0        bounce 16 (:109)  transparent_bounce 24 (:110)     *
+ *                   queued_kernel 80 (:117)  rng_offset 96 (:119)      *
+ *                   visibility 104 (:120)  mnee 120 (:122)             *
+ *   shadow_path @976 (:327): queued_kernel +88 (:235) = 1064,          *
+ *                   lightgroup +152 (:243) = 1128                      *
+ * The gate re-verifies every offset byte-for-byte after any change.    *
+ *                                                                     *
+ * Result-preserving: the helpers yield the exact 8-byte address the    *
+ * member holds - same value the untruncated load would produce, no     *
+ * logic change, CPU-comparison tolerances untouched. Default mode      *
+ * keeps the direct load (the macro's `member` argument expands         *
+ * verbatim there; the narrow expansion discards it - a macro argument  *
+ * that appears in neither replacement list is never evaluated): its    *
+ * 4-byte-pointee load is full for this card and is the configuration   *
+ * proven on RX 570 and SwiftShader. NEW sub-word accessors must go     *
+ * through SUBWORD16_PTR / SUBWORD8_PTR, never a raw member load.       *
+ * ==================================================================== */
+#if VULKAN_SUBWORD_NARROW
+static const uint BOUNCE_SLOT_OFF = 16u;                  /* path.bounce */
+static const uint TRANSPARENT_BOUNCE_SLOT_OFF = 24u;      /* path.transparent_bounce */
+static const uint QUEUED_KERNEL_SLOT_OFF = 80u;          /* path.queued_kernel */
+static const uint RNG_OFFSET_SLOT_OFF = 96u;             /* path.rng_offset */
+static const uint VISIBILITY_SLOT_OFF = 104u;            /* path.visibility */
+static const uint MNEE_SLOT_OFF = 120u;                  /* path.mnee */
+static const uint SHADOW_PATH_BASE_OFF = 976u;           /* shadow_path struct */
+static const uint SHADOW_QUEUED_KERNEL_SLOT_OFF = SHADOW_PATH_BASE_OFF + 88u;
+static const uint SHADOW_LIGHTGROUP_SLOT_OFF = SHADOW_PATH_BASE_OFF + 152u;
+
+Subword16T* subword16_ptr(uint64_t slot_addr)
+{
+    /* integer -> uint64_t* (spec opcode, NOT OpBitcast) */
+    uint64_t* slot = spirv_asm { result:$$uint64_t* = OpConvertUToPtr $slot_addr; };
+    uint64_t slice_addr = *slot; /* 8-byte SCALAR load of the stored slice address */
+    return spirv_asm { result:$$Subword16T* = OpConvertUToPtr $slice_addr; };
+}
+Subword8T* subword8_ptr(uint64_t slot_addr)
+{
+    uint64_t* slot = spirv_asm { result:$$uint64_t* = OpConvertUToPtr $slot_addr; };
+    uint64_t slice_addr = *slot;
+    return spirv_asm { result:$$Subword8T* = OpConvertUToPtr $slice_addr; };
+}
+/* (ist, member, off): narrow uses ist+off (integer add - see v7 note);
+ * `member` is discarded here and only supplies the default-mode load. */
+#define SUBWORD16_PTR(ist, member, off) subword16_ptr((uint64_t)(ist) + (off))
+#define SUBWORD8_PTR(ist, member, off) subword8_ptr((uint64_t)(ist) + (off))
+#else
+/* Default word view: expand to the original expression verbatim, so the
+ * default-mode SPIR-V is unchanged by this workaround (`off` discarded). */
+#define SUBWORD16_PTR(ist, member, off) (member)
+#define SUBWORD8_PTR(ist, member, off) (member)
+#endif
+
 /* ===================== path struct accessors ===================== */
 /* state_template.h:7-74. */
 
@@ -199,60 +290,60 @@ void write_path_sample(IntegratorStateGPU* ist, uint state, uint v)
 uint read_path_bounce(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:17 (uint16_t) -> sub-word
-    Subword16T* data_ptr = ist->path.bounce;
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.bounce, BOUNCE_SLOT_OFF);
     return load_u16(data_ptr, state);
 }
 void write_path_bounce(IntegratorStateGPU* ist, uint state, uint v)
 {
-    Subword16T* data_ptr = ist->path.bounce;
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.bounce, BOUNCE_SLOT_OFF);
     store_u16(data_ptr, state, v);
 }
 
 uint read_path_transparent_bounce(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:19 (uint16_t) -> sub-word
-    Subword16T* data_ptr = ist->path.transparent_bounce;
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.transparent_bounce, TRANSPARENT_BOUNCE_SLOT_OFF);
     return load_u16(data_ptr, state);
 }
 void write_path_transparent_bounce(IntegratorStateGPU* ist, uint state, uint v)
 {
-    Subword16T* data_ptr = ist->path.transparent_bounce;
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.transparent_bounce, TRANSPARENT_BOUNCE_SLOT_OFF);
     store_u16(data_ptr, state, v);
 }
 
 uint read_path_queued_kernel(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:33 (uint16_t) -> queue path (kernel.h:66,422)
-    Subword16T* data_ptr = ist->path.queued_kernel;
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.queued_kernel, QUEUED_KERNEL_SLOT_OFF);
     return load_u16(data_ptr, state);
 }
 void write_path_queued_kernel(IntegratorStateGPU* ist, uint state, uint v)
 {
-    Subword16T* data_ptr = ist->path.queued_kernel;
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.queued_kernel, QUEUED_KERNEL_SLOT_OFF);
     store_u16(data_ptr, state, v);
 }
 
 uint read_path_rng_offset(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:37 (uint16_t) -> sub-word
-    Subword16T* data_ptr = ist->path.rng_offset;
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.rng_offset, RNG_OFFSET_SLOT_OFF);
     return load_u16(data_ptr, state);
 }
 void write_path_rng_offset(IntegratorStateGPU* ist, uint state, uint v)
 {
-    Subword16T* data_ptr = ist->path.rng_offset;
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.rng_offset, RNG_OFFSET_SLOT_OFF);
     store_u16(data_ptr, state, v);
 }
 
 uint read_path_visibility(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:39 (uint8_t) -> sub-word
-    Subword8T* data_ptr = ist->path.visibility;
+    Subword8T* data_ptr = SUBWORD8_PTR(ist, ist->path.visibility, VISIBILITY_SLOT_OFF);
     return load_u8(data_ptr, state);
 }
 void write_path_visibility(IntegratorStateGPU* ist, uint state, uint v)
 {
-    Subword8T* data_ptr = ist->path.visibility;
+    Subword8T* data_ptr = SUBWORD8_PTR(ist, ist->path.visibility, VISIBILITY_SLOT_OFF);
     store_u8(data_ptr, state, v);
 }
 
@@ -271,12 +362,12 @@ void write_path_flag(IntegratorStateGPU* ist, uint state, uint v)
 uint read_path_mnee(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:43 (uint8_t) -> sub-word
-    Subword8T* data_ptr = ist->path.mnee;
+    Subword8T* data_ptr = SUBWORD8_PTR(ist, ist->path.mnee, MNEE_SLOT_OFF);
     return load_u8(data_ptr, state);
 }
 void write_path_mnee(IntegratorStateGPU* ist, uint state, uint v)
 {
-    Subword8T* data_ptr = ist->path.mnee;
+    Subword8T* data_ptr = SUBWORD8_PTR(ist, ist->path.mnee, MNEE_SLOT_OFF);
     store_u8(data_ptr, state, v);
 }
 
@@ -575,12 +666,12 @@ void write_shadow_path_render_pixel_index(IntegratorStateGPU* ist, uint state, u
 uint read_shadow_path_queued_kernel(IntegratorStateGPU* ist, uint state)
 {
     // source: shadow_state_template.h:31 (uint16_t) -> queue path (state_flow.h:125)
-    Subword16T* data_ptr = ist->shadow_path.queued_kernel;
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->shadow_path.queued_kernel, SHADOW_QUEUED_KERNEL_SLOT_OFF);
     return load_u16(data_ptr, state);
 }
 void write_shadow_path_queued_kernel(IntegratorStateGPU* ist, uint state, uint v)
 {
-    Subword16T* data_ptr = ist->shadow_path.queued_kernel;
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->shadow_path.queued_kernel, SHADOW_QUEUED_KERNEL_SLOT_OFF);
     store_u16(data_ptr, state, v);
 }
 
@@ -599,12 +690,12 @@ void write_shadow_path_flag(IntegratorStateGPU* ist, uint state, uint v)
 uint read_shadow_path_lightgroup(IntegratorStateGPU* ist, uint state)
 {
     // source: shadow_state_template.h:53 (uint8_t) -> sub-word
-    Subword8T* data_ptr = ist->shadow_path.lightgroup;
+    Subword8T* data_ptr = SUBWORD8_PTR(ist, ist->shadow_path.lightgroup, SHADOW_LIGHTGROUP_SLOT_OFF);
     return load_u8(data_ptr, state);
 }
 void write_shadow_path_lightgroup(IntegratorStateGPU* ist, uint state, uint v)
 {
-    Subword8T* data_ptr = ist->shadow_path.lightgroup;
+    Subword8T* data_ptr = SUBWORD8_PTR(ist, ist->shadow_path.lightgroup, SHADOW_LIGHTGROUP_SLOT_OFF);
     store_u8(data_ptr, state, v);
 }
 

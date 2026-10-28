@@ -1,3 +1,96 @@
+M4e NARROW WORKAROUND APPLIED + GATE PASSED (v7 found a SECOND driver bug) - 2026-10-27
+========================================================================
+STATUS: COMPLETE. Repo diff = this block + the section below it
+(pre-flight record) + DIVERGENCES.md (Entry 1 narrow status rewritten) +
+src/kernel/device/vulkan/integrator_state.slang (the workaround itself).
+
+WHAT WAS DONE, file by file:
+- src/kernel/device/vulkan/integrator_state.slang: added the "Sub-word
+  SLICE-POINTER loader" section (only compiled when VULKAN_SUBWORD_NARROW=1)
+  and routed all 16 sub-word accessor sites through it:
+  bounce / transparent_bounce / queued_kernel / rng_offset (u16),
+  visibility / mnee (u8), shadow_path.queued_kernel (u16),
+  shadow_path.lightgroup (u8) - each read+write = 16 sites.
+  The 3-arg macros are SUBWORD16_PTR(ist, member, off) /
+  SUBWORD8_PTR(ist, member, off): narrow mode uses (uint64_t)ist + off
+  and DISCARDS `member`; default mode expands to `(member)` verbatim.
+  (A macro argument that appears in neither replacement list is never
+  evaluated, so the discarded argument has no side effect and no cost.)
+- DIVERGENCES.md: Entry 1 "Narrow-mode status" rewritten from "cannot run"
+  to the two-bug record + the measured gate evidence below.
+- lastsession.txt: this block.
+
+SECOND DRIVER BUG (probe v7) - the first attempt at this fix FAILED:
+applying the v6 chain literally, i.e. taking the slot address as
+`&(member)` and feeding it to OpConvertPtrToU, gave gate mode 0
+68 mismatches (WORSE than the 64 baseline) with readback acc OK.
+Byte decode showed every one of the 8 subword pointers had resolved to the
+RENDER slice base (mirror+0): visibility wrote 0..7 over render bytes 0-7,
+shadow_path.queued_kernel (gbits id 32) wrote 0x2004..0x2007 at bytes 8-15.
+Probe v7 isolated it in ONE run (echo of 8 expressions, VUID 0, base this
+run = 0x17200000 from the control):
+  out[0] (uint64_t)ist                    = 0x18600000  param->int CORRECT
+  out[1] (uint64_t)(&ist->path.bounce)    = 0x18600000  should be +0x10 ->
+        OpConvertPtrToU on an OpAccessChain result DROPS THE ELEMENT OFFSET
+  out[2] loadu64((uint64_t)ist + 16)      = 0x17200060  base+96  FORM A OK
+  out[3] loadu64((uint64_t)(&...bounce))  = 0x17200000  = mirror+0, bug
+  out[4] direct render member load        = 0x17200000  control = run base
+  out[5] loadu64((uint64_t)ist + 1064)    = 0x17201240  base+4672 FORM A OK
+  out[6] loadu64((uint64_t)ist + 104)     = 0x172000E0  base+224  FORM A OK
+  out[7] direct u8 member load            = 0xE0         truncation as before
+So bugs #1 (innermost-pointee-sized pointer OpLoad) and #2 (accesschain
+element offset dropped by OpConvertPtrToU) are BOTH worked around by the
+same move: never load or convert a member ADDRESS - build it as integer
+arithmetic from the struct base and read the slot as an 8-byte scalar.
+%ist in the gate SPIR-V is `OpLoad` of the push-constant pointer (no
+element offset to drop), which is why (uint64_t)ist is safe.
+
+GATE RESULTS THIS SESSION (slangc + spirv-val exit 0 for both variants):
+SPIR-V shape, narrow build: 32 OpConvertUToPtr (16 sites x 2),
+16 OpConvertPtrToU - ALL of them `%... = OpConvertPtrToU %ulong %ist`
+(the base, never an OpAccessChain result), 16 OpLoad %ulong Aligned 8,
+0 pointer OpBitcast (77 OpBitcast, all scalar asfloat/asuint).
+The 2 remaining raw subword loads are the harness's mode-2/4-only code
+(state_access_probe.slang:91,109 - HARNESS, never edited, never executed
+in modes 0/1/3).
+Default-mode SPIR-V vs HEAD: 30252 vs 30252 bytes, BYTE-IDENTICAL
+(HEAD extracted with `git archive --format=zip` + Expand-Archive; the
+PowerShell pipe form `git archive | tar` corrupts the stream - "Damaged tar
+archive" - use the zip form).
+
+RX 570 (amdvlk 31.0.21925.1001), validation layer active (3 insert lines),
+VUID 0 in every run:
+  narrow MODE=0 : payload mismatches=0, bad canaries=0, readback acc OK => PASS
+  narrow MODE=1 : clean PASS + 7 mismatches, 1 bad canary,
+                  bytes differing from clean run=58 => DETECTED
+  narrow MODE=3 : clean PASS + 46 mismatches,
+                  bytes differing from clean run=184 => DETECTED
+  default all modes 0-4: mode 0 PASS; modes 1/2/3/4 DETECTED
+                  (7+1 canary / 7+1 / 46 / 8)
+SwiftShader (Subzero, VK_ICD_FILENAMES=...Microsoft-Edge-WebView\vk_swiftshader_icd.json),
+default all modes 0-4: mode 0 PASS; modes 1/2/3/4 DETECTED (9+1 / 7+1 / 46 / 8),
+layer active, VUID 0. Narrow mode is NOT runnable there (no shaderInt16/8).
+
+LOGS (all in %LOCALAPPDATA%\Temp\opencode):
+  narrow_formA_mode0_rx570.log, narrow_formA_mode1_rx570.log,
+  narrow_formA_mode3_rx570.log, default_allmodes_rx570.log,
+  default_allmodes_swiftshader.log, narrow_probe7_rx570.log (v7 echo),
+  narrow_fix_mode0_rx570.log (the FAILED first attempt, kept for the record)
+
+STILL OPEN: the narrow-vs-atomic TIMING comparison for DIVERGENCES.md
+Entry 1 - deferred until after the M5 gate (AGENTS.md §4 item 5).
+NEXT SUGGESTED TASK: port INIT_FROM_CAMERA.
+
+TRAPS FOR THE NEXT SESSION:
+- Env vars do not persist between tool calls; reset them every call.
+  Capture logs with `cmd /c "... 1>log 2>&1"`, never PowerShell `*>`.
+- slangc / spirv-val / spirv-dis live in C:\VulkanSDK\1.4.363.0\Bin.
+- Narrow gate modes = 0/1/3 only (2 and 4 are word-view faults).
+- Never edit state_access_probe.slang (harness) or the tolerances.
+- Buffer device addresses VARY per run - verify by relative deltas and
+  controls, never by absolute constants.
+
+========================================================================
 M4e NARROW-MODE PRE-FLIGHT SESSION (root cause found + workaround proven on
 RX 570) - 2026-10-27
 ========================================================================

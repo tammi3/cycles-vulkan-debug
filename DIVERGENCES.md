@@ -75,21 +75,47 @@ on the RX 570 **after the M5 gate passes** (AGENTS.md §4: no optimizing before
 M5 unless the user asks). This entry will be updated with both timings and the
 same-scene/same-run-conditions numbers.
 
-**Narrow-mode status (pre-flight, 2026-10-27):** the faithful variant cannot
-currently run on the RX 570 at all. The driver (amdvlk 31.0.21925.1001)
-sizes the `OpLoad` of a pointer-typed struct member by the **pointee** element
-width instead of 8 bytes: `uint32_t*` members load 4 bytes (correct here,
-addresses < 4 GB), `uint16_t*` members load 2, `uint8_t*` members load 1 —
-so every sub-word member loads a truncated pointer and narrow mode 0 fails
-with exactly 64 payload mismatches (8 sub-word slices × 8 states). Root cause
-proven by probes v1–v5; a **workaround is proven end-to-end by probe v6**
-(rebuild the pointer from a correctly-loading `uint32_t*` member + byte
-offset, convert with `OpConvertUToPtr` in a `spirv_asm` block — genuine 16-bit
-load and store verified, canaries intact, 0 VUID, layer active; details and
-raw output in `lastsession.txt`). Consequences, recorded as observations:
-- The planned narrow-vs-atomic timing comparison for this entry is
-  **impossible on this hardware** until the workaround is applied to
-  `integrator_state.slang`.
+**Two amdvlk driver bugs found while enabling the faithful variant
+(2026-10-27, probes v1–v7, raw output in `lastsession.txt`):** both take
+spec-valid SPIR-V (`spirv-val` exit 0) and are purely a miscompile in the
+driver (amdvlk 31.0.21925.1001):
+
+1. **Truncated pointer loads.** The `OpLoad` of a pointer-typed struct member
+   is sized by the **innermost pointee** element width instead of 8 bytes:
+   `uint32_t*` members load 4 bytes (correct here only because addresses are
+   < 4 GB), `uint16_t*` members load 2, `uint8_t*` members load 1. The
+   truncated pointer then addresses near physical page 0, so narrow mode 0
+   failed with exactly 64 payload mismatches (8 sub-word slices × 8 states).
+   Proven by probes v1–v5; the end-to-end rebuild chain was verified by v6.
+2. **Dropped element offset (probe v7).** Taking the slot address as
+   `&(member)` and passing it to `OpConvertPtrToU` returns the **outer** base
+   (echo came back `0x18600000` instead of `0x18600010`) — the accesschain's
+   element offset is dropped, so every member read slice 0.
+
+**Workaround applied (Form A, `integrator_state.slang` "Sub-word
+SLICE-POINTER loader"):** build the slot address as plain integer arithmetic
+from the struct base — `(uint64_t)ist + MEMBER_OFFSET` (param→int, no
+accesschain involved) — `OpConvertUToPtr` to `uint64_t*`, load the slot as an
+8-byte **scalar**, then `OpConvertUToPtr` to the element pointer type. No
+pointer `OpBitcast`: with a 16/8-bit pointee it crashes amdvlk at
+`vkCreateComputePipelines` (v1/noAB/noF bisect). v7 verified this form for
+offsets 16 / 104 / 1064. All 16 sub-word accessor sites go through the
+`SUBWORD16_PTR` / `SUBWORD8_PTR` macros; the default-mode expansion is the
+original member expression verbatim, and the default-mode SPIR-V is
+**byte-identical to HEAD** (30252 = 30252 bytes, full-file comparison).
+
+**Gate evidence (2026-10-27, RX 570, validation layer active, 0 VUID):**
+- narrow `MODE=0` → `payload mismatches=0, bad canaries=0, readback acc OK => PASS`
+- narrow `MODE=1` → 7 mismatches + 1 bad canary, `bytes differing from clean
+  run=58` → **DETECTED**
+- narrow `MODE=3` → 46 mismatches, `bytes differing from clean run=184` → **DETECTED**
+- default (word view) all modes 0–4 → clean PASS + all four faults DETECTED,
+  on **RX 570 and SwiftShader** (second reference device).
+
+Consequences, recorded as observations:
+- The narrow-vs-atomic timing comparison for this entry is now **possible on
+  this hardware** (the faithful variant runs and passes its gate); it stays
+  deferred until after the M5 gate, per AGENTS.md §4 item 5.
 - SwiftShader cannot run narrow mode at all (no `shaderInt16`/`shaderInt8`
   → VUID + `UNSUPPORTED capability 22/39`), so word-view mode is its
   configuration; narrow validation is RX 570-only.
