@@ -33,6 +33,13 @@
 #include "kernel/globals.h"
 #include "kernel/sample/pattern.h"
 #include "kernel/camera/camera.h"
+/* M4f SLICE 1: the REAL integrate_camera_sample compiled on the host (same
+ * technique as the math probe: ccl_device_inline is `static inline` on this
+ * target). This header also pulls in film/adaptive_sampling.h,
+ * film/light_passes.h, integrator/path_state.h and integrator/state_util.h -
+ * all host-compilable (the CPU kernel TU builds them). Used as the reference
+ * for the M4f slice-1 gate (vulkan_init_from_camera_probe). */
+#include "kernel/integrator/init_from_camera.h"
 
 #include "util/log.h"
 
@@ -2455,6 +2462,583 @@ bool vulkan_math_probe(VulkanDevice *dev)
     LOG_ERROR << "Vulkan: Math probe: CLEAN PASS FAILED (GPU disagrees with the real "
                  "Cycles reference).";
   LOG_INFO << "Vulkan: Math probe: " << (all_ok ? "GATE MET." : "GATE NOT MET.");
+  return all_ok;
+}
+
+/* =========================================================================
+ * M4f SLICE 1 init-from-camera probe (optional, env
+ * CYCLES_VULKAN_INIT_FROM_CAMERA_PROBE=1)
+ * =========================================================================
+ * Gate for the ported integrate_camera_sample() (init_from_camera.slang).
+ * Same structure as vulkan_math_probe: one case per GPU thread, and the host
+ * reference calls the REAL Cycles function - here
+ * integrate_camera_sample(), compiled from
+ * src/kernel/integrator/init_from_camera.h into this binary.
+ *
+ * Reference split (be precise about what is compared to what):
+ *   - PUBLIC outputs (ray P/D/tmin/tmax/time, T, r_cache_miss): compared
+ *     against the real integrate_camera_sample() call on the host;
+ *   - OBSERVATION outputs (rand_filter, rand_time_lens, rand_time,
+ *     rand_lens): these are locals inside the real function and cannot be
+ *     read from its return values, so the host reference reproduces the four
+ *     packing lines init_from_camera.h:28-48 verbatim (each cited at the
+ *     comparison site below) on top of the SAME real path_rng_2D / 3D;
+ *   - u0 (the rng_pixel fed into the function) and u1 (r_cache_miss) are
+ *     compared BIT-EXACT; floats use |gpu-ref| <= 1e-5*max(1,|ref|), the
+ *     same tolerance as the math probe.
+ *
+ * neg_mode (MathParams field, gate-only, NOT in Cycles) applies one
+ * probe-side INPUT fault per pass so the gate can prove each comparison is
+ * live; the ported function contains no fault switch:
+ *   1 -> rng_pixel fed to the function is XOR 1 (the reported u0 stays
+ *        clean) -> the PRNG draws must disagree for every sample != 0 case;
+ *   2 -> the function is fed sample+1 (reported u0 stays clean) -> the
+ *        sample==0 fixed 0.5/0.5 filter draw must disagree;
+ *   3 -> rastertocamera transposed in the params copy (same fault as the
+ *        math probe's neg 3) -> the ray must disagree.
+ * The clean pass (neg_mode 0) must MATCH for all three seeds. */
+
+/* Layouts locked against init_from_camera_probe.slang (Slang structs of the
+ * same name). Scalar-only members so C++ and Slang cannot disagree on
+ * padding (AGENTS.md section 4). */
+struct InitCamCase {
+  int32_t sample;
+  uint32_t x, y;
+};
+static_assert(sizeof(InitCamCase) == 12, "InitCamCase layout must match Slang");
+
+struct InitCamResult {
+  uint32_t u0, u1, nfloat, pad;
+  float f[24];
+};
+static_assert(sizeof(InitCamResult) == 112, "InitCamResult layout must match Slang");
+
+/* Push block: 3 device pointers + count = 32 bytes (matches Slang Push). */
+struct InitCamPush {
+  VkDeviceAddress cases;
+  VkDeviceAddress out;
+  VkDeviceAddress params;
+  uint32_t num_cases;
+};
+static_assert(sizeof(InitCamPush) == 32, "Push layout must match Slang");
+
+constexpr uint32_t INITCAM_PUSH_BYTES = 32;
+constexpr uint32_t INITCAM_CANARY_WORDS = 4;
+constexpr uint32_t INITCAM_CANARY = 0xCAFEBABEu;
+
+/* RAII for every Vulkan handle the probe creates (same pattern as
+ * MathProbeResources), so early-return error paths still destroy everything. */
+struct InitCamResources {
+  VkDevice device = VK_NULL_HANDLE;
+  VkShaderModule module = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  VkBuffer cases_buffer = VK_NULL_HANDLE, out_buffer = VK_NULL_HANDLE,
+           params_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory cases_memory = VK_NULL_HANDLE, out_memory = VK_NULL_HANDLE,
+                 params_memory = VK_NULL_HANDLE;
+
+  ~InitCamResources()
+  {
+    if (device == VK_NULL_HANDLE) return;
+    if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+    if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+    if (module) vkDestroyShaderModule(device, module, nullptr);
+    if (pool) vkDestroyCommandPool(device, pool, nullptr);
+    if (fence) vkDestroyFence(device, fence, nullptr);
+    if (cases_buffer) vkDestroyBuffer(device, cases_buffer, nullptr);
+    if (out_buffer) vkDestroyBuffer(device, out_buffer, nullptr);
+    if (params_buffer) vkDestroyBuffer(device, params_buffer, nullptr);
+    if (cases_memory) vkFreeMemory(device, cases_memory, nullptr);
+    if (out_memory) vkFreeMemory(device, out_memory, nullptr);
+    if (params_memory) vkFreeMemory(device, params_memory, nullptr);
+  }
+};
+
+bool vulkan_init_from_camera_probe(VulkanDevice *dev)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+  if (getenv("CYCLES_VULKAN_INIT_FROM_CAMERA_PROBE") == nullptr) return true;
+
+  LOG_INFO << "Vulkan: Init-from-camera probe starting "
+              "(CYCLES_VULKAN_INIT_FROM_CAMERA_PROBE=1).";
+
+  InitCamResources res;
+  const VkDevice vk_dev = dev->vk_device();
+  res.device = vk_dev;
+
+  /* ---- 1. SPIR-V (env override or cwd default) ---- */
+  std::vector<char> spirv;
+  const char *env_path = getenv("CYCLES_VULKAN_INIT_FROM_CAMERA_PROBE_SPV");
+  const char *candidates[2] = {env_path, "init_from_camera_probe.spv"};
+  const char *found = nullptr;
+  for (const char *c : candidates) {
+    if (c && probe_read_whole_file(c, spirv)) { found = c; break; }
+  }
+  if (!found) {
+    LOG_ERROR << "Vulkan: Init-from-camera probe: cannot find init_from_camera_probe.spv "
+                 "(compile it with slangc or set "
+                 "CYCLES_VULKAN_INIT_FROM_CAMERA_PROBE_SPV).";
+    return false;
+  }
+  if (spirv.size() % 4 != 0) {
+    LOG_ERROR << "Vulkan: Init-from-camera probe: '" << found
+              << "' is not a valid SPIR-V module.";
+    return false;
+  }
+  LOG_INFO << "Vulkan: Init-from-camera probe: spirv='" << found << "' ("
+           << spirv.size() << " bytes).";
+
+  /* ---- 2. Shader module ---- */
+  VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = spirv.size();
+  smi.pCode = reinterpret_cast<const uint32_t *>(spirv.data());
+  if (vkCreateShaderModule(vk_dev, &smi, nullptr, &res.module) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Init-from-camera probe: vkCreateShaderModule failed.";
+    return false;
+  }
+
+  /* ---- 3. Pipeline layout: no descriptor sets, one push-constant range ---- */
+  VkPushConstantRange pcr{};
+  pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pcr.offset = 0;
+  pcr.size = INITCAM_PUSH_BYTES;
+  VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pli.pushConstantRangeCount = 1;
+  pli.pPushConstantRanges = &pcr;
+  if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &res.layout) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Init-from-camera probe: pipeline layout creation failed.";
+    return false;
+  }
+
+  /* ---- 4. Compute pipeline (entry name "main"; slangc renames) ---- */
+  VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  cpi.stage.module = res.module;
+  cpi.stage.pName = "main";
+  cpi.layout = res.layout;
+  if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &res.pipeline) !=
+      VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Init-from-camera probe: compute pipeline creation failed "
+                 "(shader may use unsupported capabilities).";
+    return false;
+  }
+
+  /* ---- 5. Build MathParams from the REAL kernel data of the scene ----
+   * Same fill as the math probe (kernels.cpp vulkan_math_probe): the struct
+   * is shared, so its layout is already locked by
+   * static_assert(sizeof(MathProbeParams) == 176). The same two overrides
+   * apply (pixel_jitter != FLT_MAX so the filter-table branch is skipped,
+   * sampling_pattern = SOBOL_BURLEY so the in-scope path_rng branch runs),
+   * and BOTH the GPU params and the host reference get them. */
+  const KernelData &kd = dev->host_kernel_data();
+  MathProbeParams mp{};
+  mp.cam_type = kd.cam.type;
+  mp.have_perspective_motion = kd.cam.have_perspective_motion;
+  mp.aperturesize = kd.cam.aperturesize;
+  mp.num_motion_steps = kd.cam.num_motion_steps;
+  mp.interocular_offset = kd.cam.interocular_offset;
+  mp.shuttertime = kd.cam.shuttertime;
+  mp.rolling_shutter_type = kd.cam.rolling_shutter_type;
+  mp.nearclip = kd.cam.nearclip;
+  mp.cliplength = kd.cam.cliplength;
+  mp.pixel_jitter_x = 0.25f;
+  mp.pixel_jitter_y = -0.5f;
+  mp.ctw_x_x = kd.cam.cameratoworld.x.x; mp.ctw_x_y = kd.cam.cameratoworld.x.y;
+  mp.ctw_x_z = kd.cam.cameratoworld.x.z; mp.ctw_x_w = kd.cam.cameratoworld.x.w;
+  mp.ctw_y_x = kd.cam.cameratoworld.y.x; mp.ctw_y_y = kd.cam.cameratoworld.y.y;
+  mp.ctw_y_z = kd.cam.cameratoworld.y.z; mp.ctw_y_w = kd.cam.cameratoworld.y.w;
+  mp.ctw_z_x = kd.cam.cameratoworld.z.x; mp.ctw_z_y = kd.cam.cameratoworld.z.y;
+  mp.ctw_z_z = kd.cam.cameratoworld.z.z; mp.ctw_z_w = kd.cam.cameratoworld.z.w;
+  mp.rtc_x_x = kd.cam.rastertocamera.x.x; mp.rtc_x_y = kd.cam.rastertocamera.x.y;
+  mp.rtc_x_z = kd.cam.rastertocamera.x.z; mp.rtc_x_w = kd.cam.rastertocamera.x.w;
+  mp.rtc_y_x = kd.cam.rastertocamera.y.x; mp.rtc_y_y = kd.cam.rastertocamera.y.y;
+  mp.rtc_y_z = kd.cam.rastertocamera.y.z; mp.rtc_y_w = kd.cam.rastertocamera.y.w;
+  mp.rtc_z_x = kd.cam.rastertocamera.z.x; mp.rtc_z_y = kd.cam.rastertocamera.z.y;
+  mp.rtc_z_z = kd.cam.rastertocamera.z.z; mp.rtc_z_w = kd.cam.rastertocamera.z.w;
+  mp.rtc_w_x = kd.cam.rastertocamera.w.x; mp.rtc_w_y = kd.cam.rastertocamera.w.y;
+  mp.rtc_w_z = kd.cam.rastertocamera.w.z; mp.rtc_w_w = kd.cam.rastertocamera.w.w;
+  mp.sampling_pattern = SAMPLING_PATTERN_SOBOL_BURLEY;
+  mp.sobol_index_mask = (uint32_t)kd.integrator.sobol_index_mask;
+  mp.blue_noise_sequence_length = (uint32_t)kd.integrator.blue_noise_sequence_length;
+  mp.seed = 0;    /* set per pass */
+  mp.neg_mode = 0; /* set per pass */
+
+  LOG_INFO << "Vulkan: Init-from-camera probe: cam.type=" << mp.cam_type
+           << " shuttertime=" << mp.shuttertime << " aperturesize=" << mp.aperturesize
+           << " sampling_pattern=" << mp.sampling_pattern
+           << " have_persp_motion=" << mp.have_perspective_motion
+           << " num_motion_steps=" << mp.num_motion_steps
+           << " interocular=" << mp.interocular_offset;
+
+  /* ---- covered-config guard ----
+   * The Slang camera_sample port (math_core.slang) covers ONLY perspective +
+   * no DOF + no motion blur + no stereo + no filter table. Outside that
+   * config the port cannot produce the real Spectrum/ray, so this gate cannot
+   * be met for the scene: fail loudly instead of comparing against values the
+   * port never computes (AGENTS.md section 5: no inventing). */
+  if (mp.cam_type != 0 /* CAMERA_PERSPECTIVE */ || mp.shuttertime != -1.0f ||
+      mp.aperturesize != 0.0f || mp.have_perspective_motion != 0 ||
+      mp.num_motion_steps != 0 || mp.interocular_offset != 0.0f) {
+    LOG_ERROR << "Vulkan: Init-from-camera probe: scene camera is outside the covered "
+                 "config (perspective, aperture 0, shuttertime -1, no motion/stereo); "
+                 "the slice-1 gate cannot be met for this scene.";
+    return false;
+  }
+
+  /* ---- 6. Build the host reference globals (REAL Cycles functions) ----
+   * Same construction as the math probe: KernelGlobalsCPU from the real
+   * kernel data (with the same two overrides), ThreadKernelGlobalsCPU on top.
+   * lookup_table stays empty (unused: pixel_jitter != FLT_MAX skips the
+   * filter-table read; shuttertime == -1 skips the shutter-table read). */
+  KernelGlobalsCPU kg_cpu;
+  kg_cpu.data = kd;
+  kg_cpu.data.integrator.pixel_jitter = make_float2(mp.pixel_jitter_x, mp.pixel_jitter_y);
+  kg_cpu.data.integrator.sampling_pattern = SAMPLING_PATTERN_SOBOL_BURLEY;
+  Profiler initcam_profiler;
+  ThreadKernelGlobalsCPU tkg(kg_cpu, nullptr, initcam_profiler, 0);
+  KernelGlobals kg = &tkg;
+
+  /* ---- 7. Build the case list: 768 pixels x 6 samples = 4608 cases ----
+   * Same pixel grid as the math probe (64x48 tile, stride 2). */
+  std::vector<InitCamCase> cases;
+  const uint32_t samples[6] = {0, 1, 5, 15, 255, 1023};
+  for (int y = 0; y < 48; y += 2) {
+    for (int x = 0; x < 64; x += 2) {
+      for (uint32_t si = 0; si < 6; si++) {
+        InitCamCase c{};
+        c.sample = (int32_t)samples[si];
+        c.x = (uint32_t)x;
+        c.y = (uint32_t)y;
+        cases.push_back(c);
+      }
+    }
+  }
+  const uint32_t num_cases = (uint32_t)cases.size();
+  LOG_INFO << "Vulkan: Init-from-camera probe: " << num_cases << " cases, "
+           << (num_cases + 63) / 64 << " workgroups of 64 threads.";
+
+  /* ---- 8. Allocate the three host-visible + device-address buffers ---- */
+  auto make_buffer = [&](VkDeviceSize size, VkBuffer &buf, VkDeviceMemory &mem,
+                         uint64_t &addr) -> bool {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if (vkCreateBuffer(vk_dev, &bci, nullptr, &buf) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera probe: buffer creation failed.";
+      return false;
+    }
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(vk_dev, buf, &reqs);
+    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &flags_info;
+    ai.allocationSize = reqs.size;
+    ai.memoryTypeIndex = dev->find_memory_type(
+        reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX) {
+      LOG_ERROR << "Vulkan: Init-from-camera probe: no host-visible+coherent memory type.";
+      return false;
+    }
+    if (vkAllocateMemory(vk_dev, &ai, nullptr, &mem) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera probe: memory allocation failed.";
+      return false;
+    }
+    if (vkBindBufferMemory(vk_dev, buf, mem, 0) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera probe: bind buffer memory failed.";
+      return false;
+    }
+    VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    bai.buffer = buf;
+    addr = vkGetBufferDeviceAddress(vk_dev, &bai);
+    return true;
+  };
+
+  uint64_t cases_addr = 0, out_addr = 0, params_addr = 0;
+  const VkDeviceSize cases_bytes = (VkDeviceSize)num_cases * sizeof(InitCamCase);
+  const VkDeviceSize out_bytes =
+      (VkDeviceSize)num_cases * sizeof(InitCamResult) +
+      (VkDeviceSize)INITCAM_CANARY_WORDS * sizeof(uint32_t);
+  const VkDeviceSize params_bytes = sizeof(MathProbeParams);
+  if (!make_buffer(cases_bytes, res.cases_buffer, res.cases_memory, cases_addr) ||
+      !make_buffer(out_bytes, res.out_buffer, res.out_memory, out_addr) ||
+      !make_buffer(params_bytes, res.params_buffer, res.params_memory, params_addr)) {
+    return false;
+  }
+
+  /* ---- 9. Upload the case list (write once) + pre-fill the canary ---- */
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.cases_memory, 0, cases_bytes, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera probe: mapping cases buffer failed.";
+      return false;
+    }
+    memcpy(m, cases.data(), (size_t)cases_bytes);
+    vkUnmapMemory(vk_dev, res.cases_memory);
+  }
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.out_memory, 0, out_bytes, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera probe: mapping out buffer (canary) failed.";
+      return false;
+    }
+    uint32_t *canary = reinterpret_cast<uint32_t *>(static_cast<uint8_t *>(m) +
+                                                    (size_t)num_cases * sizeof(InitCamResult));
+    for (uint32_t i = 0; i < INITCAM_CANARY_WORDS; i++) canary[i] = INITCAM_CANARY;
+    vkUnmapMemory(vk_dev, res.out_memory);
+  }
+
+  /* ---- 10. Command pool + buffer + queue + fence ---- */
+  const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
+  VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  cpci.queueFamilyIndex = family;
+  if (vkCreateCommandPool(vk_dev, &cpci, nullptr, &res.pool) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Init-from-camera probe: command pool creation failed.";
+    return false;
+  }
+  VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = res.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(vk_dev, &cbai, &cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Init-from-camera probe: command buffer allocation failed.";
+    return false;
+  }
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(vk_dev, family, 0, &queue);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (vkCreateFence(vk_dev, &fci, nullptr, &res.fence) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Init-from-camera probe: fence creation failed.";
+    return false;
+  }
+
+  /* ---- 11. Per-pass runner: update seed/neg_mode, dispatch, read back ---- */
+  std::vector<InitCamResult> results(num_cases);
+  auto run_pass = [&](uint32_t seed, int neg_mode) -> bool {
+    /* Update params (seed + fault switch) on the GPU buffer. */
+    mp.seed = seed;
+    mp.neg_mode = neg_mode;
+    {
+      void *m = nullptr;
+      if (vkMapMemory(vk_dev, res.params_memory, 0, params_bytes, 0, &m) != VK_SUCCESS) {
+        LOG_ERROR << "Vulkan: Init-from-camera probe: mapping params buffer failed.";
+        return false;
+      }
+      memcpy(m, &mp, sizeof(mp));
+      vkUnmapMemory(vk_dev, res.params_memory);
+    }
+    /* Keep the host reference in sync (same integrator.seed). */
+    tkg.data.integrator.seed = (int)seed;
+
+    /* Record + submit. */
+    VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkResetCommandBuffer(cmd, 0);
+    vkBeginCommandBuffer(cmd, &begin_info);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.pipeline);
+    InitCamPush push{cases_addr, out_addr, params_addr, num_cases};
+    vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd, (num_cases + 63) / 64, 1, 1);
+    vkEndCommandBuffer(cmd);
+
+    vkResetFences(vk_dev, 1, &res.fence);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (vkQueueSubmit(queue, 1, &si, res.fence) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera probe: queue submit failed.";
+      return false;
+    }
+    if (vkWaitForFences(vk_dev, 1, &res.fence, VK_TRUE, 10000000000ull) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera probe: fence wait failed.";
+      return false;
+    }
+
+    /* Read back. */
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.out_memory, 0, out_bytes, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera probe: mapping out buffer failed.";
+      return false;
+    }
+    memcpy(results.data(), m, (size_t)num_cases * sizeof(InitCamResult));
+    /* Verify the canary region is intact (no overrun). */
+    const uint32_t *canary = reinterpret_cast<const uint32_t *>(
+        static_cast<const uint8_t *>(m) + (size_t)num_cases * sizeof(InitCamResult));
+    bool canary_ok = true;
+    for (uint32_t i = 0; i < INITCAM_CANARY_WORDS; i++)
+      if (canary[i] != INITCAM_CANARY) canary_ok = false;
+    vkUnmapMemory(vk_dev, res.out_memory);
+    if (!canary_ok) {
+      LOG_ERROR << "Vulkan: Init-from-camera probe: OUTPUT CANARY CORRUPTED (shader "
+                   "overran the results buffer).";
+      return false;
+    }
+    return true;
+  };
+
+  /* ---- 12. Compare one pass against the CLEAN REAL Cycles reference ----
+   * The reference is always computed with CLEAN inputs; a neg pass injects
+   * its fault only on the GPU side, so "detected" means the GPU output
+   * disagrees with the clean real reference (the same discipline as the math
+   * probe). */
+  struct PassStats {
+    uint64_t int_cases = 0, int_mismatch = 0;
+    uint64_t float_comps = 0, float_mismatch = 0;
+    uint64_t draw_mismatch = 0; /* f[0..7]: rand_filter + rand_time/lens packing */
+    uint64_t ray_mismatch = 0;  /* f[8..16]: ray P/D/tmin/tmax/time */
+    uint64_t t_mismatch = 0;    /* f[17..19]: Spectrum T */
+    double max_norm_err = 0.0, sum_norm_err = 0.0;
+    std::vector<double> norm_errs;
+    bool bad_output_shape = false;
+  };
+  auto compare_pass = [&](PassStats &st) {
+    st.norm_errs.reserve(num_cases * 20);
+    for (uint32_t i = 0; i < num_cases; i++) {
+      const InitCamCase &c = cases[i];
+      const InitCamResult &r = results[i];
+
+      if (r.nfloat != 20) {
+        if (!st.bad_output_shape)
+          LOG_ERROR << "Vulkan: Init-from-camera probe: case " << i
+                    << " has invalid nfloat; dispatch did not run correctly.";
+        st.bad_output_shape = true;
+        continue;
+      }
+
+      /* rng_pixel as init_from_camera.h:93 computes it (CLEAN sample). */
+      const uint32_t rng_pixel = path_rng_pixel_init(kg, c.sample, (int)c.x, (int)c.y);
+
+      /* Bit-exact integer checks: the rng_pixel fed into the function (the
+       * probe reports the CLEAN value even on neg 1) and r_cache_miss. */
+      st.int_cases += 2;
+      if (r.u0 != rng_pixel) st.int_mismatch++;
+
+      /* REAL reference call: the ported function itself, compiled on the
+       * host from src/kernel/integrator/init_from_camera.h:19-52. */
+      Ray ray;
+      memset(&ray, 0, sizeof(ray));
+      int cache_miss = 0;
+      const Spectrum T = integrate_camera_sample(kg, c.sample, (int)c.x, (int)c.y,
+                                                 rng_pixel, &ray, cache_miss);
+      const uint32_t cache_miss_ref = (cache_miss != 0) ? 1u : 0u;
+      if (r.u1 != cache_miss_ref) st.int_mismatch++;
+
+      /* Observation reference: the two draws and the repack at
+       * init_from_camera.h:28-48 are locals inside the real function and
+       * cannot be read from its return values, so those four lines are
+       * reproduced here verbatim on top of the SAME real path_rng_*. */
+      /* source: init_from_camera.h:28-29 */
+      const float2 rand_filter = (c.sample == 0) ?
+                                     make_float2(0.5f, 0.5f) :
+                                     path_rng_2D(kg, rng_pixel, c.sample, PRNG_FILTER);
+      /* source: init_from_camera.h:32-37 */
+      const bool use_motionblur = kernel_data.cam.shuttertime != -1.0f;
+      const bool use_dof = kernel_data.cam.aperturesize > 0.0f;
+      const bool use_custom_cam = kernel_data.cam.type == CAMERA_CUSTOM;
+      const float3 rand_time_lens = (use_motionblur || use_dof || use_custom_cam) ?
+                                        path_rng_3D(kg, rng_pixel, c.sample, PRNG_LENS_TIME) :
+                                        zero_float3();
+      /* source: init_from_camera.h:47-48 */
+      const float rand_time = rand_time_lens.x;
+      const float2 rand_lens = make_float2(rand_time_lens.y, rand_time_lens.z);
+
+      /* f[] layout must match init_from_camera_probe.slang InitCamResult. */
+      const float ref[20] = {
+          rand_filter.x, rand_filter.y,
+          rand_time_lens.x, rand_time_lens.y, rand_time_lens.z,
+          rand_time, rand_lens.x, rand_lens.y,
+          ray.P.x, ray.P.y, ray.P.z,
+          ray.D.x, ray.D.y, ray.D.z,
+          ray.tmin, ray.tmax, ray.time,
+          T.x, T.y, T.z};
+      for (int k = 0; k < 20; k++) {
+        const double denom = std::max(1.0, (double)std::fabs(ref[k]));
+        const double err = std::fabs((double)r.f[k] - (double)ref[k]) / denom;
+        st.float_comps++;
+        st.sum_norm_err += err;
+        if (err > st.max_norm_err) st.max_norm_err = err;
+        st.norm_errs.push_back(err);
+        if (err > 1e-5) {
+          st.float_mismatch++;
+          if (k <= 7)
+            st.draw_mismatch++;
+          else if (k <= 16)
+            st.ray_mismatch++;
+          else
+            st.t_mismatch++;
+        }
+      }
+    }
+    std::sort(st.norm_errs.begin(), st.norm_errs.end());
+  };
+
+  auto log_stats = [&](const char *label, uint32_t seed, const PassStats &st) {
+    const double mean = st.norm_errs.empty() ?
+                            0.0 :
+                            st.sum_norm_err / (double)st.norm_errs.size();
+    const double p999 = st.norm_errs.empty() ?
+                            0.0 :
+                            st.norm_errs[(size_t)((double)(st.norm_errs.size() - 1) * 0.999)];
+    LOG_INFO << "Vulkan: Init-from-camera probe: [" << label << " seed=" << seed
+             << "] int " << st.int_mismatch << "/" << st.int_cases
+             << " mismatch; float " << st.float_mismatch << "/" << st.float_comps
+             << " over tol (draw=" << st.draw_mismatch << " ray=" << st.ray_mismatch
+             << " T=" << st.t_mismatch << "); max_norm_err=" << st.max_norm_err
+             << " mean=" << mean << " p99.9=" << p999
+             << (st.bad_output_shape ? " [BAD OUTPUT SHAPE]" : "");
+  };
+
+  /* ---- 13. Run: clean for seeds {0,1,large}; negatives at seed 0 ---- */
+  const uint32_t clean_seeds[3] = {0u, 1u, 0xDEADBEEFu};
+  bool clean_ok = true;
+  for (int s = 0; s < 3; s++) {
+    if (!run_pass(clean_seeds[s], 0)) return false;
+    PassStats st;
+    compare_pass(st);
+    log_stats("CLEAN", clean_seeds[s], st);
+    if (st.int_mismatch != 0 || st.float_mismatch != 0 || st.bad_output_shape) clean_ok = false;
+  }
+
+  PassStats neg_stats[4]; /* 1..3 used */
+  const char *neg_name[4] = {"", "rng-xor", "sample+1", "transpose-rtc"};
+  for (int n = 1; n <= 3; n++) {
+    if (!run_pass(0u, n)) return false;
+    compare_pass(neg_stats[n]);
+    log_stats(neg_name[n], 0, neg_stats[n]);
+  }
+  /* Detection is per targeted comparison group: each fault must corrupt the
+   * group of outputs that the corresponding Cycles lines produce (a fault
+   * that changes nothing this gate compares would be undetected by
+   * construction). */
+  const bool neg_detected[4] = {
+      true,
+      neg_stats[1].draw_mismatch > 0, /* rng xor -> the PRNG filter draw */
+      neg_stats[2].draw_mismatch > 0, /* sample+1 -> the sample==0 0.5/0.5 draw */
+      neg_stats[3].ray_mismatch > 0}; /* transposed rtc -> the ray */
+
+  /* ---- 14. Verdict ---- */
+  bool all_ok = clean_ok;
+  for (int n = 1; n <= 3; n++) {
+    LOG_INFO << "Vulkan: Init-from-camera probe: negative '" << neg_name[n] << "' "
+             << (neg_detected[n] ? "DETECTED" : "NOT DETECTED");
+    if (!neg_detected[n]) all_ok = false;
+  }
+  if (clean_ok)
+    LOG_INFO << "Vulkan: Init-from-camera probe: CLEAN PASS (all seeds "
+                "bit/tolerance-exact).";
+  else
+    LOG_ERROR << "Vulkan: Init-from-camera probe: CLEAN PASS FAILED (GPU disagrees with "
+                 "the real Cycles reference).";
+  LOG_INFO << "Vulkan: Init-from-camera probe: " << (all_ok ? "GATE MET." : "GATE NOT MET.");
   return all_ok;
 }
 

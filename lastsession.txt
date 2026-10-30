@@ -1,3 +1,93 @@
+M4f SLICE 1 — INIT_FROM_CAMERA (integrate_camera_sample port + probe gate PASSED) - 2026-10-30
+==============================================================================================
+STATUS: COMPLETE and gate PASSED on BOTH devices. Repo diff = this block + 2 NEW Slang
+files + kernels.cpp + queue.cpp. Nothing existing was edited except the two host files
+and this summary (no existing .slang touched => no default-SPIR-V-identity concern).
+
+SCOPE (user-approved split + gate, asked and answered this session):
+- Slice 1 ONLY: the Cycles function integrate_camera_sample
+  (src/kernel/integrator/init_from_camera.h:19-52) ported faithfully, plus a
+  compile-checked SKELETON of integrator_init_from_camera (:57-143) whose body is
+  DEFERRED markers naming the exact Cycles calls they replace.
+- Gate: probe whose host reference calls the REAL integrate_camera_sample compiled
+  into the binary. Integers bit-exact, floats |a-b| <= 1e-5*max(1,|b|), layer active,
+  0 VUID, 3 negatives must be DETECTED.
+- Slice 2 (next): state init = path_state_init / path_state_init_queues /
+  path_state_init_integrator / integrator_state_write_ray + the missing
+  path.rng_pixel accessor (+ dP/dD: math_core camera_sample does not produce ray
+  differentials yet). Slice 3: film_need_sample_pixel / film_write_sample + the
+  state_flow queue layer.
+
+FILES, what and why:
+- src/kernel/device/vulkan/init_from_camera.slang (NEW): faithful port of
+  integrate_camera_sample using the ALREADY-GATED math_core path_rng_2D/3D +
+  camera_sample. 4 extra `out` observation params (rand_filter, rand_time_lens,
+  rand_time, rand_lens): they are locals in Cycles and unconsumed in the covered
+  config (filter table / DOF / shutter table branches only), so without exposing
+  them the gate would compare none of THIS function's own logic. Pure observations:
+  no computation/branch/return depends on them. The skeleton's DEFERRED list cites
+  every Cycles line + blocking reason (no KernelWorkTile, no film buffer, no
+  path.rng_pixel accessor, no dP/dD).
+- src/kernel/device/vulkan/init_from_camera_probe.slang (NEW): entry
+  init_from_camera_main, 64 thr/wg, InitCamCase(12B)/InitCamResult(112B)/Push(32B),
+  f[24] layout documented in-file. neg faults live ONLY probe-side (feed rng^1 /
+  feed sample+1 / transpose rastertocamera); the port has no fault switch.
+- src/device/vulkan/kernels.cpp: +include kernel/integrator/init_from_camera.h;
+  +vulkan_init_from_camera_probe() modeled 1:1 on vulkan_math_probe (reuses
+  MathProbeParams unchanged = the math probe's static_assert(sizeof==176) harness
+  line is untouched; covered-config guard FAILS the gate outside perspective/
+  aperture0/shutter-1/no-motion/no-stereo instead of comparing uncovered values).
+- src/device/vulkan/queue.cpp: forward decl + call after vulkan_state_access_probe.
+
+GATE RESULTS (layer proven "Insert instance layer VK_LAYER_KHRONOS_validation",
+VUID=0, Validation Error=0, cycles exit 0, 4608 cases = 768 px x samples
+{0,1,5,15,255,1023}, 9216 int + 92160 float comparisons per pass):
+- RX 570 (amdvlk): CLEAN seed=0/1/0xDEADBEEF all "int 0/9216, float 0/92160,
+  max_norm_err=2.34e-07"; negatives DETECTED: rng-xor 7680 draw-mismatches,
+  sample+1 1536, transpose-rtc 18432 ray-mismatches. => GATE MET.
+- SwiftShader (Subzero, VK_ICD_FILENAMES=...Microsoft-Edge-WebView\vk_swiftshader_icd.json):
+  same structure, all clean 0/0, same DETECTED counts, max_norm_err=1.20e-07,
+  VUID 0 => GATE MET.
+- REGRESSION re-run on RX 570 (both old probes, layer, VUID 0):
+  math probe GATE MET (3/3 negatives DETECTED); state access gate mode 0 PASS,
+  modes 1-4 DETECTED (7+1c/7+1c/46/8), "ALL CHECKS PASSED".
+
+COMMANDS THAT WORKED (repo root, env does NOT persist between tool calls):
+  slangc: C:\VulkanSDK\1.4.363.0\Bin\slangc.exe src\kernel\device\vulkan\init_from_camera_probe.slang
+          -target spirv -stage compute -entry init_from_camera_main
+          -I src\kernel\device\vulkan -o %LOCALAPPDATA%\Temp\opencode\init_from_camera_probe.spv
+          (exit 0, 39828 bytes); spirv-val --target-env vulkan1.3 -> exit 0.
+  gate:   CYCLES_VULKAN_INIT_FROM_CAMERA_PROBE=1
+          CYCLES_VULKAN_INIT_FROM_CAMERA_PROBE_SPV=%LOCALAPPDATA%\Temp\opencode\init_from_camera_probe.spv
+          CYCLES_VULKAN_ALLOW_NO_KERNELS=1 VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation
+          VK_LOADER_DEBUG=layer, VK_ICD_FILENAMES unset (RX 570) /
+          =C:\Windows\System32\Microsoft-Edge-WebView\vk_swiftshader_icd.json (SwiftShader),
+          cmd /c "build\bin\Release\cycles.exe --device VULKAN --log-level info
+          --samples 1 --background instance2.xml 1>log 2>&1"
+  regress: also CYCLES_VULKAN_MATH_PROBE=1 + _SPV=...\math_probe.spv and
+          CYCLES_VULKAN_STATE_ACCESS_PROBE=1 + _SPV=...\state_access_probe.spv
+          (the probes default to CWD for their .spv - without _SPV they ERROR "cannot
+          find" and the run still exits 0: CHECK the log lines, not just exit code).
+  build:  cmake --build build --config Release --target cycles -- /m (exit 0; only
+          kernels.cpp + queue.cpp recompile = fast).
+
+TRAPS HIT THIS SESSION:
+- path_rng_2D/3D in math_core.slang take a 5th `bool neg` (M4e fault hook): a
+  faithful call site passes `false`. (First compile: E39999 got 4 expected 5.)
+- VkComputePipelineCreateInfo sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO
+  (C2065 on the wrong enum name).
+- Regression probes silently no-op on a missing .spv (LOG_ERROR + exit 0) - grep the
+  log for "cannot find".
+- The host reference for NEG passes is always the CLEAN call (math-probe discipline);
+  a neg counts only if it changes output vs the clean run.
+
+LOGS (%LOCALAPPDATA%\Temp\opencode): initcam_gate_rx570.log, initcam_gate_swiftshader.log,
+regress_math_state_rx570.log, init_from_camera_probe.spv.
+
+STILL OPEN: narrow-vs-atomic TIMING for DIVERGENCES.md Entry 1 (deferred to after M5,
+user rule). NEXT TASK: M4f slice 2 (state init) - see scope above.
+
+==============================================================================================
 M4e NARROW WORKAROUND APPLIED + GATE PASSED (v7 found a SECOND driver bug) - 2026-10-27
 ========================================================================
 STATUS: COMPLETE. Repo diff = this block + the section below it

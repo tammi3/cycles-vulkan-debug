@@ -53,6 +53,12 @@ bool vulkan_subword_check(VulkanDevice *device);
  * mode plus the Task-4 fault modes 1..4 (see kernels.cpp for the full doc). */
 bool vulkan_state_access_probe(VulkanDevice *device);
 
+/* M4f SLICE 1 init-from-camera probe hook, implemented in kernels.cpp. Runs
+ * at most once, no-op unless CYCLES_VULKAN_INIT_FROM_CAMERA_PROBE=1; compares
+ * the ported integrate_camera_sample against the REAL Cycles function (see
+ * kernels.cpp for the full doc). */
+bool vulkan_init_from_camera_probe(VulkanDevice *device);
+
 VulkanQueue::VulkanQueue(VulkanDevice *d) : DeviceQueue(d), vulkan_device_(d) {}
 
 int VulkanQueue::num_concurrent_states(const size_t s) const {
@@ -105,6 +111,9 @@ bool VulkanQueue::enqueue(DeviceKernel k, const int n, const DeviceKernelArgumen
   /* M4e S1b-6: optional one-shot integrator-state accessor gate (env
    * CYCLES_VULKAN_STATE_ACCESS_PROBE=1), same no-op-unless-set semantics. */
   vulkan_state_access_probe(vulkan_device_);
+  /* M4f SLICE 1: optional one-shot init-from-camera probe (env
+   * CYCLES_VULKAN_INIT_FROM_CAMERA_PROBE=1), same no-op-unless-set semantics. */
+  vulkan_init_from_camera_probe(vulkan_device_);
   vulkan_device_->set_error("Vulkan: kernel dispatch not implemented yet (M4)");
   debug_enqueue_end();
   return false;
