@@ -232,6 +232,14 @@ static const uint QUEUED_KERNEL_SLOT_OFF = 80u;          /* path.queued_kernel *
 static const uint RNG_OFFSET_SLOT_OFF = 96u;             /* path.rng_offset */
 static const uint VISIBILITY_SLOT_OFF = 104u;            /* path.visibility */
 static const uint MNEE_SLOT_OFF = 120u;                  /* path.mnee */
+/* M4f slice 2 (path_state_init_integrator's u16 bounce counters; slot bytes
+ * from vulkan_data.slang IntegratorStatePath comments, path @0): */
+static const uint DIFFUSE_BOUNCE_SLOT_OFF = 32u;
+static const uint GLOSSY_BOUNCE_SLOT_OFF = 40u;
+static const uint TRANSMISSION_BOUNCE_SLOT_OFF = 48u;
+static const uint VOLUME_BOUNCE_SLOT_OFF = 56u;
+static const uint VOLUME_BOUNDS_BOUNCE_SLOT_OFF = 64u;
+static const uint PORTAL_BOUNCE_SLOT_OFF = 72u;
 static const uint SHADOW_PATH_BASE_OFF = 976u;           /* shadow_path struct */
 static const uint SHADOW_QUEUED_KERNEL_SLOT_OFF = SHADOW_PATH_BASE_OFF + 88u;
 static const uint SHADOW_LIGHTGROUP_SLOT_OFF = SHADOW_PATH_BASE_OFF + 152u;
@@ -468,6 +476,120 @@ float3 read_path_pass_diffuse_weight(IntegratorStateGPU* ist, uint state)
 void write_path_pass_diffuse_weight(IntegratorStateGPU* ist, uint state, float3 v)
 {
     float3* data_ptr = ist->path.pass_diffuse_weight;
+    data_ptr[state] = v;
+}
+
+/* ===================== M4f slice-2 accessors ===========================
+ * Members written by path_state_init_integrator (path_state.h:40-108) that
+ * had no accessor when slice 1 landed. Every source cite is the
+ * state_template.h line defining the member type. The u16 members MUST go
+ * through SUBWORD16_PTR (Form-A loader, see the driver-bug note above) -
+ * never a raw pointer-member load. */
+uint read_path_rng_pixel(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:35 (uint32_t)
+    uint* data_ptr = ist->path.rng_pixel;
+    return data_ptr[state];
+}
+void write_path_rng_pixel(IntegratorStateGPU* ist, uint state, uint v)
+{
+    uint* data_ptr = ist->path.rng_pixel;
+    data_ptr[state] = v;
+}
+
+uint read_path_diffuse_bounce(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:21 (uint16_t) -> sub-word
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.diffuse_bounce, DIFFUSE_BOUNCE_SLOT_OFF);
+    return load_u16(data_ptr, state);
+}
+void write_path_diffuse_bounce(IntegratorStateGPU* ist, uint state, uint v)
+{
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.diffuse_bounce, DIFFUSE_BOUNCE_SLOT_OFF);
+    store_u16(data_ptr, state, v);
+}
+
+uint read_path_glossy_bounce(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:23 (uint16_t) -> sub-word
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.glossy_bounce, GLOSSY_BOUNCE_SLOT_OFF);
+    return load_u16(data_ptr, state);
+}
+void write_path_glossy_bounce(IntegratorStateGPU* ist, uint state, uint v)
+{
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.glossy_bounce, GLOSSY_BOUNCE_SLOT_OFF);
+    store_u16(data_ptr, state, v);
+}
+
+uint read_path_transmission_bounce(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:25 (uint16_t) -> sub-word
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.transmission_bounce, TRANSMISSION_BOUNCE_SLOT_OFF);
+    return load_u16(data_ptr, state);
+}
+void write_path_transmission_bounce(IntegratorStateGPU* ist, uint state, uint v)
+{
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.transmission_bounce, TRANSMISSION_BOUNCE_SLOT_OFF);
+    store_u16(data_ptr, state, v);
+}
+
+uint read_path_volume_bounce(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:27 (uint16_t) -> sub-word
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.volume_bounce, VOLUME_BOUNCE_SLOT_OFF);
+    return load_u16(data_ptr, state);
+}
+void write_path_volume_bounce(IntegratorStateGPU* ist, uint state, uint v)
+{
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.volume_bounce, VOLUME_BOUNCE_SLOT_OFF);
+    store_u16(data_ptr, state, v);
+}
+
+uint read_path_volume_bounds_bounce(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:29 (uint16_t) -> sub-word
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.volume_bounds_bounce, VOLUME_BOUNDS_BOUNCE_SLOT_OFF);
+    return load_u16(data_ptr, state);
+}
+void write_path_volume_bounds_bounce(IntegratorStateGPU* ist, uint state, uint v)
+{
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.volume_bounds_bounce, VOLUME_BOUNDS_BOUNCE_SLOT_OFF);
+    store_u16(data_ptr, state, v);
+}
+
+uint read_path_portal_bounce(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:31 (uint16_t) -> sub-word
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.portal_bounce, PORTAL_BOUNCE_SLOT_OFF);
+    return load_u16(data_ptr, state);
+}
+void write_path_portal_bounce(IntegratorStateGPU* ist, uint state, uint v)
+{
+    Subword16T* data_ptr = SUBWORD16_PTR(ist, ist->path.portal_bounce, PORTAL_BOUNCE_SLOT_OFF);
+    store_u16(data_ptr, state, v);
+}
+
+int read_path_mis_ray_object(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:54 (int, KERNEL_FEATURE_LIGHT_LINKING)
+    int* data_ptr = ist->path.mis_ray_object;
+    return data_ptr[state];
+}
+void write_path_mis_ray_object(IntegratorStateGPU* ist, uint state, int v)
+{
+    int* data_ptr = ist->path.mis_ray_object;
+    data_ptr[state] = v;
+}
+
+float3 read_path_denoising_feature_throughput(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:70 (PackedSpectrum, KERNEL_FEATURE_DENOISING)
+    float3* data_ptr = ist->path.denoising_feature_throughput;
+    return data_ptr[state];
+}
+void write_path_denoising_feature_throughput(IntegratorStateGPU* ist, uint state, float3 v)
+{
+    float3* data_ptr = ist->path.denoising_feature_throughput;
     data_ptr[state] = v;
 }
 

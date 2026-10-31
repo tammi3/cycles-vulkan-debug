@@ -3043,6 +3043,678 @@ bool vulkan_init_from_camera_probe(VulkanDevice *dev)
 }
 
 /* =========================================================================
+ * M4f SLICE 2 state-init probe (optional, env
+ * CYCLES_VULKAN_STATE_INIT_PROBE=1)
+ * =========================================================================
+ * Gate for the ported state-initialization cluster (path_state.slang:
+ * path_state_init_queues / path_state_init / path_state_init_integrator /
+ * integrator_state_write_ray).
+ *
+ * Reference: for every case the host calls the REAL Cycles functions on a
+ * zeroed IntegratorStateCPU (direct member assignment on the host,
+ * state.h:227,234-240), then compares the resulting BYTES of every member
+ * the cluster writes against the raw SoA slice bytes the GPU wrote through
+ * the accessors. Integers are bit-exact by construction (raw byte compare);
+ * float slices are compared with |gpu-ref| <= 1e-5*max(1,|ref|), the same
+ * tolerance as the other probes.
+ *
+ * INPUT OVERRIDES (applied to BOTH sides - same discipline as the math
+ * probe's pixel_jitter override, documented here so no reader mistakes them
+ * for scene values):
+ *   kernel_features   = real kd.kernel_features OR the four bits the ported
+ *                       code branches on (NODE_PORTAL 1<<10, VOLUME 1<<18,
+ *                       LIGHT_LINKING 1<<28, DENOISING 1<<30), so the gate
+ *                       exercises those branches even for a scene with them
+ *                       off. The __PATH_GUIDING__ block is absent from both
+ *                       sides (see path_state.slang's header: features.h
+ *                       makes it CPU-only and WITH_PATH_GUIDING does not
+ *                       exist in this build), so that bit is NOT forced.
+ *   background.object_index = 41, background.volume_shader = 43 (real values
+ *                       are 0 in this scene; 0 would make "wrote 0 into
+ *                       zeroed memory" indistinguishable from "did not
+ *                       write", so a nonzero constant proves the wiring of
+ *                       background.* into volume_stack/mis_ray_object).
+ *   tile.offset = 1000, tile.stride = 64 (nonzero offset catches an
+ *                       omitted term in render_pixel_index).
+ *
+ * NEGATIVES (probe-side input faults only; the port contains no switch;
+ * reference always computed with CLEAN inputs, math-probe discipline):
+ *   1 -> sample+1 fed to path_state_init_integrator -> ONLY path.sample may
+ *        differ;  2 -> stride+1 fed to path_state_init -> ONLY
+ *        path.render_pixel_index may differ;  3 -> ray.time+0.5 fed to
+ *        integrator_state_write_ray -> ONLY ray.time may differ.
+ * A negative counts as DETECTED only if the targeted slice differs AND no
+ * other slice changes (a spillover would mean the port reads an input it
+ * must not read). There is no seed axis: none of the four functions reads
+ * the sampler - rng_pixel arrives per case as data. */
+
+/* Layouts locked against state_init_probe.slang (same names). */
+struct StateInitCase {
+  int32_t sample;
+  uint32_t x, y, rng_pixel;
+  float f[14]; /* ray P/dP/D/dD/tmin/tmax/time + throughput, see the Slang */
+};
+static_assert(sizeof(StateInitCase) == 72, "StateInitCase layout must match Slang");
+
+struct StateInitParams {
+  uint32_t kernel_features;
+  int32_t background_object_index;
+  int32_t background_volume_shader;
+  int32_t tile_offset;
+  uint32_t tile_stride;
+  int32_t neg_mode;
+  uint32_t pad0, pad1;
+};
+static_assert(sizeof(StateInitParams) == 32, "StateInitParams layout must match Slang");
+
+struct StateInitPush {
+  VkDeviceAddress cases;
+  VkDeviceAddress ist;
+  VkDeviceAddress params;
+  uint32_t num_cases;
+};
+static_assert(sizeof(StateInitPush) == 32, "Push layout must match Slang");
+
+constexpr uint32_t SINIT_PUSH_BYTES = 32;
+constexpr uint32_t SINIT_CANARY_WORDS = 4;
+constexpr uint32_t SINIT_CANARY = 0x5C5C5C5Cu; /* S1b canary pattern */
+
+/* One SoA slice the cluster writes: mirror slot (IntegratorStateGPU byte
+ * offset, filled with a device address), host slot (IntegratorStateCPU byte
+ * offset of the same member), element size, float-ness, and which negative
+ * is allowed to change it (0 = none). */
+struct StateInitSlice {
+  const char *name;
+  size_t mirror;
+  size_t host;
+  uint32_t elem;
+  bool is_float;
+  int neg_group;
+  size_t off; /* byte offset inside the SoA buffer (filled below) */
+};
+
+struct StateInitResources {
+  VkDevice device = VK_NULL_HANDLE;
+  VkShaderModule module = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  VkBuffer cases_buffer = VK_NULL_HANDLE, ist_buffer = VK_NULL_HANDLE,
+           params_buffer = VK_NULL_HANDLE, soa_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory cases_memory = VK_NULL_HANDLE, ist_memory = VK_NULL_HANDLE,
+                 params_memory = VK_NULL_HANDLE, soa_memory = VK_NULL_HANDLE;
+
+  ~StateInitResources()
+  {
+    if (device == VK_NULL_HANDLE) return;
+    if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+    if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+    if (module) vkDestroyShaderModule(device, module, nullptr);
+    if (pool) vkDestroyCommandPool(device, pool, nullptr);
+    if (fence) vkDestroyFence(device, fence, nullptr);
+    if (cases_buffer) vkDestroyBuffer(device, cases_buffer, nullptr);
+    if (ist_buffer) vkDestroyBuffer(device, ist_buffer, nullptr);
+    if (params_buffer) vkDestroyBuffer(device, params_buffer, nullptr);
+    if (soa_buffer) vkDestroyBuffer(device, soa_buffer, nullptr);
+    if (cases_memory) vkFreeMemory(device, cases_memory, nullptr);
+    if (ist_memory) vkFreeMemory(device, ist_memory, nullptr);
+    if (params_memory) vkFreeMemory(device, params_memory, nullptr);
+    if (soa_memory) vkFreeMemory(device, soa_memory, nullptr);
+  }
+};
+
+bool vulkan_state_init_probe(VulkanDevice *dev)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+  if (getenv("CYCLES_VULKAN_STATE_INIT_PROBE") == nullptr) return true;
+
+  LOG_INFO << "Vulkan: State-init probe starting (CYCLES_VULKAN_STATE_INIT_PROBE=1).";
+
+  StateInitResources res;
+  const VkDevice vk_dev = dev->vk_device();
+  res.device = vk_dev;
+
+  /* ---- 1. SPIR-V (env override or cwd default) ---- */
+  std::vector<char> spirv;
+  const char *env_path = getenv("CYCLES_VULKAN_STATE_INIT_PROBE_SPV");
+  const char *candidates[2] = {env_path, "state_init_probe.spv"};
+  const char *found = nullptr;
+  for (const char *c : candidates) {
+    if (c && probe_read_whole_file(c, spirv)) { found = c; break; }
+  }
+  if (!found) {
+    LOG_ERROR << "Vulkan: State-init probe: cannot find state_init_probe.spv "
+                 "(compile it with slangc or set CYCLES_VULKAN_STATE_INIT_PROBE_SPV).";
+    return false;
+  }
+  if (spirv.size() % 4 != 0) {
+    LOG_ERROR << "Vulkan: State-init probe: '" << found << "' is not a valid SPIR-V module.";
+    return false;
+  }
+  LOG_INFO << "Vulkan: State-init probe: spirv='" << found << "' (" << spirv.size()
+           << " bytes).";
+
+  /* ---- 2. Shader module ---- */
+  VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = spirv.size();
+  smi.pCode = reinterpret_cast<const uint32_t *>(spirv.data());
+  if (vkCreateShaderModule(vk_dev, &smi, nullptr, &res.module) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: State-init probe: vkCreateShaderModule failed.";
+    return false;
+  }
+
+  /* ---- 3. Pipeline layout (one 32-byte push range) ---- */
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(dev->vk_physical_device(), &props);
+  if (props.limits.maxPushConstantsSize < SINIT_PUSH_BYTES) {
+    LOG_ERROR << "Vulkan: State-init probe: maxPushConstantsSize too small.";
+    return false;
+  }
+  VkPushConstantRange pcr{};
+  pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pcr.offset = 0;
+  pcr.size = SINIT_PUSH_BYTES;
+  VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pli.pushConstantRangeCount = 1;
+  pli.pPushConstantRanges = &pcr;
+  if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &res.layout) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: State-init probe: pipeline layout creation failed.";
+    return false;
+  }
+
+  /* ---- 4. Compute pipeline (entry "main"; slangc renames) ---- */
+  VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  cpi.stage.module = res.module;
+  cpi.stage.pName = "main";
+  cpi.layout = res.layout;
+  if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &res.pipeline) !=
+      VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: State-init probe: compute pipeline creation failed.";
+    return false;
+  }
+
+  /* ---- 5. Inputs: real kernel data + the documented overrides ---- */
+  const KernelData &kd = dev->host_kernel_data();
+  StateInitParams tp{};
+  tp.kernel_features = kd.kernel_features | (1u << 10u) /* NODE_PORTAL */ |
+                       (1u << 18u) /* VOLUME */ | (1u << 28u) /* LIGHT_LINKING */ |
+                       (1u << 30u) /* DENOISING */;
+  tp.background_object_index = 41;
+  tp.background_volume_shader = 43;
+  tp.tile_offset = 1000;
+  tp.tile_stride = 64;
+  tp.neg_mode = 0;
+  LOG_INFO << "Vulkan: State-init probe: kernel_features 0x" << std::hex
+           << kd.kernel_features << " -> forced 0x" << tp.kernel_features << std::dec
+           << " tile offset=" << tp.tile_offset << " stride=" << tp.tile_stride;
+
+  /* Host reference globals: same forced feature/background values, so both
+   * sides run the same branches with the same data. No RNG state is needed
+   * (none of the four functions draws; rng_pixel arrives per case). */
+  KernelGlobalsCPU kg_cpu;
+  kg_cpu.data = kd;
+  kg_cpu.data.kernel_features = tp.kernel_features;
+  kg_cpu.data.background.object_index = tp.background_object_index;
+  kg_cpu.data.background.volume_shader = tp.background_volume_shader;
+  Profiler sinit_profiler;
+  ThreadKernelGlobalsCPU tkg(kg_cpu, nullptr, sinit_profiler, 0);
+  KernelGlobals kg = &tkg;
+
+  /* ---- 6. Case list: 768 pixels x 6 samples = 4608 cases (one state each) ---- */
+  const uint32_t samples[6] = {0, 1, 5, 15, 255, 1023};
+  std::vector<StateInitCase> cases;
+  for (int y = 0; y < 48; y += 2) {
+    for (int x = 0; x < 64; x += 2) {
+      for (uint32_t si = 0; si < 6; si++) {
+        StateInitCase c{};
+        c.sample = (int32_t)samples[si];
+        c.x = (uint32_t)x;
+        c.y = (uint32_t)y;
+        c.rng_pixel = (uint32_t)(cases.size() * 2654435761u + 1u);
+        /* Deterministic, exactly-representable (dyadic) ray + throughput so
+         * a raw byte compare against the host struct is meaningful. */
+        const uint32_t i = (uint32_t)cases.size();
+        c.f[0] = (float)(i % 32) * (1.0f / 32.0f);
+        c.f[1] = -(float)(i % 17) * (1.0f / 16.0f);
+        c.f[2] = (float)(i % 13) * (1.0f / 8.0f);
+        c.f[3] = (float)(i % 7) * 0.25f;
+        c.f[4] = (float)(i % 11) * (1.0f / 32.0f);
+        c.f[5] = (float)(i % 19) * (1.0f / 64.0f);
+        c.f[6] = -(float)(i % 5) * 0.5f;
+        c.f[7] = (float)(i % 9) * 0.125f;
+        c.f[8] = (float)(i % 6) * 0.5f;
+        c.f[9] = (float)(i % 15) * 2.0f;
+        c.f[10] = (float)(i % 16) * (1.0f / 16.0f);
+        c.f[11] = 0.5f + (float)(i % 4) * 0.125f;
+        c.f[12] = 0.25f + (float)(i % 8) * 0.0625f;
+        c.f[13] = 1.0f - (float)(i % 4) * 0.0625f;
+        cases.push_back(c);
+      }
+    }
+  }
+  const uint32_t num_cases = (uint32_t)cases.size();
+  LOG_INFO << "Vulkan: State-init probe: " << num_cases << " cases, "
+           << (num_cases + 63) / 64 << " workgroups of 64 threads.";
+
+  /* ---- 7. Slice table: every member the cluster writes ----
+   * MIS = offsetof in the IntegratorStateGPU pointer mirror (state.h:140,
+   * non-packed: every member is `type*`), HIS = offsetof in the
+   * IntegratorStateCPU AoS struct (state.h:69+, generated from the same
+   * state_template.h, so member order matches by construction).
+   * volume_stack: mirror is an array of {int* object; int* shader} stride 16
+   * (S1b-5 record: object@0 shader@8); CPU is {int object; int shader}
+   * stride 8. Element sizes: u16 members = 2 (packed pairs in a 32-bit word
+   * by default, true 16-bit in narrow - SAME byte layout in both modes,
+   * integrator_state.slang load_u16/store_u16), u8 = 1, scalar = 4,
+   * float3 = 12 (ArrayStride 12, confirmed in S1b disassembly). */
+#define SINIT_MIS(m) offsetof(IntegratorStateGPU, m)
+#define SINIT_HIS(m) offsetof(IntegratorStateCPU, m)
+
+  std::vector<StateInitSlice> sl;
+  auto add = [&](const char *name, size_t mirror, size_t host, uint32_t elem, bool flt,
+                 int grp) {
+    sl.push_back(StateInitSlice{name, mirror, host, elem, flt, grp, 0});
+  };
+  add("path.render_pixel_index", SINIT_MIS(path.render_pixel_index),
+      SINIT_HIS(path.render_pixel_index), 4, false, 2);
+  add("path.sample", SINIT_MIS(path.sample), SINIT_HIS(path.sample), 4, false, 1);
+  add("path.bounce", SINIT_MIS(path.bounce), SINIT_HIS(path.bounce), 2, false, 0);
+  add("path.diffuse_bounce", SINIT_MIS(path.diffuse_bounce), SINIT_HIS(path.diffuse_bounce),
+      2, false, 0);
+  add("path.glossy_bounce", SINIT_MIS(path.glossy_bounce), SINIT_HIS(path.glossy_bounce), 2,
+      false, 0);
+  add("path.transmission_bounce", SINIT_MIS(path.transmission_bounce),
+      SINIT_HIS(path.transmission_bounce), 2, false, 0);
+  add("path.transparent_bounce", SINIT_MIS(path.transparent_bounce),
+      SINIT_HIS(path.transparent_bounce), 2, false, 0);
+  add("path.volume_bounce", SINIT_MIS(path.volume_bounce), SINIT_HIS(path.volume_bounce), 2,
+      false, 0);
+  add("path.volume_bounds_bounce", SINIT_MIS(path.volume_bounds_bounce),
+      SINIT_HIS(path.volume_bounds_bounce), 2, false, 0);
+  add("path.portal_bounce", SINIT_MIS(path.portal_bounce), SINIT_HIS(path.portal_bounce), 2,
+      false, 0);
+  add("path.queued_kernel", SINIT_MIS(path.queued_kernel), SINIT_HIS(path.queued_kernel), 2,
+      false, 0);
+  add("path.rng_pixel", SINIT_MIS(path.rng_pixel), SINIT_HIS(path.rng_pixel), 4, false, 0);
+  add("path.rng_offset", SINIT_MIS(path.rng_offset), SINIT_HIS(path.rng_offset), 2, false, 0);
+  add("path.visibility", SINIT_MIS(path.visibility), SINIT_HIS(path.visibility), 1, false, 0);
+  add("path.flag", SINIT_MIS(path.flag), SINIT_HIS(path.flag), 4, false, 0);
+  add("path.mnee", SINIT_MIS(path.mnee), SINIT_HIS(path.mnee), 1, false, 0);
+  add("path.mis_ray_pdf", SINIT_MIS(path.mis_ray_pdf), SINIT_HIS(path.mis_ray_pdf), 4, true,
+      0);
+  add("path.min_ray_pdf", SINIT_MIS(path.min_ray_pdf), SINIT_HIS(path.min_ray_pdf), 4, true,
+      0);
+  add("path.continuation_probability", SINIT_MIS(path.continuation_probability),
+      SINIT_HIS(path.continuation_probability), 4, true, 0);
+  add("path.throughput", SINIT_MIS(path.throughput), SINIT_HIS(path.throughput), 12, true,
+      0);
+  add("path.optical_depth", SINIT_MIS(path.optical_depth), SINIT_HIS(path.optical_depth), 4,
+      true, 0);
+  add("path.mis_ray_object", SINIT_MIS(path.mis_ray_object), SINIT_HIS(path.mis_ray_object),
+      4, false, 0);
+  add("path.denoising_feature_throughput",
+      SINIT_MIS(path.denoising_feature_throughput),
+      SINIT_HIS(path.denoising_feature_throughput), 12, true, 0);
+  add("isect.object", SINIT_MIS(isect.object), SINIT_HIS(isect.object), 4, false, 0);
+  add("isect.prim", SINIT_MIS(isect.prim), SINIT_HIS(isect.prim), 4, false, 0);
+  add("isect.type", SINIT_MIS(isect.type), SINIT_HIS(isect.type), 4, false, 0);
+  {
+    const size_t vs_m = SINIT_MIS(volume_stack);
+    const size_t vs_h = SINIT_HIS(volume_stack);
+    for (uint32_t slot = 0; slot < 2; slot++) {
+      char n_obj[48], n_sh[48];
+      snprintf(n_obj, sizeof(n_obj), "volume_stack[%u].object", slot);
+      snprintf(n_sh, sizeof(n_sh), "volume_stack[%u].shader", slot);
+      add(strdup(n_obj), vs_m + (size_t)slot * 16 + 0, vs_h + (size_t)slot * 8 + 0, 4,
+          false, 0);
+      add(strdup(n_sh), vs_m + (size_t)slot * 16 + 8, vs_h + (size_t)slot * 8 + 4, 4, false,
+          0);
+    }
+  }
+  add("ray.P", SINIT_MIS(ray.P), SINIT_HIS(ray.P), 12, true, 0);
+  add("ray.D", SINIT_MIS(ray.D), SINIT_HIS(ray.D), 12, true, 0);
+  add("ray.dP", SINIT_MIS(ray.dP), SINIT_HIS(ray.dP), 4, true, 0);
+  add("ray.dD", SINIT_MIS(ray.dD), SINIT_HIS(ray.dD), 4, true, 0);
+  add("ray.tmin", SINIT_MIS(ray.tmin), SINIT_HIS(ray.tmin), 4, true, 0);
+  add("ray.tmax", SINIT_MIS(ray.tmax), SINIT_HIS(ray.tmax), 4, true, 0);
+  add("ray.time", SINIT_MIS(ray.time), SINIT_HIS(ray.time), 4, true, 3);
+
+  const size_t num_slices = sl.size();
+  int idx_sample = -1, idx_rpi = -1, idx_time = -1;
+  for (size_t s = 0; s < num_slices; s++) {
+    if (sl[s].neg_group == 1) idx_sample = (int)s;
+    if (sl[s].neg_group == 2) idx_rpi = (int)s;
+    if (sl[s].neg_group == 3) idx_time = (int)s;
+  }
+  if (idx_sample < 0 || idx_rpi < 0 || idx_time < 0) {
+    LOG_ERROR << "Vulkan: State-init probe: slice table incomplete.";
+    return false;
+  }
+
+  /* ---- 8. SoA buffer layout: each slice = elem*num_cases (4-aligned) +
+   * a 16-byte canary. Payload prefill is ZERO: feature-gated members that
+   * stay unwritten must compare equal to the CPU's zeroed struct, and a
+   * missing write is still caught by the always-written fields. ---- */
+  size_t soa_size = 0;
+  for (auto &s : sl) {
+    soa_size = (soa_size + 3) & ~(size_t)3;
+    s.off = soa_size;
+    size_t payload = (size_t)s.elem * num_cases;
+    payload = (payload + 3) & ~(size_t)3;
+    soa_size += payload + (size_t)SINIT_CANARY_WORDS * 4;
+  }
+
+  /* ---- 9. Allocate the four buffers ---- */
+  auto make_buffer = [&](VkDeviceSize size, VkBuffer &buf, VkDeviceMemory &mem,
+                         uint64_t &addr) -> bool {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if (vkCreateBuffer(vk_dev, &bci, nullptr, &buf) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: State-init probe: buffer creation failed.";
+      return false;
+    }
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(vk_dev, buf, &reqs);
+    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &flags_info;
+    ai.allocationSize = reqs.size;
+    ai.memoryTypeIndex = dev->find_memory_type(
+        reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX) {
+      LOG_ERROR << "Vulkan: State-init probe: no host-visible+coherent memory type.";
+      return false;
+    }
+    if (vkAllocateMemory(vk_dev, &ai, nullptr, &mem) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: State-init probe: memory allocation failed.";
+      return false;
+    }
+    if (vkBindBufferMemory(vk_dev, buf, mem, 0) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: State-init probe: bind buffer memory failed.";
+      return false;
+    }
+    VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    bai.buffer = buf;
+    addr = vkGetBufferDeviceAddress(vk_dev, &bai);
+    if (addr == 0) {
+      LOG_ERROR << "Vulkan: State-init probe: vkGetBufferDeviceAddress returned 0.";
+      return false;
+    }
+    return true;
+  };
+
+  uint64_t cases_addr = 0, ist_addr = 0, params_addr = 0, soa_addr = 0;
+  const VkDeviceSize cases_bytes = (VkDeviceSize)num_cases * sizeof(StateInitCase);
+  const VkDeviceSize ist_bytes = sizeof(IntegratorStateGPU);
+  const VkDeviceSize params_bytes = sizeof(StateInitParams);
+  const VkDeviceSize soa_bytes = (VkDeviceSize)soa_size;
+  if (!make_buffer(cases_bytes, res.cases_buffer, res.cases_memory, cases_addr) ||
+      !make_buffer(ist_bytes, res.ist_buffer, res.ist_memory, ist_addr) ||
+      !make_buffer(params_bytes, res.params_buffer, res.params_memory, params_addr) ||
+      !make_buffer(soa_bytes, res.soa_buffer, res.soa_memory, soa_addr)) {
+    return false;
+  }
+
+  /* ---- 10. Build the EXPECTED bytes from the REAL Cycles functions ----
+   * One IntegratorStateCPU, zeroed per case; the three real calls in
+   * Cycles' order; then each slice's expected bytes are copied straight out
+   * of the CPU struct at its recorded offset. */
+  std::vector<char> expected(soa_size, 0);
+  {
+    std::vector<IntegratorStateCPU> hold(1);
+    IntegratorStateCPU &st_cpu = hold[0];
+    KernelWorkTile tile{};
+    tile.offset = tp.tile_offset;
+    tile.stride = tp.tile_stride;
+    for (uint32_t i = 0; i < num_cases; i++) {
+      const StateInitCase &c = cases[i];
+      memset(&st_cpu, 0, sizeof(st_cpu));
+      Ray ray;
+      memset(&ray, 0, sizeof(ray));
+      ray.P = make_float3(c.f[0], c.f[1], c.f[2]);
+      ray.dP = c.f[3];
+      ray.D = make_float3(c.f[4], c.f[5], c.f[6]);
+      ray.dD = c.f[7];
+      ray.tmin = c.f[8];
+      ray.tmax = c.f[9];
+      ray.time = c.f[10];
+      const float3 thr = make_float3(c.f[11], c.f[12], c.f[13]);
+
+      /* REAL Cycles calls (host builds of path_state.h:16,27,40 and
+       * state_util.h:25). */
+      path_state_init(&st_cpu, &tile, (int)c.x, (int)c.y);
+      path_state_init_integrator(kg, &st_cpu, c.sample, c.rng_pixel, thr);
+      integrator_state_write_ray(&st_cpu, &ray);
+
+      for (const auto &s : sl) {
+        memcpy(expected.data() + s.off + (size_t)s.elem * i,
+               reinterpret_cast<const char *>(&st_cpu) + s.host, s.elem);
+      }
+    }
+  }
+
+  /* ---- 11. Upload cases + SoA (payload 0, canaries 0x5C) + mirror ---- */
+  IntegratorStateGPU ist{}; /* zero-init: untouched members stay null */
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.cases_memory, 0, cases_bytes, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: State-init probe: mapping cases buffer failed.";
+      return false;
+    }
+    memcpy(m, cases.data(), (size_t)cases_bytes);
+    vkUnmapMemory(vk_dev, res.cases_memory);
+  }
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.soa_memory, 0, soa_bytes, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: State-init probe: mapping SoA buffer failed.";
+      return false;
+    }
+    memset(m, 0, (size_t)soa_bytes);
+    uint8_t *base = static_cast<uint8_t *>(m);
+    for (const auto &s : sl) {
+      /* payload end = slice offset (already 4-aligned by the layout loop)
+       * plus the 4-aligned payload size; the inner parens matter: `&` binds
+       * looser than `+` in C++. */
+      const size_t pay_end = s.off + (((size_t)s.elem * num_cases + 3) & ~(size_t)3);
+      uint32_t *canary = reinterpret_cast<uint32_t *>(base + pay_end);
+      for (uint32_t w = 0; w < SINIT_CANARY_WORDS; w++) canary[w] = SINIT_CANARY;
+    }
+    vkUnmapMemory(vk_dev, res.soa_memory);
+  }
+  for (const auto &s : sl) { /* mirror: one device address per slice */
+    const uint64_t addr = soa_addr + s.off;
+    memcpy(reinterpret_cast<char *>(&ist) + s.mirror, &addr, sizeof(addr));
+  }
+  {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.ist_memory, 0, ist_bytes, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: State-init probe: mapping mirror buffer failed.";
+      return false;
+    }
+    memcpy(m, &ist, sizeof(ist));
+    vkUnmapMemory(vk_dev, res.ist_memory);
+  }
+
+  /* ---- 12. Command pool + buffer + queue + fence ---- */
+  const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
+  VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  cpci.queueFamilyIndex = family;
+  if (vkCreateCommandPool(vk_dev, &cpci, nullptr, &res.pool) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: State-init probe: command pool creation failed.";
+    return false;
+  }
+  VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = res.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(vk_dev, &cbai, &cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: State-init probe: command buffer allocation failed.";
+    return false;
+  }
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(vk_dev, family, 0, &queue);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (vkCreateFence(vk_dev, &fci, nullptr, &res.fence) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: State-init probe: fence creation failed.";
+    return false;
+  }
+
+  /* ---- 13. Per-pass runner + compare (reference stays CLEAN) ---- */
+  struct SInitStats {
+    uint64_t comps = 0, mismatches = 0;
+    double max_norm_err = 0.0;
+    std::vector<uint64_t> per_slice; /* mismatches per slice index */
+    bool canary_ok = true;
+    bool bad_shape = false;
+  };
+
+  auto run_and_compare = [&](int neg_mode, SInitStats &st) -> bool {
+    st.per_slice.assign(num_slices, 0);
+    tp.neg_mode = neg_mode;
+    {
+      void *m = nullptr;
+      if (vkMapMemory(vk_dev, res.params_memory, 0, params_bytes, 0, &m) != VK_SUCCESS) {
+        LOG_ERROR << "Vulkan: State-init probe: mapping params buffer failed.";
+        return false;
+      }
+      memcpy(m, &tp, sizeof(tp));
+      vkUnmapMemory(vk_dev, res.params_memory);
+    }
+
+    VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkResetCommandBuffer(cmd, 0);
+    vkBeginCommandBuffer(cmd, &begin_info);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.pipeline);
+    StateInitPush push{cases_addr, ist_addr, params_addr, num_cases};
+    vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd, (num_cases + 63) / 64, 1, 1);
+    vkEndCommandBuffer(cmd);
+
+    vkResetFences(vk_dev, 1, &res.fence);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (vkQueueSubmit(queue, 1, &si, res.fence) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: State-init probe: queue submit failed.";
+      return false;
+    }
+    if (vkWaitForFences(vk_dev, 1, &res.fence, VK_TRUE, 10000000000ull) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: State-init probe: fence wait failed.";
+      return false;
+    }
+
+    /* Read back and compare every slice against the clean reference bytes. */
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, res.soa_memory, 0, soa_bytes, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: State-init probe: mapping SoA buffer failed.";
+      return false;
+    }
+    const uint8_t *base = static_cast<const uint8_t *>(m);
+    for (size_t s = 0; s < num_slices; s++) {
+      const StateInitSlice &sli = sl[s];
+      /* canary right after this slice's (4-aligned) payload - same formula
+       * as the fill side (equivalent because s.off is 4-aligned). */
+      const size_t pay_end = sli.off + (((size_t)sli.elem * num_cases + 3) & ~(size_t)3);
+      const uint32_t *canary = reinterpret_cast<const uint32_t *>(base + pay_end);
+      for (uint32_t w = 0; w < SINIT_CANARY_WORDS; w++)
+        if (canary[w] != SINIT_CANARY) st.canary_ok = false;
+
+      for (uint32_t i = 0; i < num_cases; i++) {
+        const uint8_t *gpu = base + sli.off + (size_t)sli.elem * i;
+        const uint8_t *ref = reinterpret_cast<const uint8_t *>(expected.data()) +
+                             sli.off + (size_t)sli.elem * i;
+        if (sli.is_float) {
+          const uint32_t nf = sli.elem / 4;
+          for (uint32_t k = 0; k < nf; k++) {
+            float a, b;
+            memcpy(&a, gpu + 4 * k, 4);
+            memcpy(&b, ref + 4 * k, 4);
+            const double denom = std::max(1.0, (double)std::fabs((double)b));
+            const double err = std::fabs((double)a - (double)b) / denom;
+            st.comps++;
+            if (err > st.max_norm_err) st.max_norm_err = err;
+            if (err > 1e-5) {
+              st.mismatches++;
+              st.per_slice[s]++;
+            }
+          }
+        }
+        else {
+          st.comps++;
+          if (memcmp(gpu, ref, sli.elem) != 0) {
+            st.mismatches++;
+            st.per_slice[s]++;
+          }
+        }
+      }
+    }
+    vkUnmapMemory(vk_dev, res.soa_memory);
+    return true;
+  };
+
+  auto log_stats = [&](const char *label, const SInitStats &st) {
+    LOG_INFO << "Vulkan: State-init probe: [" << label << "] " << st.mismatches << "/"
+             << st.comps << " comparisons differ; max_norm_err=" << st.max_norm_err
+             << (st.canary_ok ? "" : " [CANARY CORRUPTED]");
+    if (st.mismatches != 0 && st.mismatches <= 32) {
+      for (size_t s = 0; s < num_slices; s++)
+        if (st.per_slice[s] != 0)
+          LOG_INFO << "Vulkan: State-init probe:   " << sl[s].name << ": "
+                   << st.per_slice[s] << " case(s) differ";
+    }
+  };
+
+  /* ---- 14. Run: clean, then the three negatives ---- */
+  SInitStats clean;
+  if (!run_and_compare(0, clean)) return false;
+  log_stats("CLEAN", clean);
+  const bool clean_ok = (clean.mismatches == 0) && clean.canary_ok;
+
+  SInitStats neg[4]; /* 1..3 used */
+  const char *neg_name[4] = {"", "sample+1", "stride+1", "time+0.5"};
+  const int neg_target[4] = {0, idx_sample, idx_rpi, idx_time};
+  bool neg_detected[4] = {true, false, false, false};
+  bool neg_spillover[4] = {false, false, false, false};
+  for (int n = 1; n <= 3; n++) {
+    if (!run_and_compare(n, neg[n])) return false;
+    log_stats(neg_name[n], neg[n]);
+    neg_detected[n] = neg[n].per_slice[neg_target[n]] > 0;
+    for (size_t s = 0; s < num_slices; s++)
+      if ((int)s != neg_target[n] && neg[n].per_slice[s] != 0) neg_spillover[n] = true;
+    if (!neg[n].canary_ok) neg_spillover[n] = true;
+  }
+
+  /* ---- 15. Verdict ---- */
+  bool all_ok = clean_ok;
+  for (int n = 1; n <= 3; n++) {
+    LOG_INFO << "Vulkan: State-init probe: negative '" << neg_name[n] << "' "
+             << (neg_detected[n] ? "DETECTED" : "NOT DETECTED")
+             << (neg_spillover[n] ? " (SPILLOVER - gate failure)" : "");
+    if (!neg_detected[n] || neg_spillover[n]) all_ok = false;
+  }
+  if (clean_ok)
+    LOG_INFO << "Vulkan: State-init probe: CLEAN PASS (every slice matches the real "
+                "Cycles reference).";
+  else
+    LOG_ERROR << "Vulkan: State-init probe: CLEAN PASS FAILED (GPU state writes disagree "
+                 "with the real Cycles reference).";
+  LOG_INFO << "Vulkan: State-init probe: " << (all_ok ? "GATE MET." : "GATE NOT MET.");
+  return all_ok;
+}
+
+/* =========================================================================
  * M4e STEP 1b-0: dual-view KernelData dump probe (optional, env
  * CYCLES_VULKAN_KDATA_PROBE=1)
  * =========================================================================

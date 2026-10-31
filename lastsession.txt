@@ -1,3 +1,77 @@
+M4f SLICE 2 — STATE INIT (state-initialization cluster port + probe gate PASSED) - 2026-10-30
+==============================================================================================
+STATUS: COMPLETE and gate PASSED on ALL THREE configs (RX 570 default, RX 570 narrow,
+SwiftShader default). Repo diff = this block + 2 NEW Slang files (path_state.slang,
+state_init_probe.slang) + integrator_state.slang (+10 accessors) + kernels.cpp
+(+probe) + queue.cpp (+hook).
+
+SCOPE (the approved slice-2 cluster, ported faithfully into
+src/kernel/device/vulkan/path_state.slang):
+- path_state_init_queues()         path_state.h:16-23 (GPU branch: only
+                                   path.queued_kernel; shadow/ao writes are
+                                   #ifndef __KERNEL_GPU__ = CPU-only layout)
+- path_state_init()                path_state.h:27-37 (tile -> explicit
+                                   tile_offset/tile_stride args)
+- path_state_init_integrator()     path_state.h:40-108 (kg -> three explicit
+                                   cited args: kernel_features,
+                                   background.object_index, background.volume_shader)
+- integrator_state_write_ray()     state_util.h:25-60 (NON-PACKED branch:
+                                   __INTEGRATOR_GPU_PACKED_STATE__ is Apple
+                                   ARM64-only, state.h:626-628)
+NOT PORTED (documented in the file header, not an oversight): the
+__PATH_GUIDING__ block (features.h:156-161 makes it CPU-only; WITH_PATH_GUIDING
+absent from this build -> host reference omits it too; a scene with the feature
+on would fail the gate loudly).
+
+ACCESSORS (+10 in integrator_state.slang, all via the mandated Form-A
+SUBWORD16_PTR route for the 6 u16 members — the amdvlk truncation bug):
+rng_pixel(u32), diffuse/glossy/transmission/volume/volume_bounds/portal_bounce(u16),
+mis_ray_object(int), denoising_feature_throughput(float3), + 6 narrow SLOT_OFF
+constants (path struct slots 32/40/48/56/64/72 from vulkan_data.slang).
+Regression proof BEFORE any gate: state_access default+narrow and
+init_from_camera SPVs recompiled BYTE-IDENTICAL (30252/29300/39828).
+
+GATE (same approved pattern as slice 1): probe dispatches 4608 cases (768 px x
+6 samples) into real SoA slices; host reference calls the REAL Cycles functions
+(path_state_init / path_state_init_integrator / integrator_state_write_ray) on a
+zeroed IntegratorStateCPU, then compares raw slice bytes. Integers bit-exact,
+floats |a-b| <= 1e-5*max(1,|b|). INPUT OVERRIDES on BOTH sides (documented in
+kernels.cpp): kernel_features forced bits 1<<10/1<<18/1<<28/1<<30
+(0x80000803 -> 0xd0040c03), background.object_index=41, volume_shader=43
+(real values 0 -> write-into-zero indistinguishable), tile offset=1000 stride=64.
+NEGATIVES (probe-side input faults only, reference always CLEAN):
+  1 = sample+1   -> only path.sample may differ        -> DETECTED (4608 diffs)
+  2 = stride+1   -> only path.render_pixel_index       -> DETECTED (4416 diffs;
+     the 192 cases with y=0 compute the same index with either stride, so they
+     legitimately do not differ — 4608-192=4416)
+  3 = time+0.5   -> only ray.time                      -> DETECTED (4608 diffs)
+No spillover to any other slice in any negative; canaries intact.
+No seed axis: none of the four functions draws; rng_pixel is per-case data.
+
+RESULTS (real log lines):
+- RX 570 default (state_init_probe.spv, 20556 B): [CLEAN] 0/207360 differ,
+  max_norm_err=0; 3/3 negatives DETECTED; GATE MET; layer inserted; VUID 0.
+- RX 570 narrow (state_init_probe_narrow.spv, 19580 B): [CLEAN] 0/207360,
+  max_norm_err=0; 3/3 DETECTED; GATE MET; VUID 0.
+- SwiftShader default: [CLEAN] 0/207360, max_norm_err=0; 3/3 DETECTED;
+  GATE MET; VUID 0; device confirmed "SwiftShader Device (Subzero)".
+REGRESSIONS (same build, layer on): math probe GATE MET VUID 0; state access
+default+narrow ALL CHECKS PASSED VUID 0; slice-1 init-from-camera GATE MET
+VUID 0. (The "ERROR: mode 4 MISMATCH ... DETECTED" line in state-access logs is
+the expected negative-test detection output, not a failure.)
+
+TRAPS THIS SLICE:
+- C++ `&` binds looser than `+`: the canary pointer expression
+  `base + off + (n+3) & ~3` miscompiled-able / error C2296; parenthesize the
+  align-up before the pointer add.
+- expected.data() is char*; needs reinterpret_cast to const uint8_t* for
+  pointer arithmetic with the slice offsets.
+
+OPEN / NEXT: M4f SLICE 3 = film + queue layer (the remaining INIT_FROM_CAMERA
+kernel work: film output wiring and the queue/enqueue plumbing to actually run
+the ported kernels in a render). After M4f: M5 gate (Cornell box vs Cycles CPU).
+
+==============================================================================================
 M4f SLICE 1 — INIT_FROM_CAMERA (integrate_camera_sample port + probe gate PASSED) - 2026-10-30
 ==============================================================================================
 STATUS: COMPLETE and gate PASSED on BOTH devices. Repo diff = this block + 2 NEW Slang

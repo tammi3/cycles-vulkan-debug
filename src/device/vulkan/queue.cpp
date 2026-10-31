@@ -59,6 +59,12 @@ bool vulkan_state_access_probe(VulkanDevice *device);
  * kernels.cpp for the full doc). */
 bool vulkan_init_from_camera_probe(VulkanDevice *device);
 
+/* M4f SLICE 2 state-init probe hook, implemented in kernels.cpp. Runs at
+ * most once, no-op unless CYCLES_VULKAN_STATE_INIT_PROBE=1; compares the
+ * ported state-initialization cluster (path_state.slang) against the REAL
+ * Cycles functions (see kernels.cpp for the full doc). */
+bool vulkan_state_init_probe(VulkanDevice *device);
+
 VulkanQueue::VulkanQueue(VulkanDevice *d) : DeviceQueue(d), vulkan_device_(d) {}
 
 int VulkanQueue::num_concurrent_states(const size_t s) const {
@@ -114,6 +120,9 @@ bool VulkanQueue::enqueue(DeviceKernel k, const int n, const DeviceKernelArgumen
   /* M4f SLICE 1: optional one-shot init-from-camera probe (env
    * CYCLES_VULKAN_INIT_FROM_CAMERA_PROBE=1), same no-op-unless-set semantics. */
   vulkan_init_from_camera_probe(vulkan_device_);
+  /* M4f SLICE 2: optional one-shot state-init probe (env
+   * CYCLES_VULKAN_STATE_INIT_PROBE=1), same no-op-unless-set semantics. */
+  vulkan_state_init_probe(vulkan_device_);
   vulkan_device_->set_error("Vulkan: kernel dispatch not implemented yet (M4)");
   debug_enqueue_end();
   return false;
