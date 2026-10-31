@@ -1,6 +1,12 @@
 // SPDX-FileCopyrightText: 2011-2022 Blender Foundation
 // SPDX-License-Identifier: Apache-2.0
 
+/* Include guard: the M4f slice-3 probe includes BOTH path_state.slang and
+ * film_queue.slang, and each of those includes this file. Slang honors
+ * #pragma once exactly like C++. Without it the accessors below would be
+ * defined twice in one translation unit. */
+#pragma once
+
 /* M4e S1b-6 Task 1: integrator state ACCESSORS (Slang equivalent of Cycles'
  * INTEGRATOR_STATE / INTEGRATOR_STATE_WRITE macros).
  *

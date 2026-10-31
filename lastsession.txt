@@ -1,3 +1,53 @@
+IN PROGRESS — M4f SLICE 3 (film + queue layer), started 2026-10-31:
+- Scope: 8 functions in NEW src/kernel/device/vulkan/film_queue.slang
+  (film_pass_pixel_render_buffer write.h:24-31, film_need_sample_pixel
+  adaptive_sampling.h:13-25, film_write_sample light_passes.h:158-173,
+  write_optical_depth state_flow.h:51-67, GPU-branch integrator_path_init/
+  next/terminate/cache_miss state_flow.h:71-105). DEFERRED w/ notes: sorted
+  + shadow variants, PROFILING_INIT.
+- Step A+B DONE: film_queue.slang + film_queue_probe.slang written.
+- Int64 BLOCKER FOUND + RESOLVED: `render_buffer == nullptr` (was
+  film_queue.slang:220) lowered to OpConvertPtrToU -> OpCapability Int64
+  (SwiftShader has no shaderInt64, would crash). Tested in this session:
+  `== nullptr`, `!ptr`, pointer==pointer vars ALL emit OpConvertPtrToU; `null`
+  undefined; Slang [op] / [__target_op] / __spirv("OpPtrEqual") all unknown
+  attributes in slangc 2026.20 -> OpPtrEqual unreachable (3 strikes, stopped).
+  RESOLUTION = platform constraint 3: write_optical_depth +
+  integrator_path_terminate take an explicit `render_buffer_valid` uint param
+  (host wires it 1:1 from the pointer it passes). NULL BRANCH IS GATED: host
+  reference calls the REAL Cycles integrator_path_terminate with literal
+  nullptr (state_flow.h:229-238 calls write_optical_depth, which early-outs at
+  :54; same call shape as intersect_subsurface.h:21) while probe runs
+  valid=0 -> expected = optical-depth slots keep initial fill.
+- Step C DONE: both variants slangc exit 0, spirv-val 0, Int64-FREE
+  (caps = PhysicalStorageBufferAddresses + Shader only), sizes default 19960 /
+  narrow 19604. Atomics verified in disasm: OpAtomicCompareExchange x2 (float
+  CAS loop), OpAtomicIAdd +-1 (queue counters + sample count), OpAtomicAnd/Or
+  (slice-2 subword fallback), 30x OpPtrAccessChain (base-pointer device rule).
+  Committed gate SPVs re-checked BYTE-IDENTICAL after the #pragma once +
+  edits (state_access def/narrow, initcam, sinit).
+- Layouts for host probe: FilmQueueCase 40 B (10 x u32 incl.
+  render_buffer_valid), FilmQueueParams 32 B, FilmQueueOut 8 B, FilmQueuePush
+  48 B. NEGATIVES (probe-side input faults, ref always CLEAN): 1=sample_offset
+  +1 -> only out.sample; 2=film pass_stride+1 -> only out.{need,sample}+render
+  buffer; 3=pass_sample_count+1 -> only out.sample+render buffer; 4=next_kernel
+  +1 -> only queue_counter+queued_kernel. Cases need UNIQUE render_pixel_index
+  (one writer per film slot => deterministic atomic old-value).
+- NEXT (Step D): host probe vulkan_film_queue_probe() in kernels.cpp (pattern:
+  slice-2 probe ~line 3172) + queue.cpp hook; env CYCLES_VULKAN_FILM_QUEUE_PROBE
+  + _SPV; then build, gates RX570 def + narrow + SwiftShader, regressions.
+- Queue-counter caveat (flagged, gate methodology is user's): CPU branch
+  (state_flow.h:206-244) omits ALL counter updates -> expected counters =
+  deterministic net-sums of the documented GPU atomic ops; queued_kernel
+  writes + ALL film effects compared against real host calls.
+- Design decisions (stated, no blocker raised): kg -> explicit cited int args
+  (5 film pass offsets/stride); float atomic = CAS loop on bit-cast uint
+  (OpAtomicFAddEXT needs un-enabled feature; core OpAtomicCompareExchange
+  instead, result-preserving, single writer per slot => bit-identical);
+  uint64 render-buffer offset -> uint32 (Int64-free backend, <=4GB device);
+  raw-bit compare for ALL gate outputs (stricter than 1e-5).
+
+==============================================================================================
 M4f SLICE 2 — STATE INIT (state-initialization cluster port + probe gate PASSED) - 2026-10-30
 ==============================================================================================
 STATUS: COMPLETE and gate PASSED on ALL THREE configs (RX 570 default, RX 570 narrow,
