@@ -71,6 +71,13 @@ bool vulkan_state_init_probe(VulkanDevice *device);
  * calls (see kernels.cpp for the full doc). */
 bool vulkan_film_queue_probe(VulkanDevice *device);
 
+/* M4f SLICE 4 init-from-camera BODY probe hook, implemented in kernels.cpp.
+ * Runs at most once, no-op unless
+ * CYCLES_VULKAN_INIT_FROM_CAMERA_BODY_PROBE=1; compares the ported
+ * integrator_init_from_camera body (init_from_camera.slang) against the
+ * REAL Cycles function (see kernels.cpp for the full doc). */
+bool vulkan_init_from_camera_body_probe(VulkanDevice *device);
+
 VulkanQueue::VulkanQueue(VulkanDevice *d) : DeviceQueue(d), vulkan_device_(d) {}
 
 int VulkanQueue::num_concurrent_states(const size_t s) const {
@@ -132,6 +139,10 @@ bool VulkanQueue::enqueue(DeviceKernel k, const int n, const DeviceKernelArgumen
   /* M4f SLICE 3: optional one-shot film+queue probe (env
    * CYCLES_VULKAN_FILM_QUEUE_PROBE=1), same no-op-unless-set semantics. */
   vulkan_film_queue_probe(vulkan_device_);
+  /* M4f SLICE 4: optional one-shot init-from-camera BODY probe (env
+   * CYCLES_VULKAN_INIT_FROM_CAMERA_BODY_PROBE=1), same no-op-unless-set
+   * semantics. */
+  vulkan_init_from_camera_body_probe(vulkan_device_);
   vulkan_device_->set_error("Vulkan: kernel dispatch not implemented yet (M4)");
   debug_enqueue_end();
   return false;

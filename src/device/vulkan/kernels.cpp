@@ -5616,11 +5616,7 @@ bool vulkan_init_from_camera_body_probe(VulkanDevice *dev)
   };
 
   /* ---- 17. Run: four CLEAN variants, then the four negatives ----
-   * Order: [0]V0 [1]N1 [2]V1 [3]N2 [4]V2 [5]N3 [6]V3 [7]N4 - a negative
-   * (n) runs at index 2n-1 against the CLEAN reference of its base
-   * variant (neg_base_variant[n]). */
-  const int run_variant[8] = {0, 0, 1, 1, 2, 0, 3, 0};
-  const int run_neg[8] = {0, 1, 0, 2, 0, 3, 0, 4};
+   * Order and negative bases: the run table declared above the lambda. */
   const char *run_name[8] = {"V0-tile CLEAN",         "N1 tile_offset+1",
                              "V1-restart CLEAN",      "N2 restart-sample+1",
                              "V2-volume CLEAN",       "N3 is_inside_volume-flip",
