@@ -40,6 +40,13 @@
  * all host-compilable (the CPU kernel TU builds them). Used as the reference
  * for the M4f slice-1 gate (vulkan_init_from_camera_probe). */
 #include "kernel/integrator/init_from_camera.h"
+/* M4f SLICE 3: state_flow.h gives the REAL host builds of write_optical_depth
+ * and the CPU branches of integrator_path_init/next/terminate/cache_miss - the
+ * queue-layer reference for the film+queue probe. (init_from_camera.h's body
+ * calls them too but relies on the kernel TUs to include this header first;
+ * for the probe we include it explicitly.) state_flow.h itself only needs
+ * globals.h/types.h/write.h/state.h, all already included above. */
+#include "kernel/integrator/state_flow.h"
 
 #include "util/log.h"
 
@@ -3711,6 +3718,864 @@ bool vulkan_state_init_probe(VulkanDevice *dev)
     LOG_ERROR << "Vulkan: State-init probe: CLEAN PASS FAILED (GPU state writes disagree "
                  "with the real Cycles reference).";
   LOG_INFO << "Vulkan: State-init probe: " << (all_ok ? "GATE MET." : "GATE NOT MET.");
+  return all_ok;
+}
+
+/* =========================================================================
+ * M4f SLICE 3: film + queue gate (optional, env CYCLES_VULKAN_FILM_QUEUE_PROBE=1)
+ * =========================================================================
+ * Gates the 8 ported functions in film_queue.slang against the REAL Cycles
+ * host calls: film_need_sample_pixel (adaptive_sampling.h:13),
+ * film_write_sample (light_passes.h:158), write_optical_depth (state_flow.h:51)
+ * and the CPU branches of integrator_path_init/next/terminate/cache_miss
+ * (state_flow.h:206-244), all driven through the same call shapes
+ * init_from_camera.h:84-138 uses.
+ *
+ * Per case (= one SoA state, one UNIQUE render_pixel_index so every film
+ * slot has exactly one writer and the atomic old-value is deterministic):
+ *   1. path_state_init(...)                    [slice-2 port, integration]
+ *   2. flag / optical_depth input data written identically on both sides
+ *   3. need = film_need_sample_pixel(...)      [REAL call on the host]
+ *   4. out.sample = film_write_sample(...) when need, else 0xFFFFFFFF
+ *      (sentinel = "pixel skipped"; mirrors the init_from_camera.h:84-89 gate)
+ *   5. queue op by mode A/B/C/D (film_queue_probe.slang header has the table)
+ *
+ * COUNTER REFERENCE CAVEAT (gate-methodology flag): the CPU branch of the
+ * queue functions (state_flow.h:206-244) deliberately performs NO counter
+ * updates, so no real host call can produce num_queued/cache_miss values.
+ * Expected counters below are therefore the deterministic NET SUMS of the
+ * documented GPU atomic ops (order-independent sums). Everything else -
+ * queued_kernel, every film write, the need/sample returns - is compared
+ * against the real calls. See the film_queue.slang header too.
+ *
+ * write_optical_depth's null branch (platform constraint 3): mode-C cases
+ * carry render_buffer_valid; for valid=0 the host reference calls the REAL
+ * integrator_path_terminate with a literal nullptr render_buffer (exactly
+ * what intersect_subsurface.h:21 does) while the probe runs with valid=0 -
+ * the expected optical-depth slots then keep their initial fill value.
+ *
+ * NEGATIVES (probe-side input faults; the reference is always CLEAN):
+ *   1 = sample_offset+1     -> only out.sample may differ
+ *   2 = film pass_stride+1  -> out.{need,sample} + render rows/extension
+ *   3 = pass_sample_count+1 -> out.sample + render rows
+ *   4 = next_kernel+1       -> only queue_counter + queued_kernel may differ
+ * A negative counts as DETECTED only if a target region differs AND every
+ * other region is byte-identical AND all canaries are intact (spillover =
+ * gate failure).
+ *
+ * Comparisons are RAW-BIT (uint32 view of every word): every value is an
+ * integer or a dyadic float that both sides write with the identical
+ * operation and a single writer per slot, so equality must be exact -
+ * stricter than the 1e-5 tolerance of the math/camera probes. */
+
+/* Layouts locked against film_queue_probe.slang (same names, all scalars). */
+struct FilmQueueCase {
+  uint32_t x, y;
+  int32_t scheduled_sample;
+  int32_t sample_offset;
+  uint32_t mode; /* A=0 B=1 C=2 D=3 */
+  uint32_t next_kernel;
+  uint32_t current_kernel;
+  uint32_t flag;
+  float optical_depth;
+  uint32_t render_buffer_valid;
+};
+static_assert(sizeof(FilmQueueCase) == 40, "FilmQueueCase layout must match Slang");
+
+struct FilmQueueParams {
+  int32_t film_stride;
+  int32_t pass_sample_count;
+  int32_t pass_adaptive_aux_buffer;
+  int32_t pass_volume_majorant;
+  int32_t pass_volume_majorant_sample_count;
+  int32_t tile_offset;
+  uint32_t tile_stride;
+  int32_t neg_mode;
+};
+static_assert(sizeof(FilmQueueParams) == 32, "FilmQueueParams layout must match Slang");
+
+struct FilmQueueOut {
+  uint32_t need;
+  uint32_t sample;
+};
+static_assert(sizeof(FilmQueueOut) == 8, "FilmQueueOut layout must match Slang");
+
+struct FilmQueuePush {
+  VkDeviceAddress cases;
+  VkDeviceAddress ist;
+  VkDeviceAddress params;
+  VkDeviceAddress render_buffer;    /* float reads (film_need_sample_pixel) */
+  VkDeviceAddress render_buffer_u;  /* atomic paths: same address, uint view
+                                      * (film_queue.slang platform constraint 4) */
+  VkDeviceAddress out;
+  uint32_t num_cases;
+  uint32_t pad0;
+};
+static_assert(sizeof(FilmQueuePush) == 56, "Push layout must match Slang");
+
+constexpr uint32_t FQ_PUSH_BYTES = 56;
+constexpr uint32_t FQ_CANARY_WORDS = 4;
+constexpr uint32_t FQ_CANARY = 0x5C5C5C5Cu; /* S1b canary pattern */
+
+/* Film layout fed to BOTH sides (kernel_data.film.* overrides, slice-2
+ * pattern): pass_stride=16 floats per pixel row; the sample-count counter
+ * (uint view) at row+0; adaptive aux float4 at row+4..7 (.w = row+7 is what
+ * film_need_sample_pixel tests); optical-depth pair at row+8 / row+9. */
+constexpr int FQ_FILM_STRIDE = 16;
+constexpr int FQ_PASS_SAMPLE_COUNT = 0;
+constexpr int FQ_PASS_ADAPTIVE_AUX = 4;
+constexpr int FQ_PASS_VOLUME_MAJORANT = 8;
+constexpr int FQ_PASS_VOLUME_MAJORANT_COUNT = 9;
+
+/* Tile + case grid: 64x12 = 768 unique pixels (one case each). With
+ * tile.offset=1000, tile.stride=64 the render_pixel_index (path_state.h:32:
+ * offset + x + y*stride) spans [1000,1767] uniquely. */
+constexpr int FQ_TILE_OFFSET = 1000;
+constexpr uint32_t FQ_TILE_STRIDE = 64;
+constexpr int FQ_NUM_X = 64;
+constexpr int FQ_NUM_Y = 12;
+
+/* Render buffer geometry (floats):
+ *  CLEAN/NEG1/3/4 max byte = 1767*16+15 = 28287 -> rows end at 28288;
+ *  NEG2 (film stride 17) max touched = 1767*17+9 = 30048 (slot row+9) ->
+ *  extension region ends at 30240; [30240,30400) is a protected tail that
+ *  NO run may touch (stray-write detector for every negative incl. NEG2). */
+constexpr int FQ_RB_FLOATS = 30400;
+constexpr int FQ_RB_ROWS = 28288;
+constexpr int FQ_RB_EXT = 30240;
+
+/* Compared regions. A negative may only change the regions in its mask;
+ * anything else differing = spillover = gate failure. */
+enum {
+  FQ_R_RPI = 0,       /* path.render_pixel_index slice  (mask 0)          */
+  FQ_R_FLAG,          /* path.flag slice                (mask 0)          */
+  FQ_R_OPTICAL,       /* path.optical_depth slice       (mask 0)          */
+  FQ_R_QUEUED,        /* path.queued_kernel slice       (neg 4)           */
+  FQ_R_OUT_NEED,      /* out.need words                 (neg 2)           */
+  FQ_R_OUT_SAMPLE,    /* out.sample words               (neg 1,2,3)       */
+  FQ_R_RB_ROWS,       /* render buffer pixel rows       (neg 2,3)         */
+  FQ_R_RB_EXT,        /* render buffer NEG2 extension   (neg 2)           */
+  FQ_R_RB_TAIL,       /* render buffer protected tail   (mask 0)          */
+  FQ_R_COUNTERS,      /* queue counter block            (neg 4)           */
+  FQ_R_OUT_TAIL,      /* out buffer canary tail         (mask 0)          */
+  FQ_R_CTR_TAIL,      /* counter canary tail            (mask 0)          */
+  FQ_R_SOA_CANARY,    /* SoA slice canaries             (mask 0)          */
+  FQ_NUM_REGIONS
+};
+
+struct FilmQueueResources {
+  VkDevice device = VK_NULL_HANDLE;
+  VkShaderModule module = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  VkBuffer cases_buffer = VK_NULL_HANDLE, ist_buffer = VK_NULL_HANDLE,
+           params_buffer = VK_NULL_HANDLE, rb_buffer = VK_NULL_HANDLE,
+           out_buffer = VK_NULL_HANDLE, ctr_buffer = VK_NULL_HANDLE,
+           soa_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory cases_memory = VK_NULL_HANDLE, ist_memory = VK_NULL_HANDLE,
+                 params_memory = VK_NULL_HANDLE, rb_memory = VK_NULL_HANDLE,
+                 out_memory = VK_NULL_HANDLE, ctr_memory = VK_NULL_HANDLE,
+                 soa_memory = VK_NULL_HANDLE;
+
+  ~FilmQueueResources()
+  {
+    if (device == VK_NULL_HANDLE) return;
+    if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+    if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+    if (module) vkDestroyShaderModule(device, module, nullptr);
+    if (pool) vkDestroyCommandPool(device, pool, nullptr);
+    if (fence) vkDestroyFence(device, fence, nullptr);
+    if (cases_buffer) vkDestroyBuffer(device, cases_buffer, nullptr);
+    if (ist_buffer) vkDestroyBuffer(device, ist_buffer, nullptr);
+    if (params_buffer) vkDestroyBuffer(device, params_buffer, nullptr);
+    if (rb_buffer) vkDestroyBuffer(device, rb_buffer, nullptr);
+    if (out_buffer) vkDestroyBuffer(device, out_buffer, nullptr);
+    if (ctr_buffer) vkDestroyBuffer(device, ctr_buffer, nullptr);
+    if (soa_buffer) vkDestroyBuffer(device, soa_buffer, nullptr);
+    if (cases_memory) vkFreeMemory(device, cases_memory, nullptr);
+    if (ist_memory) vkFreeMemory(device, ist_memory, nullptr);
+    if (params_memory) vkFreeMemory(device, params_memory, nullptr);
+    if (rb_memory) vkFreeMemory(device, rb_memory, nullptr);
+    if (out_memory) vkFreeMemory(device, out_memory, nullptr);
+    if (ctr_memory) vkFreeMemory(device, ctr_memory, nullptr);
+    if (soa_memory) vkFreeMemory(device, soa_memory, nullptr);
+  }
+};
+
+bool vulkan_film_queue_probe(VulkanDevice *dev)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+  if (getenv("CYCLES_VULKAN_FILM_QUEUE_PROBE") == nullptr) return true;
+
+  LOG_INFO << "Vulkan: Film-queue probe starting (CYCLES_VULKAN_FILM_QUEUE_PROBE=1).";
+
+  FilmQueueResources res;
+  const VkDevice vk_dev = dev->vk_device();
+  res.device = vk_dev;
+
+  /* ---- 1. SPIR-V (env override or cwd default) ---- */
+  std::vector<char> spirv;
+  const char *env_path = getenv("CYCLES_VULKAN_FILM_QUEUE_PROBE_SPV");
+  const char *candidates[2] = {env_path, "film_queue_probe.spv"};
+  const char *found = nullptr;
+  for (const char *c : candidates) {
+    if (c && probe_read_whole_file(c, spirv)) { found = c; break; }
+  }
+  if (!found) {
+    LOG_ERROR << "Vulkan: Film-queue probe: cannot find film_queue_probe.spv "
+                 "(compile it with slangc or set CYCLES_VULKAN_FILM_QUEUE_PROBE_SPV).";
+    return false;
+  }
+  if (spirv.size() % 4 != 0) {
+    LOG_ERROR << "Vulkan: Film-queue probe: '" << found << "' is not a valid SPIR-V module.";
+    return false;
+  }
+  LOG_INFO << "Vulkan: Film-queue probe: spirv='" << found << "' (" << spirv.size()
+           << " bytes).";
+
+  /* ---- 2. Shader module ---- */
+  VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = spirv.size();
+  smi.pCode = reinterpret_cast<const uint32_t *>(spirv.data());
+  if (vkCreateShaderModule(vk_dev, &smi, nullptr, &res.module) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Film-queue probe: vkCreateShaderModule failed.";
+    return false;
+  }
+
+  /* ---- 3. Pipeline layout (one 56-byte push range) ---- */
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(dev->vk_physical_device(), &props);
+  if (props.limits.maxPushConstantsSize < FQ_PUSH_BYTES) {
+    LOG_ERROR << "Vulkan: Film-queue probe: maxPushConstantsSize too small.";
+    return false;
+  }
+  VkPushConstantRange pcr{};
+  pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pcr.offset = 0;
+  pcr.size = FQ_PUSH_BYTES;
+  VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pli.pushConstantRangeCount = 1;
+  pli.pPushConstantRanges = &pcr;
+  if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &res.layout) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Film-queue probe: pipeline layout creation failed.";
+    return false;
+  }
+
+  /* ---- 4. Compute pipeline (entry "main"; slangc renames) ---- */
+  VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  cpi.stage.module = res.module;
+  cpi.stage.pName = "main";
+  cpi.layout = res.layout;
+  if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &res.pipeline) !=
+      VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Film-queue probe: compute pipeline creation failed.";
+    return false;
+  }
+
+  /* ---- 5. Params (the forced film layout) + host reference globals ---- */
+  FilmQueueParams fp{};
+  fp.film_stride = FQ_FILM_STRIDE;
+  fp.pass_sample_count = FQ_PASS_SAMPLE_COUNT;
+  fp.pass_adaptive_aux_buffer = FQ_PASS_ADAPTIVE_AUX;
+  fp.pass_volume_majorant = FQ_PASS_VOLUME_MAJORANT;
+  fp.pass_volume_majorant_sample_count = FQ_PASS_VOLUME_MAJORANT_COUNT;
+  fp.tile_offset = FQ_TILE_OFFSET;
+  fp.tile_stride = FQ_TILE_STRIDE;
+  fp.neg_mode = 0;
+  LOG_INFO << "Vulkan: Film-queue probe: film stride=" << fp.film_stride
+           << " sample_count@" << fp.pass_sample_count << " aux@"
+           << fp.pass_adaptive_aux_buffer << " majorant@" << fp.pass_volume_majorant
+           << " tile offset=" << fp.tile_offset << " stride=" << fp.tile_stride;
+
+  const KernelData &kd = dev->host_kernel_data();
+  KernelGlobalsCPU kg_cpu;
+  kg_cpu.data = kd;
+  kg_cpu.data.film.pass_stride = fp.film_stride;
+  kg_cpu.data.film.pass_sample_count = fp.pass_sample_count;
+  kg_cpu.data.film.pass_adaptive_aux_buffer = fp.pass_adaptive_aux_buffer;
+  kg_cpu.data.film.pass_volume_majorant = fp.pass_volume_majorant;
+  kg_cpu.data.film.pass_volume_majorant_sample_count =
+      fp.pass_volume_majorant_sample_count;
+  Profiler fq_profiler;
+  ThreadKernelGlobalsCPU tkg(kg_cpu, nullptr, fq_profiler, 0);
+  KernelGlobals kg = &tkg;
+
+  /* ---- 6. Case list: 768 unique pixels, modes A/B/C/D round-robin ---- */
+  const uint32_t samples6[6] = {0, 1, 5, 15, 255, 1023};
+  std::vector<FilmQueueCase> cases;
+  for (int y = 0; y < FQ_NUM_Y; y++) {
+    for (int x = 0; x < FQ_NUM_X; x++) {
+      FilmQueueCase c{};
+      const uint32_t i = (uint32_t)cases.size();
+      c.x = (uint32_t)x;
+      c.y = (uint32_t)y;
+      c.mode = i % 4u; /* A,B,C,D */
+      c.scheduled_sample = (int32_t)samples6[i % 6u];
+      c.sample_offset = (int32_t)(i % 7u);
+      /* next_kernel: A uses {2,5,8,11}, D uses {12,14,16} - chosen so the
+       * NEG4 +1 shift ({3,6,9,12}/{13,15,17}) stays < 18 (num_queued slots,
+       * state.h:101) and the CLEAN vs shifted supports differ, so the fault
+       * cannot cancel out in the net sums. B/C ignore this field (the probe
+       * passes literal 0 / current_kernel, like the real kernels). */
+      c.next_kernel = (c.mode == 3u) ? (12u + 2u * ((i / 4u) % 3u)) :
+                                       (2u + 3u * ((i / 4u) % 4u));
+      c.current_kernel = 2u + 3u * (i % 2u); /* mode C: 2 or 5 */
+      /* PATH_RAY_VOLUME_PRIMARY_TRANSMIT (types.h:276) on 2/3 of cases so
+       * the optical-depth branch has both outcomes. */
+      c.flag = ((i % 3u) != 0u) ? (1u << 24) : 0u;
+      c.optical_depth = (float)(i % 7u) * 0.125f; /* dyadic -> exact adds */
+      /* mode C mixes null and non-null buffers (every 8th C case is the
+       * nullptr branch that intersect_subsurface.h:21 exercises). */
+      c.render_buffer_valid = (c.mode == 2u && (i % 8u == 2u)) ? 0u : 1u;
+      cases.push_back(c);
+    }
+  }
+  const uint32_t num_cases = (uint32_t)cases.size();
+  LOG_INFO << "Vulkan: Film-queue probe: " << num_cases << " cases, "
+           << (num_cases + 63) / 64 << " workgroups of 64 threads.";
+
+  /* ---- 7. SoA slice table: the four state members this cluster touches ----
+   * mirror = offsetof in the IntegratorStateGPU pointer mirror, host =
+   * offsetof in the IntegratorStateCPU AoS struct (slice-2 mapping, same
+   * accessors). queued_kernel is u16 (store via the sub-word word fallback). */
+#define FQ_MIS(m) offsetof(IntegratorStateGPU, m)
+#define FQ_HIS(m) offsetof(IntegratorStateCPU, m)
+  struct FqSlice {
+    const char *name;
+    size_t mirror;
+    size_t host;
+    uint32_t elem;
+    int region; /* FQ_R_* this slice is compared as */
+    size_t off; /* filled by the layout loop */
+  };
+  std::vector<FqSlice> sl = {
+      {"path.render_pixel_index", FQ_MIS(path.render_pixel_index),
+       FQ_HIS(path.render_pixel_index), 4, FQ_R_RPI, 0},
+      {"path.flag", FQ_MIS(path.flag), FQ_HIS(path.flag), 4, FQ_R_FLAG, 0},
+      {"path.optical_depth", FQ_MIS(path.optical_depth), FQ_HIS(path.optical_depth), 4,
+       FQ_R_OPTICAL, 0},
+      {"path.queued_kernel", FQ_MIS(path.queued_kernel), FQ_HIS(path.queued_kernel), 2,
+       FQ_R_QUEUED, 0},
+  };
+  const size_t num_slices = sl.size();
+
+  /* ---- 8. SoA layout: each slice = elem*num_cases (4-aligned) + 16-B canary.
+   * Payload starts at ZERO; queued_kernel's word-fallback atomics touch only
+   * payload words (768 elements = 384 words, even count -> the last case's
+   * word is inside the payload). ---- */
+  size_t soa_size = 0;
+  for (auto &s : sl) {
+    soa_size = (soa_size + 3) & ~(size_t)3;
+    s.off = soa_size;
+    size_t payload = (size_t)s.elem * num_cases;
+    payload = (payload + 3) & ~(size_t)3;
+    soa_size += payload + (size_t)FQ_CANARY_WORDS * 4;
+  }
+
+  /* ---- 9. Render buffer initial fill: dyadic (exactly representable)
+   * values so a raw-bit compare is meaningful. Slot 0 is the sample-count
+   * counter (read as uint); row[7] (aux .w) alternates 0/1 -> half the
+   * pixels pass the need test. The rows land at the offsets actually
+   * accessed: rpi = tile.offset + i (path_state.h:32, case i has x+y*64=i)
+   * so row rpi occupies floats [rpi*16, rpi*16+16). Everything else -
+   * including the NEG2 stride-17 extension - starts as the canary. */
+  std::vector<float> rb_init(FQ_RB_FLOATS);
+  {
+    uint32_t *bits = reinterpret_cast<uint32_t *>(rb_init.data());
+    for (int k = 0; k < FQ_RB_FLOATS; k++) bits[k] = FQ_CANARY;
+    for (int i = 0; i < FQ_NUM_X * FQ_NUM_Y; i++) {
+      float rowf[16];
+      const uint32_t u0 = 100u + (uint32_t)i * 7u; /* count slot: varied bits */
+      memcpy(&rowf[0], &u0, 4);
+      rowf[1] = 0.25f;
+      rowf[2] = 0.5f;
+      rowf[3] = 0.75f;
+      rowf[4] = 0.5f + (float)(i % 5) * 0.25f; /* aux.x varies per pixel */
+      rowf[5] = 1.0f;
+      rowf[6] = 3.0f;
+      rowf[7] = ((i % 2) != 0) ? 0.0f : 1.0f; /* aux.w: need==true when 0 */
+      rowf[8] = (float)(i % 5) * 0.125f;      /* optical-depth fill */
+      rowf[9] = 0.5f;                         /* optical sample-count fill */
+      rowf[10] = 2.5f;
+      rowf[11] = -1.25f;
+      rowf[12] = 0.375f;
+      rowf[13] = 7.0f;
+      rowf[14] = -0.0625f;
+      rowf[15] = 4.5f;
+      memcpy(&rb_init[(size_t)(FQ_TILE_OFFSET + i) * 16], rowf, sizeof(rowf));
+    }
+  }
+
+  /* ---- 10. Allocate the seven buffers ---- */
+  auto make_buffer = [&](VkDeviceSize size, VkBuffer &buf, VkDeviceMemory &mem,
+                         uint64_t &addr) -> bool {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if (vkCreateBuffer(vk_dev, &bci, nullptr, &buf) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Film-queue probe: buffer creation failed.";
+      return false;
+    }
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(vk_dev, buf, &reqs);
+    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &flags_info;
+    ai.allocationSize = reqs.size;
+    ai.memoryTypeIndex = dev->find_memory_type(
+        reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX) {
+      LOG_ERROR << "Vulkan: Film-queue probe: no host-visible+coherent memory type.";
+      return false;
+    }
+    if (vkAllocateMemory(vk_dev, &ai, nullptr, &mem) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Film-queue probe: memory allocation failed.";
+      return false;
+    }
+    if (vkBindBufferMemory(vk_dev, buf, mem, 0) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Film-queue probe: bind buffer memory failed.";
+      return false;
+    }
+    VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    bai.buffer = buf;
+    addr = vkGetBufferDeviceAddress(vk_dev, &bai);
+    if (addr == 0) {
+      LOG_ERROR << "Vulkan: Film-queue probe: vkGetBufferDeviceAddress returned 0.";
+      return false;
+    }
+    return true;
+  };
+
+  uint64_t cases_addr = 0, ist_addr = 0, params_addr = 0, rb_addr = 0, out_addr = 0,
+           ctr_addr = 0, soa_addr = 0;
+  const VkDeviceSize cases_bytes = (VkDeviceSize)num_cases * sizeof(FilmQueueCase);
+  const VkDeviceSize ist_bytes = sizeof(IntegratorStateGPU);
+  const VkDeviceSize params_bytes = sizeof(FilmQueueParams);
+  const VkDeviceSize rb_bytes = (VkDeviceSize)FQ_RB_FLOATS * 4;
+  const VkDeviceSize out_bytes = (VkDeviceSize)num_cases * sizeof(FilmQueueOut);
+  const VkDeviceSize ctr_bytes = 128; /* payload 76 + canary tail 52 */
+  const VkDeviceSize soa_bytes = (VkDeviceSize)soa_size;
+  if (!make_buffer(cases_bytes, res.cases_buffer, res.cases_memory, cases_addr) ||
+      !make_buffer(ist_bytes, res.ist_buffer, res.ist_memory, ist_addr) ||
+      !make_buffer(params_bytes, res.params_buffer, res.params_memory, params_addr) ||
+      !make_buffer(rb_bytes, res.rb_buffer, res.rb_memory, rb_addr) ||
+      !make_buffer(out_bytes, res.out_buffer, res.out_memory, out_addr) ||
+      !make_buffer(ctr_bytes, res.ctr_buffer, res.ctr_memory, ctr_addr) ||
+      !make_buffer(soa_bytes, res.soa_buffer, res.soa_memory, soa_addr)) {
+    return false;
+  }
+
+  /* ---- 11. EXPECTED bytes from the REAL Cycles functions ----
+   * One IntegratorStateCPU zeroed per case; path_state_init + the film
+   * functions + the CPU queue branches in init_from_camera's order; the
+   * mutated ref_rb becomes the expected render buffer, the CPU struct bytes
+   * become the expected state slices, and the counter net sums are gathered
+   * alongside (documented caveat in the probe header). */
+  std::vector<char> expected_soa(soa_size, 0);
+  std::vector<float> ref_rb = rb_init;
+  std::vector<FilmQueueOut> exp_out(num_cases);
+  std::vector<int32_t> net(19, 0); /* num_queued[18] + cache_miss at [18] */
+  {
+    IntegratorStateCPU st_cpu;
+    KernelWorkTile tile{};
+    tile.offset = FQ_TILE_OFFSET;
+    tile.stride = FQ_TILE_STRIDE;
+    tile.sample_offset = 0; /* the probe passes c.sample_offset explicitly */
+    for (uint32_t i = 0; i < num_cases; i++) {
+      const FilmQueueCase &c = cases[i];
+      memset(&st_cpu, 0, sizeof(st_cpu));
+
+      /* REAL Cycles calls (slice-2 integration + the slice-3 cluster). */
+      path_state_init(&st_cpu, &tile, (int)c.x, (int)c.y);
+      st_cpu.path.flag = c.flag; /* input data, written by the probe too */
+      st_cpu.path.optical_depth = c.optical_depth;
+
+      const bool need = film_need_sample_pixel(kg, &st_cpu, ref_rb.data());
+      exp_out[i].need = need ? 1u : 0u;
+      if (need) {
+        exp_out[i].sample = (uint32_t)film_write_sample(
+            kg, &st_cpu, ref_rb.data(), c.scheduled_sample, c.sample_offset);
+      }
+      else {
+        exp_out[i].sample = 0xFFFFFFFFu; /* sentinel: pixel skipped */
+      }
+
+      switch (c.mode) {
+        case 0: /* A: integrator_path_init(next) */
+          integrator_path_init(&st_cpu, (DeviceKernel)c.next_kernel);
+          net[c.next_kernel] += 1; /* GPU-branch atomic (net-sum caveat) */
+          break;
+        case 1: /* B: cache-miss restart */
+          integrator_path_init(&st_cpu, DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA);
+          /* CPU branch is assert-only (state_flow.h:240-244): a no-op in
+           * this Release build; the GPU effect is counter.cache_miss = 1. */
+          integrator_path_cache_miss(&st_cpu, DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA);
+          net[0] += 1;
+          net[18] = 1; /* cache_miss */
+          break;
+        case 2: /* C: terminate (null branch when valid==0) */
+          integrator_path_terminate(kg, &st_cpu,
+                                    c.render_buffer_valid ? ref_rb.data() : nullptr,
+                                    (DeviceKernel)c.current_kernel);
+          net[c.current_kernel] -= 1;
+          break;
+        default: /* D: integrator_path_next(0 -> next) */
+          integrator_path_next(&st_cpu, DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA,
+                               (DeviceKernel)c.next_kernel);
+          net[0] -= 1;
+          net[c.next_kernel] += 1;
+          break;
+      }
+
+      /* Expected state slices: raw bytes out of the CPU struct. */
+      memcpy(expected_soa.data() + sl[0].off + (size_t)4 * i,
+             &st_cpu.path.render_pixel_index, 4);
+      memcpy(expected_soa.data() + sl[1].off + (size_t)4 * i, &st_cpu.path.flag, 4);
+      memcpy(expected_soa.data() + sl[2].off + (size_t)4 * i, &st_cpu.path.optical_depth,
+             4);
+      memcpy(expected_soa.data() + sl[3].off + (size_t)2 * i, &st_cpu.path.queued_kernel,
+             2);
+    }
+  }
+
+  /* ---- 12. Upload: cases, params, mirror (slice addresses + counter
+   * pointer), render buffer, zeroed counters, zeroed+canaried SoA. ---- */
+  auto upload = [&](VkDeviceMemory mem, const void *data, VkDeviceSize bytes) -> bool {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, mem, 0, bytes, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Film-queue probe: mapping buffer failed.";
+      return false;
+    }
+    memcpy(m, data, (size_t)bytes);
+    vkUnmapMemory(vk_dev, mem);
+    return true;
+  };
+  if (!upload(res.cases_memory, cases.data(), cases_bytes) ||
+      !upload(res.params_memory, &fp, params_bytes) ||
+      !upload(res.rb_memory, rb_init.data(), rb_bytes)) {
+    return false;
+  }
+  {
+    IntegratorStateGPU ist{}; /* zero-init: untouched members stay null */
+    for (const auto &s : sl) {
+      const uint64_t addr = soa_addr + s.off;
+      memcpy(reinterpret_cast<char *>(&ist) + s.mirror, &addr, sizeof(addr));
+    }
+    memcpy(reinterpret_cast<char *>(&ist) + offsetof(IntegratorStateGPU, queue_counter),
+           &ctr_addr, sizeof(ctr_addr));
+    if (!upload(res.ist_memory, &ist, ist_bytes)) return false;
+  }
+  {
+    std::vector<uint8_t> ctr((size_t)ctr_bytes, 0);
+    memset(ctr.data() + 76, 0, (size_t)ctr_bytes - 76); /* tail: fill below */
+    for (size_t k = 76; k < (size_t)ctr_bytes; k += 4)
+      memcpy(ctr.data() + k, &FQ_CANARY, 4);
+    if (!upload(res.ctr_memory, ctr.data(), ctr_bytes)) return false;
+  }
+
+  /* ---- 13. Command pool + buffer + queue + fence ---- */
+  const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
+  VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  cpci.queueFamilyIndex = family;
+  if (vkCreateCommandPool(vk_dev, &cpci, nullptr, &res.pool) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Film-queue probe: command pool creation failed.";
+    return false;
+  }
+  VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = res.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(vk_dev, &cbai, &cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Film-queue probe: command buffer allocation failed.";
+    return false;
+  }
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(vk_dev, family, 0, &queue);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (vkCreateFence(vk_dev, &fci, nullptr, &res.fence) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Film-queue probe: fence creation failed.";
+    return false;
+  }
+
+  /* ---- 14. Per-run: re-init mutable buffers, dispatch, count per region ---- */
+  struct FqStats {
+    uint64_t comps = 0;
+    uint64_t mism[FQ_NUM_REGIONS] = {0};
+    bool canary_ok = true;
+    /* DIAGNOSTIC (does not affect the verdict): the first few concrete
+     * mismatches, so a failing CLEAN can be traced to a value, not just a
+     * count. index = word index inside the region (or case index for the
+     * strided compares). */
+    struct Rec {
+      int region;
+      uint64_t index;
+      uint32_t gpu, ref;
+    };
+    /* Local classes cannot have static data members (MSVC C2246), so the caps
+     * are enums. Keep the first few mismatches PER REGION. */
+    enum { MAX_REC_PER_REGION = 4, MAX_REC = 52 };
+    Rec rec[MAX_REC];
+    int nrec = 0;
+    int nrec_r[FQ_NUM_REGIONS] = {0};
+    /* DIAGNOSTIC: histogram of mismatching render-row words by their slot in
+     * the pixel row (idx % 16) - distinguishes the sample-count slot (0) from
+     * the optical-depth slots (8/9). */
+    uint64_t slot_hist[16] = {0};
+    void note(int region, uint64_t index, uint32_t gpu, uint32_t ref)
+    {
+      if (region == FQ_R_RB_ROWS) slot_hist[index % 16]++;
+      if (nrec_r[region] < MAX_REC_PER_REGION && nrec < MAX_REC) {
+        nrec_r[region]++;
+        rec[nrec++] = {region, index, gpu, ref};
+      }
+    }
+    uint64_t total() const
+    {
+      uint64_t t = 0;
+      for (int r = 0; r < FQ_NUM_REGIONS; r++) t += mism[r];
+      return t;
+    }
+  };
+
+  /* Raw-bit word compare (both pointers 4-aligned, bytes a multiple of 4). */
+  auto count_words = [](FqStats &st, int region, const uint8_t *gpu, const uint8_t *ref,
+                        size_t bytes) {
+    for (size_t k = 0; k < bytes; k += 4) {
+      uint32_t x, y;
+      memcpy(&x, gpu + k, 4);
+      memcpy(&y, ref + k, 4);
+      st.comps++;
+      if (x != y) {
+        st.mism[region]++;
+        st.note(region, k / 4, x, y);
+      }
+    }
+  };
+  /* Strided words (out.need at +0 / out.sample at +4 of each 8-B record). */
+  auto count_strided = [](FqStats &st, int region, const uint8_t *gpu, const uint8_t *ref,
+                          size_t count, size_t stride, size_t off0) {
+    for (size_t i = 0; i < count; i++) {
+      uint32_t x, y;
+      memcpy(&x, gpu + i * stride + off0, 4);
+      memcpy(&y, ref + i * stride + off0, 4);
+      st.comps++;
+      if (x != y) {
+        st.mism[region]++;
+        st.note(region, i, x, y);
+      }
+    }
+  };
+  /* Canary words against the constant pattern. */
+  auto count_canary = [](FqStats &st, int region, const uint8_t *gpu, size_t offset,
+                         size_t bytes) {
+    for (size_t k = 0; k < bytes; k += 4) {
+      uint32_t x;
+      memcpy(&x, gpu + offset + k, 4);
+      st.comps++;
+      if (x != FQ_CANARY) {
+        st.mism[region]++;
+        st.canary_ok = false;
+        st.note(region, (offset + k) / 4, x, FQ_CANARY);
+      }
+    }
+  };
+
+  auto run_and_compare = [&](int neg_mode, FqStats &st) -> bool {
+    st = FqStats();
+    fp.neg_mode = neg_mode;
+    if (!upload(res.params_memory, &fp, params_bytes)) return false;
+
+    /* Re-init everything the shader mutates: render buffer (film writes),
+     * counters (atomics), SoA (state writes incl. the word-fallback atomics
+     * whose canaries must start clean). cases/mirror are rewrite-only. The
+     * out buffer is shader-write-only: fill it with a distinctive sentinel
+     * so a slot the shader never wrote is recognizable (DIAGNOSTIC). */
+    if (!upload(res.rb_memory, rb_init.data(), rb_bytes)) return false;
+    {
+      std::vector<uint8_t> out_s((size_t)out_bytes, 0);
+      const uint32_t SENT = 0xABABABABu;
+      for (size_t k = 0; k < (size_t)out_bytes; k += 4)
+        memcpy(out_s.data() + k, &SENT, 4);
+      if (!upload(res.out_memory, out_s.data(), out_bytes)) return false;
+    }
+    {
+      std::vector<uint8_t> ctr((size_t)ctr_bytes, 0);
+      for (size_t k = 76; k < (size_t)ctr_bytes; k += 4)
+        memcpy(ctr.data() + k, &FQ_CANARY, 4);
+      if (!upload(res.ctr_memory, ctr.data(), ctr_bytes)) return false;
+    }
+    {
+      std::vector<uint8_t> soa((size_t)soa_bytes, 0);
+      for (const auto &s : sl) {
+        const size_t pay_end = s.off + (((size_t)s.elem * num_cases + 3) & ~(size_t)3);
+        for (uint32_t w = 0; w < FQ_CANARY_WORDS; w++)
+          memcpy(soa.data() + pay_end + (size_t)w * 4, &FQ_CANARY, 4);
+      }
+      if (!upload(res.soa_memory, soa.data(), soa_bytes)) return false;
+    }
+
+    VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    vkResetCommandBuffer(cmd, 0);
+    vkBeginCommandBuffer(cmd, &begin_info);
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.pipeline);
+    FilmQueuePush push{cases_addr, ist_addr, params_addr, rb_addr, rb_addr, out_addr,
+                       num_cases, 0};
+    vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push), &push);
+    vkCmdDispatch(cmd, (num_cases + 63) / 64, 1, 1);
+    vkEndCommandBuffer(cmd);
+
+    vkResetFences(vk_dev, 1, &res.fence);
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    if (vkQueueSubmit(queue, 1, &si, res.fence) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Film-queue probe: queue submit failed.";
+      return false;
+    }
+    if (vkWaitForFences(vk_dev, 1, &res.fence, VK_TRUE, 10000000000ull) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Film-queue probe: fence wait failed.";
+      return false;
+    }
+
+    /* Map the four readback buffers and count mismatches per region. */
+    void *m_soa = nullptr, *m_rb = nullptr, *m_out = nullptr, *m_ctr = nullptr;
+    if (vkMapMemory(vk_dev, res.soa_memory, 0, soa_bytes, 0, &m_soa) != VK_SUCCESS ||
+        vkMapMemory(vk_dev, res.rb_memory, 0, rb_bytes, 0, &m_rb) != VK_SUCCESS ||
+        vkMapMemory(vk_dev, res.out_memory, 0, out_bytes, 0, &m_out) != VK_SUCCESS ||
+        vkMapMemory(vk_dev, res.ctr_memory, 0, ctr_bytes, 0, &m_ctr) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Film-queue probe: mapping readback failed.";
+      return false;
+    }
+    const uint8_t *soa_p = static_cast<const uint8_t *>(m_soa);
+    const uint8_t *rb_p = static_cast<const uint8_t *>(m_rb);
+    const uint8_t *out_p = static_cast<const uint8_t *>(m_out);
+    const uint8_t *ctr_p = static_cast<const uint8_t *>(m_ctr);
+
+    for (const auto &s : sl)
+      count_words(st, s.region, soa_p + s.off,
+                  reinterpret_cast<const uint8_t *>(expected_soa.data()) + s.off,
+                  (size_t)s.elem * num_cases);
+    for (const auto &s : sl)
+      count_canary(st, FQ_R_SOA_CANARY, soa_p,
+                   s.off + (((size_t)s.elem * num_cases + 3) & ~(size_t)3),
+                   (size_t)FQ_CANARY_WORDS * 4);
+
+    count_strided(st, FQ_R_OUT_NEED, out_p,
+                  reinterpret_cast<const uint8_t *>(exp_out.data()), num_cases, 8, 0);
+    count_strided(st, FQ_R_OUT_SAMPLE, out_p,
+                  reinterpret_cast<const uint8_t *>(exp_out.data()), num_cases, 8, 4);
+    count_canary(st, FQ_R_OUT_TAIL, out_p, (size_t)num_cases * 8,
+                 (size_t)out_bytes - (size_t)num_cases * 8);
+
+    count_words(st, FQ_R_RB_ROWS, rb_p,
+                reinterpret_cast<const uint8_t *>(ref_rb.data()),
+                (size_t)FQ_RB_ROWS * 4);
+    count_words(st, FQ_R_RB_EXT, rb_p + (size_t)FQ_RB_ROWS * 4,
+                reinterpret_cast<const uint8_t *>(ref_rb.data()) +
+                    (size_t)FQ_RB_ROWS * 4,
+                (size_t)(FQ_RB_EXT - FQ_RB_ROWS) * 4);
+    count_canary(st, FQ_R_RB_TAIL, rb_p, (size_t)FQ_RB_EXT * 4,
+                 (size_t)(FQ_RB_FLOATS - FQ_RB_EXT) * 4);
+
+    count_words(st, FQ_R_COUNTERS, ctr_p, reinterpret_cast<const uint8_t *>(net.data()),
+                76);
+    count_canary(st, FQ_R_CTR_TAIL, ctr_p, 76, (size_t)ctr_bytes - 76);
+
+    vkUnmapMemory(vk_dev, res.soa_memory);
+    vkUnmapMemory(vk_dev, res.rb_memory);
+    vkUnmapMemory(vk_dev, res.out_memory);
+    vkUnmapMemory(vk_dev, res.ctr_memory);
+    return true;
+  };
+
+  auto log_stats = [&](const char *label, const FqStats &st) {
+    LOG_INFO << "Vulkan: Film-queue probe: [" << label << "] " << st.total() << "/"
+             << st.comps << " comparisons differ"
+             << (st.canary_ok ? "" : " [CANARY CORRUPTED]");
+    /* DIAGNOSTIC: always print the per-region breakdown (was gated to small
+     * totals, which hid the CLEAN failure breakdown), then the first
+     * concrete mismatching words with both values. */
+    static const char *rname[FQ_NUM_REGIONS] = {
+        "render_pixel_index", "flag",           "optical_depth", "queued_kernel",
+        "out.need",           "out.sample",     "render rows",   "render ext",
+        "render tail",        "counters",       "out tail",      "counter tail",
+        "SoA canaries"};
+    for (int r = 0; r < FQ_NUM_REGIONS; r++)
+      if (st.mism[r] != 0)
+        LOG_INFO << "Vulkan: Film-queue probe:   " << rname[r] << ": " << st.mism[r]
+                 << " word(s) differ";
+    if (st.mism[FQ_R_RB_ROWS] != 0) {
+      std::string hist;
+      for (int s = 0; s < 16; s++)
+        if (st.slot_hist[s] != 0) hist += " slot" + std::to_string(s) + "=" + std::to_string(st.slot_hist[s]);
+      LOG_INFO << "Vulkan: Film-queue probe:   render-row slots:" << hist;
+    }
+    for (int k = 0; k < st.nrec; k++)
+      LOG_INFO << "Vulkan: Film-queue probe:   first[" << k << "] " << rname[st.rec[k].region]
+               << " idx=" << st.rec[k].index << " gpu=0x" << std::hex << st.rec[k].gpu
+               << " ref=0x" << st.rec[k].ref << std::dec;
+  };
+
+  /* ---- 15. Run: clean, then the four negatives ---- */
+  FqStats clean;
+  if (!run_and_compare(0, clean)) return false;
+  log_stats("CLEAN", clean);
+  const bool clean_ok = (clean.total() == 0) && clean.canary_ok;
+
+  /* Region masks: bit r set = negative n may change region r (probe header). */
+  const uint32_t neg_allowed[5] = {
+      0u,
+      1u << FQ_R_OUT_SAMPLE,
+      (1u << FQ_R_OUT_NEED) | (1u << FQ_R_OUT_SAMPLE) | (1u << FQ_R_RB_ROWS) |
+          (1u << FQ_R_RB_EXT),
+      (1u << FQ_R_OUT_SAMPLE) | (1u << FQ_R_RB_ROWS),
+      (1u << FQ_R_QUEUED) | (1u << FQ_R_COUNTERS),
+  };
+  const char *neg_name[5] = {"", "sample_offset+1", "film_stride+1", "sample_count+1",
+                             "next_kernel+1"};
+
+  FqStats neg[5];
+  bool neg_detected[5] = {true, false, false, false, false};
+  bool neg_spillover[5] = {false, false, false, false, false};
+  for (int n = 1; n <= 4; n++) {
+    if (!run_and_compare(n, neg[n])) return false;
+    log_stats(neg_name[n], neg[n]);
+    for (int r = 0; r < FQ_NUM_REGIONS; r++) {
+      const bool allowed = (neg_allowed[n] >> r) & 1u;
+      if (neg[n].mism[r] != 0) {
+        if (allowed) neg_detected[n] = true;
+        else neg_spillover[n] = true;
+      }
+    }
+    if (!neg[n].canary_ok) neg_spillover[n] = true;
+  }
+
+  /* ---- 16. Verdict ---- */
+  bool all_ok = clean_ok;
+  for (int n = 1; n <= 4; n++) {
+    LOG_INFO << "Vulkan: Film-queue probe: negative '" << neg_name[n] << "' "
+             << (neg_detected[n] ? "DETECTED" : "NOT DETECTED")
+             << (neg_spillover[n] ? " (SPILLOVER - gate failure)" : "");
+    if (!neg_detected[n] || neg_spillover[n]) all_ok = false;
+  }
+  if (clean_ok)
+    LOG_INFO << "Vulkan: Film-queue probe: CLEAN PASS (film writes, queue state and "
+                "counters match the real Cycles reference).";
+  else
+    LOG_ERROR << "Vulkan: Film-queue probe: CLEAN PASS FAILED (GPU output disagrees "
+                 "with the real Cycles reference).";
+  LOG_INFO << "Vulkan: Film-queue probe: " << (all_ok ? "GATE MET." : "GATE NOT MET.");
   return all_ok;
 }
 

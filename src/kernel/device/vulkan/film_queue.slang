@@ -26,7 +26,9 @@
  *       slot `ist->queue_counter` (vulkan_data.slang:331, host offset 1944,
  *       state.h:197). The host probe points it at a real counter block.
  *   state -> IntegratorStateGPU* ist + uint state (slice-1/2 accessors)
- *   render_buffer -> float* device pointer (push constant)
+ *   render_buffer -> float* device pointer (push constant) for the float
+ *       READS (film_need_sample_pixel), plus a uint* view of the SAME
+ *       address for the ATOMIC paths (platform constraint 4 below)
  *   next_kernel / current_kernel -> explicit uint args carrying the cited
  *       DeviceKernel enum values (types.h:1745+: INIT_FROM_CAMERA=0,
  *       INTERSECT_CLOSEST=2, INTERSECT_VOLUME_STACK=5)
@@ -73,6 +75,29 @@
  *      integrator_path_terminate with literal nullptr, exactly as
  *      intersect_subsurface.h:21 does, while the probe gets valid=0 with a
  *      canary-filled buffer that must stay untouched).
+ *   4. uint-typed view of the render buffer for the ATOMIC paths
+ *      (film_write_sample, write_optical_depth -> atomic_add_float_cas).
+ *      Cycles casts the float* buffer to (ccl_global uint*) in-place
+ *      (light_passes.h:170, and util/atomic.h's atomicAdd takes the uint
+ *      view); on SPIR-V that cast is OpBitcast BETWEEN POINTER TYPES. On the
+ *      RX 570 (driver 31.0.21925.1001) this session measured that every
+ *      atomic whose pointer went through OpBitcast ptr_float->ptr_uint
+ *      executed at the BUFFER BASE instead of base+offset: the CLEAN gate
+ *      run showed +384 integer adds on render-buffer float 0 (384 = one per
+ *      film_write_sample call) while the float-only path
+ *      (film_need_sample_pixel, no bitcast) read the correct row in the same
+ *      dispatch. Slot histogram of the 503 differing render-row words:
+ *      slot0=385, slot8=54, slot9=64 - slot8 is 54 rather than 64 because
+ *      exactly 10 of the 64 optical cases have optical_depth 0
+ *      ((i%7)*0.125 == 0), i.e. a host-side no-op, which only fits an
+ *      address-at-base fault. The host therefore passes the SAME buffer
+ *      address a second time typed uint*, and the atomic paths do pure
+ *      uint-pointer arithmetic (OpPtrAccessChain on a plain pointer - the
+ *      shape proven to work by the float reads). The Cycles reference calls
+ *      on the host are untouched: CPU pointer casts are free there.
+ *      The identical SPIR-V crashes SwiftShader with 0xC000001D (illegal
+ *      instruction) before any probe output; whether that has the same root
+ *      cause is UNVERIFIED and must be re-measured after this change.
  */
 
 #include "integrator_state.slang"  // accessors + the IntegratorStateGPU mirror
@@ -117,6 +142,23 @@ float *film_pass_pixel_render_buffer(IntegratorStateGPU *ist,
     return render_buffer + render_buffer_offset;
 }
 
+/* Platform constraint 4 (file header): the SAME offset computation returning
+ * a uint view of the buffer, for the atomic paths. Cycles reaches the uint
+ * view by casting the float* (light_passes.h:170); an in-shader pointer
+ * bitcast is miscompiled on the RX 570 (measured: every OpBitcast'd atomic
+ * ran at the buffer base), so the host supplies the uint view directly. The
+ * offset math is identical to the float version above - only the element
+ * type of the pointer differs. */
+uint *film_pass_pixel_render_buffer_u(IntegratorStateGPU *ist,
+                                      uint state,
+                                      uint *render_buffer_u,
+                                      const int pass_stride)
+{
+    uint render_pixel_index = read_path_render_pixel_index(ist, state);
+    uint render_buffer_offset = render_pixel_index * (uint)pass_stride;
+    return render_buffer_u + render_buffer_offset;
+}
+
 /* =========================================================================== *
  *  film_need_sample_pixel - FAITHFUL PORT
  *  source: src/kernel/film/adaptive_sampling.h:13-25
@@ -155,13 +197,16 @@ bool film_need_sample_pixel(IntegratorStateGPU *ist,
  *          + sample_offset;
  * The count slot is addressed as UINT (the counter bits live in a float-typed
  * slot; read back via __float_as_uint at adaptive_sampling.h:58). InterlockedAdd
- * matches HLSL's uint overload and lowers to core OpAtomicIAdd. Bounds check:
- * pass_sample_count is an offset in the pixel's pass row, which must be
- * < pass_stride for the slot to exist; the gate only feeds in-range values and
- * the real kernel data comes from the film layout (checked host-side). */
+ * matches HLSL's uint overload and lowers to core OpAtomicIAdd. The float->uint
+ * cast of light_passes.h:170 becomes the render_buffer_u argument (platform
+ * constraint 4 in the file header - in-shader pointer bitcasts land at the
+ * buffer base on the RX 570). Bounds check: pass_sample_count is an offset in
+ * the pixel's pass row, which must be < pass_stride for the slot to exist; the
+ * gate only feeds in-range values and the real kernel data comes from the film
+ * layout (checked host-side). */
 int film_write_sample(IntegratorStateGPU *ist,
                       uint state,
-                      float *render_buffer,
+                      uint *render_buffer_u,
                       const int sample,
                       const int sample_offset,
                       const int pass_sample_count,
@@ -171,9 +216,9 @@ int film_write_sample(IntegratorStateGPU *ist,
         return sample;
     }
 
-    float *buffer = film_pass_pixel_render_buffer(ist, state, render_buffer, pass_stride);
+    uint *buffer = film_pass_pixel_render_buffer_u(ist, state, render_buffer_u, pass_stride);
 
-    uint *count_slot = (uint *)buffer + (uint)pass_sample_count;
+    uint *count_slot = buffer + (uint)pass_sample_count;
     uint old;
     InterlockedAdd(count_slot[0], 1u, old);
     return int(old) + sample_offset;
@@ -186,11 +231,13 @@ int film_write_sample(IntegratorStateGPU *ist,
  *  source of the semantics: src/kernel/film/write.h:61-62 -> util/atomic.h:30
  *  (atomicAdd returns the OLD value, so fetch-and-add = old + x)
  * =========================================================================== *
- * CAS loop on the bit-cast uint word: load bits, compute the IEEE sum, and
- * CAS it in; retry with the winner's value if another writer interfered. */
-float atomic_add_float_cas(float *slot, float x)
+ * CAS loop on the uint word view of the slot (platform constraint 4: the host
+ * supplies the uint view of the buffer, so the float->uint reinterpretation
+ * happens in the CALLER's address arithmetic, not via a pointer bitcast):
+ * load bits, compute the IEEE sum, and CAS it in; retry with the winner's
+ * value if another writer interfered. */
+float atomic_add_float_cas(uint *p, float x)
 {
-    uint *p = (uint *)slot;  // bit-cast: same 4 bytes, integer view for the CAS
     uint old_bits = p[0];
     float sum;
     uint new_bits;
@@ -232,7 +279,7 @@ float atomic_add_float_cas(float *slot, float x)
  * flag from the same pointer it passes. */
 void write_optical_depth(IntegratorStateGPU *ist,
                          uint state,
-                         float *render_buffer,
+                         uint *render_buffer_u,
                          const uint render_buffer_valid,
                          const int pass_volume_majorant,
                          const int pass_volume_majorant_sample_count,
@@ -245,7 +292,7 @@ void write_optical_depth(IntegratorStateGPU *ist,
     uint flag = read_path_flag(ist, state);
     if ((flag & PATH_RAY_VOLUME_PRIMARY_TRANSMIT) != 0u) {
         float optical_depth = read_path_optical_depth(ist, state);
-        float *buffer = film_pass_pixel_render_buffer(ist, state, render_buffer, pass_stride);
+        uint *buffer = film_pass_pixel_render_buffer_u(ist, state, render_buffer_u, pass_stride);
 
         /* source: state_flow.h:64-65 via film_write_pass_float (write.h:58-66) */
         atomic_add_float_cas(buffer + (uint)pass_volume_majorant, optical_depth);
@@ -332,7 +379,7 @@ void integrator_path_next(IntegratorStateGPU *ist,
  * passes the pointer itself and lets write_optical_depth test it. */
 void integrator_path_terminate(IntegratorStateGPU *ist,
                                uint state,
-                               float *render_buffer,
+                               uint *render_buffer_u,
                                const uint render_buffer_valid,
                                const uint current_kernel,
                                const int pass_volume_majorant,
@@ -341,7 +388,7 @@ void integrator_path_terminate(IntegratorStateGPU *ist,
 {
     write_optical_depth(ist,
                         state,
-                        render_buffer,
+                        render_buffer_u,
                         render_buffer_valid,
                         pass_volume_majorant,
                         pass_volume_majorant_sample_count,

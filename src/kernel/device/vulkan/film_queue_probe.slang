@@ -100,17 +100,22 @@ struct FilmQueueOut
     uint sample;  // film_write_sample return, 0xFFFFFFFF when need == 0
 };                // 8 bytes
 
-/* Push block: 5 device pointers + count (+ pad) = 48 bytes. */
+/* Push block: 6 device pointers + count (+ pad) = 56 bytes. The render
+ * buffer is passed twice: float* for reads, uint* for the atomic paths
+ * (film_queue.slang platform constraint 4 - no in-shader pointer bitcasts,
+ * which the RX 570 miscompiles to the buffer base). */
 struct FilmQueuePush
 {
     FilmQueueCase*       cases;
     IntegratorStateGPU*  ist;
     FilmQueueParams*     params;
-    float*               render_buffer;
+    float*               render_buffer;   // float READS (film_need_sample_pixel)
+    uint*                render_buffer_u; // ATOMIC paths: same address, uint
+                                          // view (film_queue.slang constraint 4)
     FilmQueueOut*        out;
     uint                 num_cases;
     uint                 pad0;
-};                         // 5 * 8 + 4 + 4 = 48 bytes
+};                         // 6 * 8 + 4 + 4 = 56 bytes
 
 [[vk::push_constant]]
 ConstantBuffer<FilmQueuePush> pc;
@@ -157,7 +162,7 @@ void film_queue_main(uint3 tid : SV_DispatchThreadID)
     if (need) {
         o.sample = (uint)film_write_sample(pc.ist,
                                            i,
-                                           pc.render_buffer,
+                                           pc.render_buffer_u,
                                            c.scheduled_sample,
                                            sample_offset_arg,
                                            sample_count_arg,
@@ -183,7 +188,7 @@ void film_queue_main(uint3 tid : SV_DispatchThreadID)
          * render_buffer_valid selects the null branch, see header) */
         integrator_path_terminate(pc.ist,
                                   i,
-                                  pc.render_buffer,
+                                  pc.render_buffer_u,
                                   c.render_buffer_valid,
                                   c.current_kernel,
                                   p.pass_volume_majorant,
