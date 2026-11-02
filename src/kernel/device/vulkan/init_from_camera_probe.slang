@@ -120,6 +120,11 @@ void init_from_camera_main(uint3 tid : SV_DispatchThreadID)
     /* ---- the port under test ---- */
     float3 ray_P, ray_D;
     float ray_tmin, ray_tmax, ray_time;
+    /* ray_dP/ray_dD (M4f slice 4) are threaded through but NOT written to
+     * f[]: the slice-1 result layout and its host comparison stay byte-for-
+     * byte as gated in slice 1. dP/dD are gated raw against the real
+     * integrator_init_from_camera by init_from_camera_body_probe (slice 4). */
+    float ray_dP, ray_dD;
     int r_cache_miss;
     float2 obs_rand_filter;
     float3 obs_rand_time_lens;
@@ -127,6 +132,7 @@ void init_from_camera_main(uint3 tid : SV_DispatchThreadID)
     float2 obs_rand_lens;
     float3 T = integrate_camera_sample(pf, sample_arg, (int)c.x, (int)c.y, rng_fed,
                                        ray_P, ray_D, ray_tmin, ray_tmax, ray_time,
+                                       ray_dP, ray_dD,
                                        r_cache_miss,
                                        obs_rand_filter, obs_rand_time_lens,
                                        obs_rand_time, obs_rand_lens);

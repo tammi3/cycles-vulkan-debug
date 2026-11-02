@@ -158,8 +158,11 @@ void math_probe_main(uint3 tid : SV_DispatchThreadID)
         }
         float2 filter_uv = float2(c.fx, c.fy);
         float2 lens_uv = float2(0.0f, 0.0f);
-        float3 P, D; float tmin, tmax, time; bool ok;
-        camera_sample(pc_params, (int)c.x, (int)c.y, filter_uv, c.fz, lens_uv, P, D, tmin, tmax, time, ok);
+        // dP/dD: outputs of the M4f slice-4 differential port; the math
+        // probe does not REPORT them (its result layout and comparison stay
+        // unchanged) - they are gated by init_from_camera_body_probe.
+        float3 P, D; float tmin, tmax, time, dP, dD; bool ok;
+        camera_sample(pc_params, (int)c.x, (int)c.y, filter_uv, c.fz, lens_uv, P, D, tmin, tmax, time, dP, dD, ok);
         if (ok) {
             r.f[0] = P.x; r.f[1] = P.y; r.f[2] = P.z;
             r.f[3] = D.x; r.f[4] = D.y; r.f[5] = D.z;

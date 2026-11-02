@@ -1842,6 +1842,15 @@ struct MathProbeParams {
   float interocular_offset, shuttertime;
   int32_t rolling_shutter_type;
   float nearclip, cliplength;
+  /* M4f slice 4: camera ray differentials + the two body-only cam scalars
+   * (Slang MathParams fields of the same names, math_core.slang). cam.dx/dy
+   * are float4 in Cycles (types.h:1201-1202) but only xyz is consumed
+   * (make_float3 at camera.h:116-117), so only xyz is mirrored. */
+  float dx_x, dx_y, dx_z;
+  float dy_x, dy_y, dy_z;
+  float differential_scale;
+  float width; /* cam.width, float (types.h:1217) */
+  int32_t is_inside_volume;
   float pixel_jitter_x, pixel_jitter_y;
   float ctw_x_x, ctw_x_y, ctw_x_z, ctw_x_w;
   float ctw_y_x, ctw_y_y, ctw_y_z, ctw_y_w;
@@ -1854,7 +1863,7 @@ struct MathProbeParams {
   uint32_t seed, sobol_index_mask, blue_noise_sequence_length;
   int32_t neg_mode;
 };
-static_assert(sizeof(MathProbeParams) == 176, "MathParams layout must match Slang");
+static_assert(sizeof(MathProbeParams) == 212, "MathParams layout must match Slang");
 
 /* Push block: 3 device pointers + count = 32 bytes (matches Slang Push). */
 struct MathProbePush {
@@ -1982,6 +1991,14 @@ bool vulkan_math_probe(VulkanDevice *dev)
   mp.rolling_shutter_type = kd.cam.rolling_shutter_type;
   mp.nearclip = kd.cam.nearclip;
   mp.cliplength = kd.cam.cliplength;
+  /* M4f slice 4: differential inputs from the REAL camera (types.h:1201-1206)
+   * + the body-only cam scalars (types.h:1217,1222). Only xyz of cam.dx/dy
+   * is consumed by camera.h:116-117 (make_float3 drops .w). */
+  mp.dx_x = kd.cam.dx.x; mp.dx_y = kd.cam.dx.y; mp.dx_z = kd.cam.dx.z;
+  mp.dy_x = kd.cam.dy.x; mp.dy_y = kd.cam.dy.y; mp.dy_z = kd.cam.dy.z;
+  mp.differential_scale = kd.cam.differential_scale;
+  mp.width = kd.cam.width;
+  mp.is_inside_volume = kd.cam.is_inside_volume;
   /* NOTE: pixel_jitter is OVERRIDDEN to a non-FLT_MAX value so camera_sample
    * takes the no-table branch (raster += -pixel_jitter). The FLT_MAX
    * (Blackman-Harris filter-table) branch needs kernel_data.tables.lookup_table,
@@ -2654,6 +2671,14 @@ bool vulkan_init_from_camera_probe(VulkanDevice *dev)
   mp.rolling_shutter_type = kd.cam.rolling_shutter_type;
   mp.nearclip = kd.cam.nearclip;
   mp.cliplength = kd.cam.cliplength;
+  /* M4f slice 4: differential inputs from the REAL camera (types.h:1201-1206)
+   * + the body-only cam scalars (types.h:1217,1222). Only xyz of cam.dx/dy
+   * is consumed by camera.h:116-117 (make_float3 drops .w). */
+  mp.dx_x = kd.cam.dx.x; mp.dx_y = kd.cam.dx.y; mp.dx_z = kd.cam.dx.z;
+  mp.dy_x = kd.cam.dy.x; mp.dy_y = kd.cam.dy.y; mp.dy_z = kd.cam.dy.z;
+  mp.differential_scale = kd.cam.differential_scale;
+  mp.width = kd.cam.width;
+  mp.is_inside_volume = kd.cam.is_inside_volume;
   mp.pixel_jitter_x = 0.25f;
   mp.pixel_jitter_y = -0.5f;
   mp.ctw_x_x = kd.cam.cameratoworld.x.x; mp.ctw_x_y = kd.cam.cameratoworld.x.y;
@@ -4577,6 +4602,1067 @@ bool vulkan_film_queue_probe(VulkanDevice *dev)
                  "with the real Cycles reference).";
   LOG_INFO << "Vulkan: Film-queue probe: " << (all_ok ? "GATE MET." : "GATE NOT MET.");
   return all_ok;
+}
+
+/* =========================================================================
+ * M4f SLICE 4: integrator_init_from_camera BODY probe (optional, env
+ * CYCLES_VULKAN_INIT_FROM_CAMERA_BODY_PROBE=1)
+ * =========================================================================
+ * Gates the ported BODY (init_from_camera.slang: integrator_init_from_camera,
+ * source init_from_camera.h:57-143) against the REAL Cycles function called
+ * on the host. One call per case; the compared outputs ARE what the body
+ * writes: the full per-state slices (ray differentials dP/dD included), the
+ * film sample-count rows, the returned pixel-finished flag, and the queue
+ * counter net sums. Method is identical to slices 1-3 (host reference =
+ * the real function compiled into this binary).
+ *
+ * VARIANTS (whole-dispatch configs, one CLEAN run each - the body branch
+ * under test is selected by params.has_tile / pre-seeded SoA state / aux.w
+ * prefill; the table lives in init_from_camera_body_probe.slang's header):
+ *   V0 tile / V1 restart / V2 tile+is_inside_volume / V3 need=false.
+ * The cache_miss and is_zero(T) branches are UNREACHABLE in the covered
+ * config (documented in init_from_camera.slang's header) - not exercised.
+ *
+ * NEGATIVES (one fault per dispatch, applied OUTSIDE the ported code: the
+ * body has no switch; the host reference is ALWAYS the CLEAN variant):
+ *   N1 base V0: tile_offset +1          (params value)
+ *   N2 base V1: pre-seeded path.sample +1 (SoA INPUT payload, re-uploaded)
+ *   N3 base V0: is_inside_volume flip   (params value)
+ *   N4 base V0: tile_sample_offset +1   (params value)
+ * Region masks are computed by NAME after the slice table is built (a
+ * negative is DETECTED only if a masked region differs; anything else
+ * differing - or a canary breaking - is spillover and fails the gate).
+ *
+ * COMPARISON POLICY (user ruling for this slice): integer / passthrough
+ * words RAW-BIT (film rows, counters, out.ret, u8/u16/u32 state members,
+ * canaries); computed float words |gpu-ref| <= 1e-5*max(1,|ref|) - the
+ * established GPU-vs-CPU float policy (kernels.cpp:2494 / :3065). */
+
+/* ---- Locked layouts (kernels.cpp <-> init_from_camera_body_probe.slang) -- */
+struct IfcBodyCase {
+  uint32_t x, y;
+  int32_t scheduled_sample;
+  uint32_t rpi_seed;     // SoA INPUT path.render_pixel_index (V1 restart)
+  int32_t sample_seed;   // SoA INPUT path.sample (V1 read / V3 passthrough)
+};
+static_assert(sizeof(IfcBodyCase) == 20, "IfcBodyCase layout must match Slang");
+
+struct IfcBodyParams {
+  MathProbeParams mp;    // 212 B, same layout as Slang MathParams
+  int32_t has_tile;
+  int32_t tile_offset;
+  uint32_t tile_stride;
+  int32_t tile_sample_offset;
+  int32_t pass_stride;
+  int32_t pass_adaptive_aux_buffer;
+  int32_t pass_sample_count;
+  int32_t pass_volume_majorant;
+  int32_t pass_volume_majorant_sample_count;
+  uint32_t kernel_features;
+  int32_t background_object_index;
+  int32_t background_volume_shader;
+  uint32_t render_buffer_valid;
+};
+static_assert(sizeof(IfcBodyParams) == 264, "IfcBodyParams layout must match Slang");
+
+struct IfcBodyOut {
+  uint32_t ret;
+};
+static_assert(sizeof(IfcBodyOut) == 4, "IfcBodyOut layout must match Slang");
+
+struct IfcBodyPush {
+  VkDeviceAddress cases, out, params, ist, rb_f, rb_u;
+  uint32_t num_cases, pad0;
+};
+static_assert(sizeof(IfcBodyPush) == 56, "IfcBodyPush layout must match Slang");
+
+constexpr uint32_t IFCB_PUSH_BYTES = 56;
+constexpr uint32_t IFCB_CANARY_WORDS = 4;
+constexpr uint32_t IFCB_CANARY = 0x6A6A6A6Au;   // slice-private canary pattern
+constexpr uint32_t IFCB_SENTINEL = 0xABABABABu; // out prefill (diagnostic)
+constexpr size_t IFCB_NUM_SLICES = 37;          // must equal sl.size() below
+
+/* Compared regions. Slice regions are0..36 in table order; the fixed ones
+ * follow. A negative may only change the regions in its mask. */
+enum {
+  IFCB_R_RB_ROWS = (int)IFCB_NUM_SLICES, /* render buffer rows [0,28288) (N1) */
+  IFCB_R_RB_EXT,      /* extension rows 28288..30239 (N1)                    */
+  IFCB_R_RB_TAIL,     /* protected tail 30240..30399 (no negative may touch)  */
+  IFCB_R_COUNTERS,    /* queue counter block (N3)                            */
+  IFCB_R_OUT_RET,     /* out.ret words                                       */
+  IFCB_R_OUT_TAIL,    /* out canary tail                                     */
+  IFCB_R_CTR_TAIL,    /* counter canary tail                                 */
+  IFCB_R_SOA_CANARY,  /* SoA slice canaries                                  */
+  IFCB_NUM_REGIONS    /* = 45                                                */
+};
+
+/* One SoA slice: mirror slot (IntegratorStateGPU byte offset, filled with a
+ * device address), host slot (IntegratorStateCPU byte offset of the same
+ * member - slice-2's mapping), element size, float-ness, layout offset. */
+struct IfcSlice {
+  const char *name;
+  size_t mirror;
+  size_t host;
+  uint32_t elem;
+  bool is_float;
+  size_t off; /* filled by the layout loop */
+};
+
+struct IfcBodyResources {
+  VkDevice device = VK_NULL_HANDLE;
+  VkShaderModule module = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+  VkBuffer cases_buffer = VK_NULL_HANDLE, out_buffer = VK_NULL_HANDLE,
+           params_buffer = VK_NULL_HANDLE, ist_buffer = VK_NULL_HANDLE,
+           rb_buffer = VK_NULL_HANDLE, ctr_buffer = VK_NULL_HANDLE,
+           soa_buffer = VK_NULL_HANDLE;
+  VkDeviceMemory cases_memory = VK_NULL_HANDLE, out_memory = VK_NULL_HANDLE,
+                 params_memory = VK_NULL_HANDLE, ist_memory = VK_NULL_HANDLE,
+                 rb_memory = VK_NULL_HANDLE, ctr_memory = VK_NULL_HANDLE,
+                 soa_memory = VK_NULL_HANDLE;
+
+  ~IfcBodyResources()
+  {
+    if (device == VK_NULL_HANDLE) return;
+    if (pipeline) vkDestroyPipeline(device, pipeline, nullptr);
+    if (layout) vkDestroyPipelineLayout(device, layout, nullptr);
+    if (module) vkDestroyShaderModule(device, module, nullptr);
+    if (pool) vkDestroyCommandPool(device, pool, nullptr);
+    if (fence) vkDestroyFence(device, fence, nullptr);
+    if (cases_buffer) vkDestroyBuffer(device, cases_buffer, nullptr);
+    if (out_buffer) vkDestroyBuffer(device, out_buffer, nullptr);
+    if (params_buffer) vkDestroyBuffer(device, params_buffer, nullptr);
+    if (ist_buffer) vkDestroyBuffer(device, ist_buffer, nullptr);
+    if (rb_buffer) vkDestroyBuffer(device, rb_buffer, nullptr);
+    if (ctr_buffer) vkDestroyBuffer(device, ctr_buffer, nullptr);
+    if (soa_buffer) vkDestroyBuffer(device, soa_buffer, nullptr);
+    if (cases_memory) vkFreeMemory(device, cases_memory, nullptr);
+    if (out_memory) vkFreeMemory(device, out_memory, nullptr);
+    if (params_memory) vkFreeMemory(device, params_memory, nullptr);
+    if (ist_memory) vkFreeMemory(device, ist_memory, nullptr);
+    if (rb_memory) vkFreeMemory(device, rb_memory, nullptr);
+    if (ctr_memory) vkFreeMemory(device, ctr_memory, nullptr);
+    if (soa_memory) vkFreeMemory(device, soa_memory, nullptr);
+  }
+};
+
+bool vulkan_init_from_camera_body_probe(VulkanDevice *dev)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+  if (getenv("CYCLES_VULKAN_INIT_FROM_CAMERA_BODY_PROBE") == nullptr) return true;
+
+  LOG_INFO << "Vulkan: Init-from-camera body probe starting "
+              "(CYCLES_VULKAN_INIT_FROM_CAMERA_BODY_PROBE=1).";
+
+  IfcBodyResources res;
+  const VkDevice vk_dev = dev->vk_device();
+  res.device = vk_dev;
+
+  /* ---- 1. SPIR-V (env override or cwd default) ---- */
+  std::vector<char> spirv;
+  const char *env_path = getenv("CYCLES_VULKAN_INIT_FROM_CAMERA_BODY_PROBE_SPV");
+  const char *candidates[2] = {env_path, "init_from_camera_body_probe.spv"};
+  const char *found = nullptr;
+  for (const char *cand : candidates) {
+    if (cand && probe_read_whole_file(cand, spirv)) {
+      found = cand;
+      break;
+    }
+  }
+  if (!found) {
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: cannot find "
+                 "init_from_camera_body_probe.spv (compile it with slangc or set "
+                 "CYCLES_VULKAN_INIT_FROM_CAMERA_BODY_PROBE_SPV).";
+    return false;
+  }
+  if (spirv.size() % 4 != 0) {
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: '" << found
+              << "' is not a valid SPIR-V module.";
+    return false;
+  }
+  LOG_INFO << "Vulkan: Init-from-camera body probe: spirv='" << found << "' ("
+           << spirv.size() << " bytes).";
+
+  /* ---- 2. Shader module ---- */
+  VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = spirv.size();
+  smi.pCode = reinterpret_cast<const uint32_t *>(spirv.data());
+  if (vkCreateShaderModule(vk_dev, &smi, nullptr, &res.module) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: vkCreateShaderModule failed.";
+    return false;
+  }
+
+  /* ---- 3. Pipeline layout (one 56-byte push range) ---- */
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(dev->vk_physical_device(), &props);
+  if (props.limits.maxPushConstantsSize < IFCB_PUSH_BYTES) {
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: maxPushConstantsSize too small.";
+    return false;
+  }
+  VkPushConstantRange pcr{};
+  pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pcr.offset = 0;
+  pcr.size = IFCB_PUSH_BYTES;
+  VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pli.pushConstantRangeCount = 1;
+  pli.pPushConstantRanges = &pcr;
+  if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &res.layout) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: pipeline layout creation failed.";
+    return false;
+  }
+
+  /* ---- 4. Compute pipeline (entry "main"; slangc renames) ---- */
+  VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  cpi.stage.module = res.module;
+  cpi.stage.pName = "main";
+  cpi.layout = res.layout;
+  if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr, &res.pipeline) !=
+      VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: compute pipeline creation failed.";
+    return false;
+  }
+
+  /* ---- 5. MathParams from the REAL kernel data + covered-config guard ----
+   * Same fill as the math / slice-1 init-from-camera probes (the struct is
+   * shared: static_assert(sizeof(MathProbeParams) == 212) locks it), plus
+   * the same two overrides so the GPU port and the REAL host call take the
+   * same raster branch (pixel_jitter != FLT_MAX skips the filter table;
+   * SOBOL_BURLEY selects the ported sampling path). */
+  const KernelData &kd = dev->host_kernel_data();
+  IfcBodyParams bp{};
+  bp.mp.cam_type = kd.cam.type;
+  bp.mp.have_perspective_motion = kd.cam.have_perspective_motion;
+  bp.mp.aperturesize = kd.cam.aperturesize;
+  bp.mp.num_motion_steps = kd.cam.num_motion_steps;
+  bp.mp.interocular_offset = kd.cam.interocular_offset;
+  bp.mp.shuttertime = kd.cam.shuttertime;
+  bp.mp.rolling_shutter_type = kd.cam.rolling_shutter_type;
+  bp.mp.nearclip = kd.cam.nearclip;
+  bp.mp.cliplength = kd.cam.cliplength;
+  /* M4f slice 4 differential inputs (types.h:1201-1206) + the body-only cam
+   * scalars (types.h:1217 width, types.h:1222 is_inside_volume). Only xyz of
+   * cam.dx/dy is consumed (make_float3 at camera.h:116-117). */
+  bp.mp.dx_x = kd.cam.dx.x;
+  bp.mp.dx_y = kd.cam.dx.y;
+  bp.mp.dx_z = kd.cam.dx.z;
+  bp.mp.dy_x = kd.cam.dy.x;
+  bp.mp.dy_y = kd.cam.dy.y;
+  bp.mp.dy_z = kd.cam.dy.z;
+  bp.mp.differential_scale = kd.cam.differential_scale;
+  bp.mp.width = kd.cam.width;
+  bp.mp.is_inside_volume = kd.cam.is_inside_volume;
+  bp.mp.pixel_jitter_x = 0.25f;
+  bp.mp.pixel_jitter_y = -0.5f;
+  bp.mp.ctw_x_x = kd.cam.cameratoworld.x.x;
+  bp.mp.ctw_x_y = kd.cam.cameratoworld.x.y;
+  bp.mp.ctw_x_z = kd.cam.cameratoworld.x.z;
+  bp.mp.ctw_x_w = kd.cam.cameratoworld.x.w;
+  bp.mp.ctw_y_x = kd.cam.cameratoworld.y.x;
+  bp.mp.ctw_y_y = kd.cam.cameratoworld.y.y;
+  bp.mp.ctw_y_z = kd.cam.cameratoworld.y.z;
+  bp.mp.ctw_y_w = kd.cam.cameratoworld.y.w;
+  bp.mp.ctw_z_x = kd.cam.cameratoworld.z.x;
+  bp.mp.ctw_z_y = kd.cam.cameratoworld.z.y;
+  bp.mp.ctw_z_z = kd.cam.cameratoworld.z.z;
+  bp.mp.ctw_z_w = kd.cam.cameratoworld.z.w;
+  bp.mp.rtc_x_x = kd.cam.rastertocamera.x.x;
+  bp.mp.rtc_x_y = kd.cam.rastertocamera.x.y;
+  bp.mp.rtc_x_z = kd.cam.rastertocamera.x.z;
+  bp.mp.rtc_x_w = kd.cam.rastertocamera.x.w;
+  bp.mp.rtc_y_x = kd.cam.rastertocamera.y.x;
+  bp.mp.rtc_y_y = kd.cam.rastertocamera.y.y;
+  bp.mp.rtc_y_z = kd.cam.rastertocamera.y.z;
+  bp.mp.rtc_y_w = kd.cam.rastertocamera.y.w;
+  bp.mp.rtc_z_x = kd.cam.rastertocamera.z.x;
+  bp.mp.rtc_z_y = kd.cam.rastertocamera.z.y;
+  bp.mp.rtc_z_z = kd.cam.rastertocamera.z.z;
+  bp.mp.rtc_z_w = kd.cam.rastertocamera.z.w;
+  bp.mp.rtc_w_x = kd.cam.rastertocamera.w.x;
+  bp.mp.rtc_w_y = kd.cam.rastertocamera.w.y;
+  bp.mp.rtc_w_z = kd.cam.rastertocamera.w.z;
+  bp.mp.rtc_w_w = kd.cam.rastertocamera.w.w;
+  bp.mp.sampling_pattern = SAMPLING_PATTERN_SOBOL_BURLEY;
+  bp.mp.sobol_index_mask = (uint32_t)kd.integrator.sobol_index_mask;
+  bp.mp.blue_noise_sequence_length = (uint32_t)kd.integrator.blue_noise_sequence_length;
+  bp.mp.seed = 0;
+  bp.mp.neg_mode = 0;
+
+  /* Body scalars (kg -> explicit cited args; values = slice-3's forced film
+   * layout so both sides address the same slots). */
+  bp.has_tile = 1;
+  bp.tile_offset = FQ_TILE_OFFSET;
+  bp.tile_stride = FQ_TILE_STRIDE;
+  bp.tile_sample_offset = 0;
+  bp.pass_stride = FQ_FILM_STRIDE;
+  bp.pass_adaptive_aux_buffer = FQ_PASS_ADAPTIVE_AUX;
+  bp.pass_sample_count = FQ_PASS_SAMPLE_COUNT;
+  bp.pass_volume_majorant = FQ_PASS_VOLUME_MAJORANT;
+  bp.pass_volume_majorant_sample_count = FQ_PASS_VOLUME_MAJORANT_COUNT;
+  /* Forced feature/background bits: slice-2 precedent (kernels.cpp state-init
+   * probe) - real kd value OR the four bits the ported path_state_init_
+   * integrator has branches for, so both sides take the same branches. */
+  bp.kernel_features = kd.kernel_features | (1u << 10u) /* NODE_PORTAL */ |
+                       (1u << 18u) /* VOLUME */ | (1u << 28u) /* LIGHT_LINKING */ |
+                       (1u << 30u) /* DENOISING */;
+  bp.background_object_index = 41;
+  bp.background_volume_shader = 43;
+  bp.render_buffer_valid = 1u; /* the gate always passes a real buffer */
+
+  LOG_INFO << "Vulkan: Init-from-camera body probe: cam.type=" << bp.mp.cam_type
+           << " shuttertime=" << bp.mp.shuttertime
+           << " aperturesize=" << bp.mp.aperturesize
+           << " width=" << bp.mp.width << " sampling_pattern=" << bp.mp.sampling_pattern
+           << " have_persp_motion=" << bp.mp.have_perspective_motion
+           << " num_motion_steps=" << bp.mp.num_motion_steps
+           << " interocular=" << bp.mp.interocular_offset
+           << " kernel_features 0x" << std::hex << bp.kernel_features << std::dec;
+
+  /* ---- covered-config guard (same as slice 1) ----
+   * The Slang camera_sample port covers ONLY perspective + no DOF + no
+   * motion + no stereo + no filter table. Outside it the port cannot
+   * produce the real ray, so this gate cannot be met for the scene: fail
+   * loudly instead of comparing against values the port never computes
+   * (AGENTS.md section 5: no inventing). width==0 would additionally
+   * divide by zero in the REAL restart reference (init_from_camera.h:72). */
+  if (bp.mp.cam_type != 0 /* CAMERA_PERSPECTIVE */ || bp.mp.shuttertime != -1.0f ||
+      bp.mp.aperturesize != 0.0f || bp.mp.have_perspective_motion != 0 ||
+      bp.mp.num_motion_steps != 0 || bp.mp.interocular_offset != 0.0f ||
+      bp.mp.width == 0.0f) {
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: scene camera is outside the "
+                 "covered config (perspective, aperture 0, shuttertime -1, no "
+                 "motion/stereo, width != 0); the slice-4 gate cannot be met for "
+                 "this scene.";
+    return false;
+  }
+
+  /* ---- host reference globals (REAL Cycles functions) ----
+   * Same construction as the slice-1 probe: KernelGlobalsCPU from the real
+   * kernel data with the forced film / feature / jitter overrides, so the
+   * real integrator_init_from_camera takes the same branches with the same
+   * data the GPU body gets through IfcBodyParams. lookup_table stays empty
+   * (pixel_jitter != FLT_MAX skips the filter table; shuttertime == -1 skips
+   * the shutter table). */
+  KernelGlobalsCPU kg_cpu;
+  kg_cpu.data = kd;
+  kg_cpu.data.film.pass_stride = FQ_FILM_STRIDE;
+  kg_cpu.data.film.pass_sample_count = FQ_PASS_SAMPLE_COUNT;
+  kg_cpu.data.film.pass_adaptive_aux_buffer = FQ_PASS_ADAPTIVE_AUX;
+  kg_cpu.data.film.pass_volume_majorant = FQ_PASS_VOLUME_MAJORANT;
+  kg_cpu.data.film.pass_volume_majorant_sample_count = FQ_PASS_VOLUME_MAJORANT_COUNT;
+  kg_cpu.data.integrator.pixel_jitter = make_float2(bp.mp.pixel_jitter_x, bp.mp.pixel_jitter_y);
+  kg_cpu.data.integrator.sampling_pattern = SAMPLING_PATTERN_SOBOL_BURLEY;
+  kg_cpu.data.kernel_features = bp.kernel_features;
+  kg_cpu.data.background.object_index = bp.background_object_index;
+  kg_cpu.data.background.volume_shader = bp.background_volume_shader;
+  Profiler ifcb_profiler;
+  /* (ThreadKernelGlobalsCPU is re-created per variant inside the reference
+   * loop so the per-variant cam.is_inside_volume override is definitely the
+   * value the real call reads, whether tkg copies or references kg_cpu.) */
+
+  /* ---- 6. Case list: slice-3's grid - 64x12 = 768 unique pixels ---- */
+  const uint32_t samples6[6] = {0, 1, 5, 15, 255, 1023};
+  std::vector<IfcBodyCase> cases;
+  for (int y = 0; y < FQ_NUM_Y; y++) {
+    for (int x = 0; x < FQ_NUM_X; x++) {
+      IfcBodyCase c{};
+      const uint32_t i = (uint32_t)cases.size();
+      c.x = (uint32_t)x;
+      c.y = (uint32_t)y;
+      c.scheduled_sample = (int32_t)samples6[i % 6u];
+      /* V1 restart seeds: rpi 1000+i (same span the tile modes produce, so
+       * the reconstruction stays in-range even if a bug routed a restart
+       * case into the film path); sample varies so N2 has a per-case fault. */
+      c.rpi_seed = (uint32_t)(FQ_TILE_OFFSET + (int)i);
+      c.sample_seed = (int32_t)samples6[i % 6u];
+      cases.push_back(c);
+    }
+  }
+  const uint32_t num_cases = (uint32_t)cases.size();
+  LOG_INFO << "Vulkan: Init-from-camera body probe: " << num_cases << " cases, "
+           << (num_cases + 63) / 64 << " workgroups of 64 threads.";
+
+  /* ---- 7. Slice table: every member the real body writes (37 entries) ----
+   * MIS = offsetof in the IntegratorStateGPU pointer mirror, HIS = offsetof
+   * in the IntegratorStateCPU AoS struct - the exact table of the slice-2
+   * state-init probe (path_state_init + path_state_init_integrator +
+   * integrator_state_write_ray = the body's state writers), re-derived here
+   * so this gate stays independent of that probe's verdict. */
+#define IFBC_MIS(m) offsetof(IntegratorStateGPU, m)
+#define IFBC_HIS(m) offsetof(IntegratorStateCPU, m)
+  std::vector<IfcSlice> sl;
+  auto add = [&](const char *name, size_t mirror, size_t host, uint32_t elem, bool flt) {
+    sl.push_back(IfcSlice{name, mirror, host, elem, flt, 0});
+  };
+  add("path.render_pixel_index", IFBC_MIS(path.render_pixel_index),
+      IFBC_HIS(path.render_pixel_index), 4, false);
+  add("path.sample", IFBC_MIS(path.sample), IFBC_HIS(path.sample), 4, false);
+  add("path.bounce", IFBC_MIS(path.bounce), IFBC_HIS(path.bounce), 2, false);
+  add("path.diffuse_bounce", IFBC_MIS(path.diffuse_bounce), IFBC_HIS(path.diffuse_bounce), 2,
+      false);
+  add("path.glossy_bounce", IFBC_MIS(path.glossy_bounce), IFBC_HIS(path.glossy_bounce), 2,
+      false);
+  add("path.transmission_bounce", IFBC_MIS(path.transmission_bounce),
+      IFBC_HIS(path.transmission_bounce), 2, false);
+  add("path.transparent_bounce", IFBC_MIS(path.transparent_bounce),
+      IFBC_HIS(path.transparent_bounce), 2, false);
+  add("path.volume_bounce", IFBC_MIS(path.volume_bounce), IFBC_HIS(path.volume_bounce), 2,
+      false);
+  add("path.volume_bounds_bounce", IFBC_MIS(path.volume_bounds_bounce),
+      IFBC_HIS(path.volume_bounds_bounce), 2, false);
+  add("path.portal_bounce", IFBC_MIS(path.portal_bounce), IFBC_HIS(path.portal_bounce), 2,
+      false);
+  add("path.queued_kernel", IFBC_MIS(path.queued_kernel), IFBC_HIS(path.queued_kernel), 2,
+      false);
+  add("path.rng_pixel", IFBC_MIS(path.rng_pixel), IFBC_HIS(path.rng_pixel), 4, false);
+  add("path.rng_offset", IFBC_MIS(path.rng_offset), IFBC_HIS(path.rng_offset), 2, false);
+  add("path.visibility", IFBC_MIS(path.visibility), IFBC_HIS(path.visibility), 1, false);
+  add("path.flag", IFBC_MIS(path.flag), IFBC_HIS(path.flag), 4, false);
+  add("path.mnee", IFBC_MIS(path.mnee), IFBC_HIS(path.mnee), 1, false);
+  add("path.mis_ray_pdf", IFBC_MIS(path.mis_ray_pdf), IFBC_HIS(path.mis_ray_pdf), 4, true);
+  add("path.min_ray_pdf", IFBC_MIS(path.min_ray_pdf), IFBC_HIS(path.min_ray_pdf), 4, true);
+  add("path.continuation_probability", IFBC_MIS(path.continuation_probability),
+      IFBC_HIS(path.continuation_probability), 4, true);
+  add("path.throughput", IFBC_MIS(path.throughput), IFBC_HIS(path.throughput), 12, true);
+  add("path.optical_depth", IFBC_MIS(path.optical_depth), IFBC_HIS(path.optical_depth), 4,
+      true);
+  add("path.mis_ray_object", IFBC_MIS(path.mis_ray_object), IFBC_HIS(path.mis_ray_object), 4,
+      false);
+  add("path.denoising_feature_throughput",
+      IFBC_MIS(path.denoising_feature_throughput),
+      IFBC_HIS(path.denoising_feature_throughput), 12, true);
+  add("isect.object", IFBC_MIS(isect.object), IFBC_HIS(isect.object), 4, false);
+  add("isect.prim", IFBC_MIS(isect.prim), IFBC_HIS(isect.prim), 4, false);
+  add("isect.type", IFBC_MIS(isect.type), IFBC_HIS(isect.type), 4, false);
+  {
+    /* volume_stack: mirror is {int* object; int* shader} stride 16, CPU is
+     * {int object; int shader} stride 8 (slice-2 record). */
+    const size_t vs_m = IFBC_MIS(volume_stack);
+    const size_t vs_h = IFBC_HIS(volume_stack);
+    for (uint32_t slot = 0; slot < 2; slot++) {
+      add(slot == 0 ? "volume_stack[0].object" : "volume_stack[1].object",
+          vs_m + (size_t)slot * 16 + 0, vs_h + (size_t)slot * 8 + 0, 4, false);
+      add(slot == 0 ? "volume_stack[0].shader" : "volume_stack[1].shader",
+          vs_m + (size_t)slot * 16 + 8, vs_h + (size_t)slot * 8 + 4, 4, false);
+    }
+  }
+  add("ray.P", IFBC_MIS(ray.P), IFBC_HIS(ray.P), 12, true);
+  add("ray.D", IFBC_MIS(ray.D), IFBC_HIS(ray.D), 12, true);
+  add("ray.dP", IFBC_MIS(ray.dP), IFBC_HIS(ray.dP), 4, true);
+  add("ray.dD", IFBC_MIS(ray.dD), IFBC_HIS(ray.dD), 4, true);
+  add("ray.tmin", IFBC_MIS(ray.tmin), IFBC_HIS(ray.tmin), 4, true);
+  add("ray.tmax", IFBC_MIS(ray.tmax), IFBC_HIS(ray.tmax), 4, true);
+  add("ray.time", IFBC_MIS(ray.time), IFBC_HIS(ray.time), 4, true);
+
+  if (sl.size() != IFCB_NUM_SLICES) {
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: slice table has " << sl.size()
+              << " entries, expected " << IFCB_NUM_SLICES << ".";
+    return false;
+  }
+
+  /* Slice region indices by NAME (used for the negative masks and the N2
+   * input fault) - looked up instead of hardcoded so a table reorder cannot
+   * silently mis-mask a negative. */
+  int i_rpi = -1, i_sample = -1, i_queued = -1, i_rng = -1, i_rP = -1, i_rD = -1;
+  int i_rdP = -1, i_rdD = -1, i_rtmax = -1, i_rtime = -1;
+  for (size_t s = 0; s < sl.size(); s++) {
+    if (strcmp(sl[s].name, "path.render_pixel_index") == 0) i_rpi = (int)s;
+    if (strcmp(sl[s].name, "path.sample") == 0) i_sample = (int)s;
+    if (strcmp(sl[s].name, "path.queued_kernel") == 0) i_queued = (int)s;
+    if (strcmp(sl[s].name, "path.rng_pixel") == 0) i_rng = (int)s;
+    if (strcmp(sl[s].name, "ray.P") == 0) i_rP = (int)s;
+    if (strcmp(sl[s].name, "ray.D") == 0) i_rD = (int)s;
+    if (strcmp(sl[s].name, "ray.dP") == 0) i_rdP = (int)s;
+    if (strcmp(sl[s].name, "ray.dD") == 0) i_rdD = (int)s;
+    if (strcmp(sl[s].name, "ray.tmax") == 0) i_rtmax = (int)s;
+    if (strcmp(sl[s].name, "ray.time") == 0) i_rtime = (int)s;
+  }
+  if (i_rpi < 0 || i_sample < 0 || i_queued < 0 || i_rng < 0 || i_rP < 0 || i_rD < 0 ||
+      i_rdP < 0 || i_rdD < 0 || i_rtmax < 0 || i_rtime < 0) {
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: slice table lookup failed.";
+    return false;
+  }
+
+  /* Region masks per negative (bit r set = negative n may change region r):
+   *   N1 tile_offset+1  -> render_pixel_index + the film rows it addresses
+   *                        (row rpi+1 reads keep film_write_sample's old
+   *                        value identical: count rows are single-writer in
+   *                        both runs, so sample/rng/ray stay clean);
+   *   N2 sample seed+1  -> path.sample, rng_pixel and the rng-derived ray
+   *                        members (ray.tmin excluded: constant 0.0f);
+   *   N3 volume flip    -> queued_kernel + the counter block;
+   *   N4 sample_off+1   -> the film_write_sample return feeds sample/rng/ray
+   *                        (the count ROW gets +1 either way: unchanged). */
+  const uint64_t rng_ray_regions = (1ull << i_sample) | (1ull << i_rng) | (1ull << i_rP) |
+                                   (1ull << i_rD) | (1ull << i_rdP) | (1ull << i_rdD) |
+                                   (1ull << i_rtmax) | (1ull << i_rtime);
+  const uint64_t neg_allowed[5] = {
+      0ull,
+      (1ull << i_rpi) | (1ull << IFCB_R_RB_ROWS) | (1ull << IFCB_R_RB_EXT),
+      rng_ray_regions,
+      (1ull << i_queued) | (1ull << IFCB_R_COUNTERS),
+      rng_ray_regions,
+  };
+  const char *neg_name[5] = {"", "tile_offset+1", "restart-sample+1",
+                             "is_inside_volume-flip", "tile_sample_offset+1"};
+  const int neg_base_variant[5] = {0, 0, 1, 0, 0};
+
+  /* ---- 8. SoA layout: each slice = elem*num_cases (4-aligned) + 16-B canary ---- */
+  size_t soa_size = 0;
+  for (auto &s : sl) {
+    soa_size = (soa_size + 3) & ~(size_t)3;
+    s.off = soa_size;
+    size_t payload = (size_t)s.elem * num_cases;
+    payload = (payload + 3) & ~(size_t)3;
+    soa_size += payload + (size_t)IFCB_CANARY_WORDS * 4;
+  }
+
+  /* ---- 9. Allocate the seven buffers ---- */
+  auto make_buffer = [&](VkDeviceSize size, VkBuffer &buf, VkDeviceMemory &mem,
+                         uint64_t &addr) -> bool {
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = size;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    if (vkCreateBuffer(vk_dev, &bci, nullptr, &buf) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera body probe: buffer creation failed.";
+      return false;
+    }
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(vk_dev, buf, &reqs);
+    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &flags_info;
+    ai.allocationSize = reqs.size;
+    ai.memoryTypeIndex = dev->find_memory_type(
+        reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (ai.memoryTypeIndex == UINT32_MAX) {
+      LOG_ERROR << "Vulkan: Init-from-camera body probe: no host-visible+coherent memory "
+                   "type.";
+      return false;
+    }
+    if (vkAllocateMemory(vk_dev, &ai, nullptr, &mem) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera body probe: memory allocation failed.";
+      return false;
+    }
+    if (vkBindBufferMemory(vk_dev, buf, mem, 0) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera body probe: bind buffer memory failed.";
+      return false;
+    }
+    VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    bai.buffer = buf;
+    addr = vkGetBufferDeviceAddress(vk_dev, &bai);
+    if (addr == 0) {
+      LOG_ERROR << "Vulkan: Init-from-camera body probe: vkGetBufferDeviceAddress returned "
+                   "0.";
+      return false;
+    }
+    return true;
+  };
+
+  uint64_t cases_addr = 0, out_addr = 0, params_addr = 0, ist_addr = 0, rb_addr = 0,
+           ctr_addr = 0, soa_addr = 0;
+  const VkDeviceSize cases_bytes = (VkDeviceSize)num_cases * sizeof(IfcBodyCase);
+  const VkDeviceSize out_bytes =
+      (VkDeviceSize)num_cases * sizeof(IfcBodyOut) + IFCB_CANARY_WORDS * 4;
+  const VkDeviceSize params_bytes = sizeof(IfcBodyParams);
+  const VkDeviceSize ist_bytes = sizeof(IntegratorStateGPU);
+  const VkDeviceSize rb_bytes = (VkDeviceSize)FQ_RB_FLOATS * 4;
+  const VkDeviceSize ctr_bytes = 128; /* payload 19 words (76 B) + canary tail */
+  const VkDeviceSize soa_bytes = (VkDeviceSize)soa_size;
+  if (!make_buffer(cases_bytes, res.cases_buffer, res.cases_memory, cases_addr) ||
+      !make_buffer(out_bytes, res.out_buffer, res.out_memory, out_addr) ||
+      !make_buffer(params_bytes, res.params_buffer, res.params_memory, params_addr) ||
+      !make_buffer(ist_bytes, res.ist_buffer, res.ist_memory, ist_addr) ||
+      !make_buffer(rb_bytes, res.rb_buffer, res.rb_memory, rb_addr) ||
+      !make_buffer(ctr_bytes, res.ctr_buffer, res.ctr_memory, ctr_addr) ||
+      !make_buffer(soa_bytes, res.soa_buffer, res.soa_memory, soa_addr)) {
+    return false;
+  }
+
+  /* ---- 10. Render-buffer initial fill, per variant ----
+   * Geometry = slice-3's: rows [0,28288) hold the case pixels (rows
+   * 1000..1767 = the 768 cases at stride 16), [28288,30240) is the N1
+   * extension (tile_offset+1 addresses row 1768), [30240,30400) is the
+   * protected tail. Count slots (row+0) start at 0 so film_write_sample's
+   * atomic old-value is deterministic and identical under N1 (single writer
+   * per addressed row in both runs); aux.w (row+7) is 1.0f in V3 only,
+   * which is what makes film_need_sample_pixel return false there. */
+  std::vector<std::vector<float>> rb_init(4, std::vector<float>(FQ_RB_FLOATS, 0.0f));
+  for (int i = 0; i < (int)num_cases; i++) {
+    const size_t row = (size_t)(FQ_TILE_OFFSET + i);
+    rb_init[3][row * 16 + 7] = 1.0f; /* V3: aux.w prefill -> need == false */
+  }
+
+  /* ---- 11. SoA INPUT payload, per variant ----
+   * Zero everywhere except the two seeded members: V1 (restart) pre-seeds
+   * path.render_pixel_index with rpi_seed (init_from_camera.h:71 reads it)
+   * and path.sample with sample_seed (:74); every variant seeds path.sample
+   * (V0/V2 overwrite it via film_write_sample, V3 keeps it as passthrough,
+   * V1 reads it). rpi stays 0 in the tile variants so their
+   * path_state_init write is provably a write (expected = 1000+x+y*64). */
+  std::vector<std::vector<uint8_t>> input_soa(4, std::vector<uint8_t>(soa_size, 0));
+  for (uint32_t v = 0; v < 4; v++) {
+    for (uint32_t i = 0; i < num_cases; i++) {
+      IntegratorStateCPU st0;
+      memset(&st0, 0, sizeof(st0));
+      st0.path.render_pixel_index = (v == 1) ? cases[i].rpi_seed : 0u;
+      st0.path.sample = (uint32_t)cases[i].sample_seed;
+      for (const auto &s : sl) {
+        memcpy(input_soa[v].data() + s.off + (size_t)s.elem * i,
+               reinterpret_cast<const char *>(&st0) + s.host, s.elem);
+      }
+    }
+  }
+
+  /* ---- 12. EXPECTED bytes from the REAL integrator_init_from_camera ----
+   * One IntegratorStateCPU per case, seeded exactly like the SoA input,
+   * then the REAL function (init_from_camera.h:57-143 compiled into this
+   * binary) runs on it: the mutated ref_rb becomes the expected film rows,
+   * the CPU struct bytes become the expected state slices, out.ret is the
+   * returned bool, and the counter net sums are gathered alongside (the CPU
+   * queue branch omits counter updates - the same documented caveat as
+   * slice 3: expected = net sums of the GPU-branch atomics). */
+  std::vector<std::vector<uint8_t>> exp_soa(4, std::vector<uint8_t>(soa_size, 0));
+  std::vector<std::vector<float>> ref_rb = rb_init;
+  std::vector<std::vector<IfcBodyOut>> exp_out(4, std::vector<IfcBodyOut>(num_cases));
+  std::vector<std::vector<int32_t>> net(4, std::vector<int32_t>(19, 0));
+  {
+    KernelWorkTile tile{};
+    tile.offset = FQ_TILE_OFFSET;
+    tile.stride = FQ_TILE_STRIDE;
+    tile.sample_offset = 0; /* CLEAN value; N4's fault is GPU-only */
+    for (uint32_t v = 0; v < 4; v++) {
+      /* Per-variant camera override: V2's branch under test is
+       * is_inside_volume != 0 (init_from_camera.h:134-138). Built fresh per
+       * variant so the override is definitely seen by the real call. */
+      kg_cpu.data.cam.is_inside_volume = (v == 2) ? 1 : 0;
+      ThreadKernelGlobalsCPU tkg_v(kg_cpu, nullptr, ifcb_profiler, 0);
+      KernelGlobals kg_v = &tkg_v;
+      uint32_t n_ret1 = 0;
+      for (uint32_t i = 0; i < num_cases; i++) {
+        const IfcBodyCase &c = cases[i];
+        IntegratorStateCPU st;
+        memset(&st, 0, sizeof(st));
+        /* mirror the SoA INPUT payload built in step 11 */
+        st.path.render_pixel_index = (v == 1) ? c.rpi_seed : 0u;
+        st.path.sample = (uint32_t)c.sample_seed;
+
+        const bool ret = integrator_init_from_camera(
+            kg_v,
+            &st,
+            (v == 1) ? nullptr : &tile, /* restart: tile == nullptr */
+            ref_rb[v].data(),
+            (int)c.x,
+            (int)c.y,
+            c.scheduled_sample);
+        exp_out[v][i].ret = ret ? 1u : 0u;
+        if (ret) n_ret1++;
+
+        /* expected state slices: raw bytes out of the CPU struct (covers
+         * both the members the body wrote and the passthrough inputs) */
+        for (const auto &s : sl) {
+          memcpy(exp_soa[v].data() + s.off + (size_t)s.elem * i,
+                 reinterpret_cast<const char *>(&st) + s.host, s.elem);
+        }
+
+        /* counter net sums of the GPU-branch atomics (state_flow.h):
+         *   path_init:  +1 on num_queued[next]           (:71-76)
+         *   path_next:  -1 on [current], +1 on [next]    (:78-86)
+         * V0/V2 tile: path_init(next = inside ? 5 : 2); V1 restart:
+         * path_next(0 -> 2) (inside == 0); V3: early return, no queue op. */
+        if (v == 1) {
+          net[v][0] -= 1;
+          net[v][2] += 1;
+        }
+        else if (v <= 2) {
+          net[v][(v == 2) ? 5 : 2] += 1;
+        }
+      }
+      LOG_INFO << "Vulkan: Init-from-camera body probe: variant V" << v << ": " << n_ret1
+               << "/" << num_cases << " pixels scheduled (ret == true)";
+    }
+  }
+
+  /* ---- 13. Upload: cases + ist mirror once; the rest per run ---- */
+  auto upload = [&](VkDeviceMemory mem, const void *data, VkDeviceSize bytes) -> bool {
+    void *m = nullptr;
+    if (vkMapMemory(vk_dev, mem, 0, bytes, 0, &m) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera body probe: mapping buffer failed.";
+      return false;
+    }
+    memcpy(m, data, (size_t)bytes);
+    vkUnmapMemory(vk_dev, mem);
+    return true;
+  };
+  if (!upload(res.cases_memory, cases.data(), cases_bytes)) return false;
+  {
+    IntegratorStateGPU ist{}; /* zero-init: untouched members stay null */
+    for (const auto &s : sl) {
+      const uint64_t addr = soa_addr + s.off;
+      memcpy(reinterpret_cast<char *>(&ist) + s.mirror, &addr, sizeof(addr));
+    }
+    memcpy(reinterpret_cast<char *>(&ist) + offsetof(IntegratorStateGPU, queue_counter),
+           &ctr_addr, sizeof(ctr_addr));
+    if (!upload(res.ist_memory, &ist, ist_bytes)) return false;
+  }
+
+  /* ---- 14. Command pool + buffer + queue + fence ---- */
+  const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
+  VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  cpci.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+  cpci.queueFamilyIndex = family;
+  if (vkCreateCommandPool(vk_dev, &cpci, nullptr, &res.pool) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: command pool creation failed.";
+    return false;
+  }
+  VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = res.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  if (vkAllocateCommandBuffers(vk_dev, &cbai, &cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: command buffer allocation failed.";
+    return false;
+  }
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(vk_dev, family, 0, &queue);
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (vkCreateFence(vk_dev, &fci, nullptr, &res.fence) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: fence creation failed.";
+    return false;
+  }
+
+  /* ---- 15. Per-run: re-init mutable buffers, dispatch, count per region ---- */
+  struct IfcbStats {
+    uint64_t comps = 0;
+    uint64_t mism[IFCB_NUM_REGIONS] = {0};
+    bool canary_ok = true;
+    double max_norm_err = 0.0;
+    /* DIAGNOSTIC (does not affect the verdict): first few concrete
+     * mismatches per region, so a failing CLEAN traces to a value. */
+    struct Rec {
+      int region;
+      uint64_t index;
+      uint32_t gpu, ref;
+    };
+    /* Local classes cannot have static data members (MSVC C2246): enums. */
+    enum { MAX_REC = 40, REC_PER_REGION = 4 };
+    Rec rec[MAX_REC];
+    int nrec = 0;
+    int per_region_rec[IFCB_NUM_REGIONS] = {0};
+    void note(int r, uint64_t idx, uint32_t g, uint32_t rf)
+    {
+      if (per_region_rec[r] >= REC_PER_REGION || nrec >= MAX_REC) return;
+      per_region_rec[r]++;
+      rec[nrec].region = r;
+      rec[nrec].index = idx;
+      rec[nrec].gpu = g;
+      rec[nrec].ref = rf;
+      nrec++;
+    }
+    uint64_t total() const
+    {
+      uint64_t t = 0;
+      for (int r = 0; r < IFCB_NUM_REGIONS; r++) t += mism[r];
+      return t;
+    }
+  };
+
+  /* Raw word compare (integers / passthrough / canaries): the user-approved
+   * policy is raw-bit for these words. */
+  auto count_raw = [](IfcbStats &st, int region, const uint8_t *gpu, const uint8_t *ref,
+                      size_t bytes) {
+    for (size_t k = 0; k < bytes; k += 4) {
+      uint32_t x, y;
+      memcpy(&x, gpu + k, 4);
+      memcpy(&y, ref + k, 4);
+      st.comps++;
+      if (x != y) {
+        st.mism[region]++;
+        st.note(region, k / 4, x, y);
+      }
+    }
+  };
+  /* Float word compare: |gpu-ref| <= 1e-5*max(1,|ref|), the established
+   * GPU-vs-CPU float policy (kernels.cpp:2494 / :3065); NaN fails via the
+   * negated comparison. max_norm_err is reported for diagnostics only. */
+  auto count_float = [](IfcbStats &st, int region, const uint8_t *gpu, const uint8_t *ref,
+                        size_t bytes) {
+    for (size_t k = 0; k < bytes; k += 4) {
+      float g, r;
+      uint32_t g_bits, r_bits;
+      memcpy(&g, gpu + k, 4);
+      memcpy(&r, ref + k, 4);
+      memcpy(&g_bits, gpu + k, 4);
+      memcpy(&r_bits, ref + k, 4);
+      double d = (double)g - (double)r;
+      if (d < 0) d = -d;
+      const double denom = ((double)r < 0 ? -(double)r : (double)r) > 1.0
+                               ? ((double)r < 0 ? -(double)r : (double)r)
+                               : 1.0;
+      const double norm_err = d / denom;
+      if (norm_err > st.max_norm_err) st.max_norm_err = norm_err;
+      st.comps++;
+      if (!(d <= 1e-5 * denom)) {
+        st.mism[region]++;
+        st.note(region, k / 4, g_bits, r_bits);
+      }
+    }
+  };
+  /* Canary words against the constant pattern. */
+  auto count_canary = [](IfcbStats &st, int region, const uint8_t *p, size_t bytes,
+                         uint32_t pat) {
+    for (size_t k = 0; k < bytes; k += 4) {
+      uint32_t x;
+      memcpy(&x, p + k, 4);
+      st.comps++;
+      if (x != pat) {
+        st.mism[region]++;
+        st.canary_ok = false;
+        st.note(region, k / 4, x, pat);
+      }
+    }
+  };
+
+  /* Region names for the log: slice names in table order + the fixed ones. */
+  std::vector<std::string> rname;
+  for (const auto &s : sl) rname.push_back(s.name);
+  rname.push_back("render rows");
+  rname.push_back("render ext");
+  rname.push_back("render tail");
+  rname.push_back("counters");
+  rname.push_back("out.ret");
+  rname.push_back("out tail");
+  rname.push_back("counter tail");
+  rname.push_back("SoA canaries");
+
+  /* Run table: [0]V0 [1]N1 [2]V1 [3]N2 [4]V2 [5]N3 [6]V3 [7]N4 - a
+   * negative (n) runs at index 2n-1 against the CLEAN reference of its
+   * base variant (neg_base_variant[n]). Declared BEFORE run_and_compare,
+   * which captures them. */
+  const int run_variant[8] = {0,
+                              neg_base_variant[1],
+                              1,
+                              neg_base_variant[2],
+                              2,
+                              neg_base_variant[3],
+                              3,
+                              neg_base_variant[4]};
+  const int run_neg[8] = {0, 1, 0, 2, 0, 3, 0, 4};
+
+  /* ---- 16. One run = upload variant+fault inputs, dispatch, compare ----
+   * The host reference (exp_soa / ref_rb / exp_out / net) is ALWAYS the
+   * CLEAN variant of run_variant[run] - a negative is a GPU-side input
+   * fault only, exactly like slices 2/3. */
+  auto run_and_compare = [&](int run, IfcbStats &st) -> bool {
+    const uint32_t v = (uint32_t)run_variant[run];
+    const int neg = run_neg[run];
+
+    /* params: CLEAN base + this run's fault (the body has no switch - the
+     * fault is a value the ported code already reads). */
+    IfcBodyParams p = bp;
+    p.has_tile = (v == 1) ? 0 : 1;
+    int inside = (v == 2) ? 1 : 0;
+    if (neg == 3) inside ^= 1;
+    p.mp.is_inside_volume = inside;
+    p.tile_offset = FQ_TILE_OFFSET + ((neg == 1) ? 1 : 0);
+    p.tile_sample_offset = (neg == 4) ? 1 : 0;
+    if (!upload(res.params_memory, &p, params_bytes) ||
+        !upload(res.rb_memory, rb_init[v].data(), rb_bytes)) {
+      return false;
+    }
+
+    /* SoA input: the variant's payload, + N2's input fault (pre-seeded
+     * path.sample +1 - the restart reconstruction reads it at
+     * init_from_camera.h:74). */
+    std::vector<uint8_t> soa_run = input_soa[v];
+    if (neg == 2) {
+      for (uint32_t i = 0; i < num_cases; i++) {
+        int32_t s;
+        memcpy(&s, soa_run.data() + sl[i_sample].off + (size_t)4 * i, 4);
+        s += 1;
+        memcpy(soa_run.data() + sl[i_sample].off + (size_t)4 * i, &s, 4);
+      }
+    }
+    if (!upload(res.soa_memory, soa_run.data(), soa_bytes)) return false;
+
+    /* out: sentinel prefill (a slot the shader never wrote stays obvious)
+     * + canary tail. */
+    {
+      std::vector<uint8_t> out_s((size_t)out_bytes, 0);
+      for (size_t k = 0; k < (size_t)out_bytes; k += 4)
+        memcpy(out_s.data() + k, &IFCB_SENTINEL, 4);
+      if (!upload(res.out_memory, out_s.data(), out_bytes)) return false;
+    }
+    /* counters: zero payload + canary tail (from word 19 = byte 76). */
+    {
+      std::vector<uint8_t> ctr((size_t)ctr_bytes, 0);
+      for (size_t k = 76; k < (size_t)ctr_bytes; k += 4)
+        memcpy(ctr.data() + k, &IFCB_CANARY, 4);
+      if (!upload(res.ctr_memory, ctr.data(), ctr_bytes)) return false;
+    }
+
+    /* record + submit + wait */
+    vkResetCommandBuffer(cmd, 0);
+    VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    if (vkBeginCommandBuffer(cmd, &bi) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera body probe: begin failed.";
+      return false;
+    }
+    vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, res.pipeline);
+    IfcBodyPush push{cases_addr, out_addr, params_addr, ist_addr, rb_addr, rb_addr,
+                     num_cases, 0};
+    vkCmdPushConstants(cmd, res.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, IFCB_PUSH_BYTES,
+                       &push);
+    vkCmdDispatch(cmd, (num_cases + 63) / 64, 1, 1);
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera body probe: end failed.";
+      return false;
+    }
+    VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    si.commandBufferCount = 1;
+    si.pCommandBuffers = &cmd;
+    vkResetFences(vk_dev, 1, &res.fence);
+    if (vkQueueSubmit(queue, 1, &si, res.fence) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera body probe: submit failed.";
+      return false;
+    }
+    if (vkWaitForFences(vk_dev, 1, &res.fence, VK_TRUE, UINT64_MAX) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera body probe: fence wait failed.";
+      return false;
+    }
+
+    /* map the four readback buffers and count mismatches per region */
+    void *m_soa = nullptr, *m_rb = nullptr, *m_out = nullptr, *m_ctr = nullptr;
+    if (vkMapMemory(vk_dev, res.soa_memory, 0, soa_bytes, 0, &m_soa) != VK_SUCCESS ||
+        vkMapMemory(vk_dev, res.rb_memory, 0, rb_bytes, 0, &m_rb) != VK_SUCCESS ||
+        vkMapMemory(vk_dev, res.out_memory, 0, out_bytes, 0, &m_out) != VK_SUCCESS ||
+        vkMapMemory(vk_dev, res.ctr_memory, 0, ctr_bytes, 0, &m_ctr) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: Init-from-camera body probe: mapping readback failed.";
+      return false;
+    }
+    const uint8_t *soa_p = static_cast<const uint8_t *>(m_soa);
+    const uint8_t *rb_p = static_cast<const uint8_t *>(m_rb);
+    const uint8_t *out_p = static_cast<const uint8_t *>(m_out);
+    const uint8_t *ctr_p = static_cast<const uint8_t *>(m_ctr);
+    const uint8_t *exp_soa_p = exp_soa[v].data();
+    const uint8_t *exp_rb_p = reinterpret_cast<const uint8_t *>(ref_rb[v].data());
+
+    /* state slices (float slices at 1e-5, integer/passthrough raw) + the
+     * 16-B canary that follows each padded payload */
+    for (size_t si = 0; si < sl.size(); si++) {
+      const IfcSlice &s = sl[si];
+      const size_t bytes = (size_t)s.elem * num_cases;
+      if (s.is_float)
+        count_float(st, (int)si, soa_p + s.off, exp_soa_p + s.off, bytes);
+      else
+        count_raw(st, (int)si, soa_p + s.off, exp_soa_p + s.off, bytes);
+      const size_t pay_end = s.off + ((bytes + 3) & ~(size_t)3);
+      count_canary(st, IFCB_R_SOA_CANARY, soa_p + pay_end, IFCB_CANARY_WORDS * 4,
+                   IFCB_CANARY);
+    }
+
+    /* render buffer: rows / N1 extension / protected tail (raw: count slots
+     * are uint atomics, aux/optical slots are exact passthrough fills) */
+    count_raw(st, IFCB_R_RB_ROWS, rb_p, exp_rb_p, (size_t)FQ_RB_ROWS * 4);
+    count_raw(st, IFCB_R_RB_EXT, rb_p + (size_t)FQ_RB_ROWS * 4,
+              exp_rb_p + (size_t)FQ_RB_ROWS * 4,
+              ((size_t)FQ_RB_EXT - (size_t)FQ_RB_ROWS) * 4);
+    count_raw(st, IFCB_R_RB_TAIL, rb_p + (size_t)FQ_RB_EXT * 4,
+              exp_rb_p + (size_t)FQ_RB_EXT * 4,
+              ((size_t)FQ_RB_FLOATS - (size_t)FQ_RB_EXT) * 4);
+
+    /* queue counters: 19 payload words vs the net sums (int32 bit patterns
+     * match the uint wraps the GPU atomics produce) + canary tail */
+    count_raw(st, IFCB_R_COUNTERS, ctr_p, reinterpret_cast<const uint8_t *>(net[v].data()),
+              76);
+    count_canary(st, IFCB_R_CTR_TAIL, ctr_p + 76, (size_t)ctr_bytes - 76, IFCB_CANARY);
+
+    /* out.ret words + out canary tail */
+    count_raw(st, IFCB_R_OUT_RET, out_p, reinterpret_cast<const uint8_t *>(exp_out[v].data()),
+              (size_t)num_cases * 4);
+    count_canary(st, IFCB_R_OUT_TAIL, out_p + (size_t)num_cases * 4,
+                 (size_t)out_bytes - (size_t)num_cases * 4, IFCB_CANARY);
+
+    vkUnmapMemory(vk_dev, res.soa_memory);
+    vkUnmapMemory(vk_dev, res.rb_memory);
+    vkUnmapMemory(vk_dev, res.out_memory);
+    vkUnmapMemory(vk_dev, res.ctr_memory);
+    return true;
+  };
+
+  auto log_stats = [&](const char *label, const IfcbStats &st) {
+    LOG_INFO << "Vulkan: Init-from-camera body probe: [" << label << "] " << st.total()
+             << "/" << st.comps << " comparisons differ"
+             << (st.canary_ok ? "" : " [CANARY CORRUPTED]")
+             << " max_norm_err=" << st.max_norm_err;
+    for (int r = 0; r < IFCB_NUM_REGIONS; r++)
+      if (st.mism[r] != 0)
+        LOG_INFO << "Vulkan: Init-from-camera body probe:   " << rname[r] << ": "
+                 << st.mism[r] << " word(s) differ";
+    for (int k = 0; k < st.nrec; k++)
+      LOG_INFO << "Vulkan: Init-from-camera body probe:   first[" << k << "] "
+               << rname[st.rec[k].region] << " idx=" << st.rec[k].index << " gpu=0x"
+               << std::hex << st.rec[k].gpu << " ref=0x" << st.rec[k].ref << std::dec;
+  };
+
+  /* ---- 17. Run: four CLEAN variants, then the four negatives ----
+   * Order: [0]V0 [1]N1 [2]V1 [3]N2 [4]V2 [5]N3 [6]V3 [7]N4 - a negative
+   * (n) runs at index 2n-1 against the CLEAN reference of its base
+   * variant (neg_base_variant[n]). */
+  const int run_variant[8] = {0, 0, 1, 1, 2, 0, 3, 0};
+  const int run_neg[8] = {0, 1, 0, 2, 0, 3, 0, 4};
+  const char *run_name[8] = {"V0-tile CLEAN",         "N1 tile_offset+1",
+                             "V1-restart CLEAN",      "N2 restart-sample+1",
+                             "V2-volume CLEAN",       "N3 is_inside_volume-flip",
+                             "V3-need=false CLEAN",   "N4 tile_sample_offset+1"};
+
+  IfcbStats stats[8];
+  bool run_ok = true;
+  for (int run = 0; run < 8; run++) {
+    if (!run_and_compare(run, stats[run])) return false;
+    log_stats(run_name[run], stats[run]);
+  }
+
+  /* ---- 18. Verdict ---- */
+  bool clean_ok = true;
+  for (int run = 0; run < 8; run += 2) {
+    if (stats[run].total() != 0 || !stats[run].canary_ok) clean_ok = false;
+  }
+  bool all_ok = clean_ok;
+  for (int n = 1; n <= 4; n++) {
+    const IfcbStats &st = stats[2 * n - 1];
+    bool detected = false, spillover = false;
+    for (int r = 0; r < IFCB_NUM_REGIONS; r++) {
+      if (st.mism[r] == 0) continue;
+      const bool allowed = ((neg_allowed[n] >> r) & 1ull) != 0;
+      if (allowed) detected = true;
+      else spillover = true;
+    }
+    if (!st.canary_ok) spillover = true;
+    LOG_INFO << "Vulkan: Init-from-camera body probe: negative '" << neg_name[n] << "' "
+             << (detected ? "DETECTED" : "NOT DETECTED")
+             << (spillover ? " (SPILLOVER - gate failure)" : "");
+    if (!detected || spillover) all_ok = false;
+  }
+  if (clean_ok)
+    LOG_INFO << "Vulkan: Init-from-camera body probe: CLEAN PASS (all four body variants "
+                "match the real Cycles integrator_init_from_camera).";
+  else
+    LOG_ERROR << "Vulkan: Init-from-camera body probe: CLEAN PASS FAILED (GPU body "
+                 "disagrees with the real Cycles reference).";
+  LOG_INFO << "Vulkan: Init-from-camera body probe: " << (all_ok ? "GATE MET."
+                                                                 : "GATE NOT MET.");
+  return all_ok && run_ok;
 }
 
 /* =========================================================================

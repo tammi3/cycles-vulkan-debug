@@ -1,3 +1,68 @@
+================================================================================
+M4f SLICE 4 — IN PROGRESS (integrator_init_from_camera body + ray dP/dD port)
+================================================================================
+STATUS: research + baseline done, NO source edits yet (tree clean @ 3971926b6).
+
+SCOPE (user-confirmed this session): ONE slice = (a) port ray differentials
+dP/dD into math_core camera_sample_perspective/camera_sample (camera.h:109-119,
+__RAY_DIFFERENTIALS__ is unconditional, features.h:145) + add 9 MathParams
+scalars (cam.dx/dy xyz, differential_scale, cam.width, is_inside_volume),
+(b) replace the integrator_init_from_camera stub body (init_from_camera.slang:
+165-234) with the faithful port, (c) gate = NEW probe vs the REAL Cycles
+integrator_init_from_camera (init_from_camera.h:57-143). queue.cpp dispatch
+plumbing NOT in this slice. Same 3 gate configs as slice 3 (RX570 def,
+RX570 narrow, SwiftShader def) + the 4 regression probes.
+
+GATE FLOAT POLICY (asked, user chose "established repo policy"): integers /
+passthrough words RAW-BIT; float words |gpu-ref| <= 1e-5*max(1,|ref|)
+(kernels.cpp:2494/:3065 precedent). EVIDENCE: baseline math probe (current
+build, RX570 def) [CLEAN] int 0/1536, float 0/11712 over tol,
+max_norm_err=2.34236e-07, sobol_bitexact=1920/1920 => raw-bit on computed
+ray floats is impossible by construction (ULP divergence ~2.3e-7).
+
+BRANCH REACHABILITY (covered PERSPECTIVE config), do not fabricate inputs:
+- cache_miss branch (init_from_camera.h:99-106): UNREACHABLE - only
+  camera_sample_custom can set r_cache_miss=true (camera.h:335), only for
+  CAMERA_CUSTOM (camera.h:520-523); covered config is PERSPECTIVE
+  (camera.h:509 sets false before dispatch). Port faithfully, report uncovered.
+- is_zero(T) branch (:108-114): UNREACHABLE - covered branch returns
+  one_spectrum (1,1,1) (camera.h:172 / init_from_camera.slang:147); zero T
+  only comes from panorama/custom cameras (camera.h:336/340/366/404).
+  Port faithfully, report uncovered.
+- COVERED branches: tile!=nullptr (path_state_init, need-check, film_write_sample)
+  AND tile==nullptr restart (x/y/sample reconstruction via cam.width);
+  is_inside_volume both values via mirrored kg_cpu+params gate input.
+
+PLAN (steps): 1) [DONE] research+baseline+policy. 2) [DONE] dP/dD port:
+MathParams +9 fields (MathProbeParams static_assert 176->212), out dP/dD
+threaded through camera_sample_perspective/camera_sample/
+integrate_camera_sample, 2 probe call sites pass-through only (slice-1
+verdict logic untouched). Includes camera.h:168 (clipping updates dP:
+dP = 0 + nearclip*dD). slangc+spirv-val exit 0: math_probe.spv 107556 B,
+init_from_camera_probe.spv 40296 B. Regressions RX570 def + layer, VUID 0:
+math GATE MET (3/3 neg, max_norm_err=2.34236e-07 = baseline), init-from-
+camera GATE MET (3/3 neg). 3) [DONE] body port: init_from_camera.slang stub
+replaced by faithful integrator_init_from_camera (21-param signature: ist,
+state, MathParams, tile-as-scalars (types.h:1695 int offset/1696 uint
+stride/1693 uint sample_offset), 5 cited film scalars, 3 cited features/
+background scalars, rb float*+uint*+valid, x_/y_/scheduled_sample) + 3 added
+DeviceKernel constants (types.h:1744-1752: 0/2/5) + is_zero helper
+(math_float3.h:576) + 2 new includes (path_state.slang, film_queue.slang).
+DEFENSIVE width==0 guard (Cycles = host div-by-zero; cannot fire in gate).
+cache_miss + is_zero(T) branches ported faithfully, documented UNREACHABLE
+in covered config. Compile check via slice-1 probe: slangc+spirv-val 0,
+slice-1 SPV UNCHANGED at 40296 B (body dead-code-eliminated there).
+4) init_from_camera_body_probe.slang + host hook +
+queue.cpp decl. 5) slangc+spirv-val both variants, 3-config gates, regressions,
+negatives, commit (state message first), lastsession.txt.
+
+TRAPS CARRIED: env vars reset every shell call; cmd /c 1>log 2>&1; slangc NOT
+in build; RX570: no pointer OpBitcast before atomics (constraint 4: push rb
+addr twice, uint* view); SwiftShader: no pointer OpBitcast at all, no Int64
+(narrow SPVs pre-existing incompatible); dynamic index on fixed BDA array =
+base pointer first; probes default .spv from CWD (set _SPV).
+
+================================================================================
 M4f SLICE 3 — FILM + QUEUE LAYER (film_queue.slang port + probe gate PASSED) - 2026-10-31
 STATUS: COMPLETE and gate PASSED on ALL THREE gate configs (RX 570 default,
 RX 570 narrow, SwiftShader default). NOTE: the user committed a WIP snapshot

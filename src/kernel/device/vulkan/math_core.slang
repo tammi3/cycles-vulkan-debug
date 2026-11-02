@@ -313,6 +313,19 @@ struct MathParams
     int rolling_shutter_type;      // cam.rolling_shutter_type
     float nearclip;                // cam.nearclip
     float cliplength;              // cam.cliplength
+    // -- camera ray differentials (M4f slice 4; kernel_data.cam subset) ------
+    // cam.dx / cam.dy are float4 (types.h:1201-1202) but only xyz is ever
+    // consumed: the Cycles call sites use make_float3(cam.dx)
+    // (camera.h:116-117) which drops .w (util/types_float4.h:108), so the w
+    // components are not mirrored here (they are never read by any ported
+    // function - citing every read site: camera.h:116,117 only).
+    float dx_x, dx_y, dx_z;        // cam.dx.xyz   (types.h:1201)
+    float dy_x, dy_y, dy_z;        // cam.dy.xyz   (types.h:1202)
+    float differential_scale;      // cam.differential_scale (types.h:1206)
+    // cam.width: a float in Cycles (types.h:1217) cast to int by its only
+    // reader, init_from_camera.h:72-73 (x = pixel_index % (int)cam.width).
+    float width;
+    int is_inside_volume;          // cam.is_inside_volume (types.h:1222)
     // integrator.pixel_jitter (see report: overridden != FLT_MAX)
     float pixel_jitter_x;
     float pixel_jitter_y;
@@ -447,9 +460,16 @@ float3 transform_direction(float4 rowx, float4 rowy, float4 rowz, float3 a)
 // source: kernel/camera/camera.h:43 (camera_sample_perspective). Faithful for
 // a PERSPECTIVE camera with have_perspective_motion==0, aperturesize==0,
 // num_motion_steps==0 and interocular_offset==0 (the gate config). Outputs the
-// clipped ray P/D/tmin/tmax (clipping math from camera.h:164-170). Ray
-// differentials (dP/dD) are skipped: they are not part of the S1a comparison.
-void camera_sample_perspective(MathParams p, float2 raster_xy, out float3 ray_P, out float3 ray_D, out float ray_tmin, out float ray_tmax)
+// clipped ray P/D/tmin/tmax (clipping math from camera.h:164-170) AND the ray
+// differentials dP/dD (camera.h:109-119 + the dP clipping line at camera.h:168;
+// __RAY_DIFFERENTIALS__ is unconditionally defined, features.h:145 - the slice-1
+// version of this port omitted them, M4f slice 4 adds them).
+// dP/dD are the compact RADIUS form: both are floats (state_util.h:33-34 packs
+// them into P.w/D.w; state_template.h:81,83 stores them as floats in state).
+void camera_sample_perspective(MathParams p, float2 raster_xy,
+                               out float3 ray_P, out float3 ray_D,
+                               out float ray_tmin, out float ray_tmax,
+                               out float ray_dP, out float ray_dD)
 {
     // Rebuild the matrix rows (scalars -> local float4; no cross-ABI layout).
     float4 rtc_x = float4(p.rtc_x_x, p.rtc_x_y, p.rtc_x_z, p.rtc_x_w);
@@ -481,10 +501,33 @@ void camera_sample_perspective(MathParams p, float2 raster_xy, out float3 ray_P,
     ray_P = P;
     ray_D = D;
 
-    // camera.h:164-170 clipping.
+    // camera.h:109-119 ray differentials (the NON-stereo branch; the stereo
+    // variant at :127-161 is NOT covered - interocular_offset == 0).
+    //   const float3 Dcenter = transform_direction(&cameratoworld, Pcamera);
+    //   const float3 Dcenter_normalized = normalize(Dcenter);
+    //   ray->dP = differential_zero_compact();                 -> 0.0f
+    //   dD.dx = normalize(Dcenter + make_float3(cam.dx)) - Dcenter_normalized;
+    //   dD.dy = normalize(Dcenter + make_float3(cam.dy)) - Dcenter_normalized;
+    //   ray->dD = differential_make_compact(dD) * cam.differential_scale;
+    // differential_zero_compact() is literally 0.0f (util/differential.h:
+    // 113-116) and differential_make_compact(float3,float3) is
+    // 0.5f * (len(dx) + len(dy)) (util/differential.h:123-126; Cycles len()
+    // = sqrt(dot(a,a)), spelled length() in Slang - compiled+validated).
+    // Dcenter is the UN-normalized transform of Pcamera (w=0), exactly as
+    // written: Cycles recomputes it instead of reusing D.
+    float3 Dcenter = transform_direction(ctw_x, ctw_y, ctw_z, Pcamera);
+    float3 Dcenter_normalized = normalize(Dcenter);
+    float3 diff_dx = normalize(Dcenter + float3(p.dx_x, p.dx_y, p.dx_z)) - Dcenter_normalized;
+    float3 diff_dy = normalize(Dcenter + float3(p.dy_x, p.dy_y, p.dy_z)) - Dcenter_normalized;
+    ray_dP = 0.0f;  // differential_zero_compact()
+    ray_dD = (0.5f * (length(diff_dx) + length(diff_dy))) * p.differential_scale;
+
+    // camera.h:164-170 clipping (line 168 updates dP as well:
+    //   ray->dP += nearclip * ray->dD; ).
     float z_inv = 1.0f / normalize(Pcamera).z;
     float nearclip = p.nearclip * z_inv;
     ray_P += nearclip * ray_D;
+    ray_dP += nearclip * ray_dD;
     ray_tmin = 0.0f;
     ray_tmax = p.cliplength * z_inv;
 }
@@ -497,7 +540,7 @@ void camera_sample_perspective(MathParams p, float2 raster_xy, out float3 ray_P,
 // camera types return false in `ok`.
 void camera_sample(MathParams p, int x, int y, float2 filter_uv, float time, float2 lens_uv,
                    out float3 ray_P, out float3 ray_D, out float ray_tmin, out float ray_tmax,
-                   out float ray_time, out bool ok)
+                   out float ray_time, out float ray_dP, out float ray_dD, out bool ok)
 {
     float2 raster = float2((float)x, (float)y);
     ray_P = float3(0.0f, 0.0f, 0.0f);
@@ -505,6 +548,8 @@ void camera_sample(MathParams p, int x, int y, float2 filter_uv, float time, flo
     ray_tmin = 0.0f;
     ray_tmax = 0.0f;
     ray_time = 0.0f;
+    ray_dP = 0.0f;
+    ray_dD = 0.0f;
     ok = false;
 
     // camera.h:461-468 pixel filter. Gate: pixel_jitter.x != FLT_MAX.
@@ -527,7 +572,8 @@ void camera_sample(MathParams p, int x, int y, float2 filter_uv, float time, flo
 
     // camera.h:510-511 sample dispatch.
     if (p.cam_type == 0 /* CAMERA_PERSPECTIVE */) {
-        camera_sample_perspective(p, raster, ray_P, ray_D, ray_tmin, ray_tmax);
+        camera_sample_perspective(p, raster, ray_P, ray_D, ray_tmin, ray_tmax,
+                                  ray_dP, ray_dD);
         ok = true;
         return;
     }
