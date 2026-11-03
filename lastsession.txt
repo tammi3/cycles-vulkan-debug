@@ -1,9 +1,13 @@
 ================================================================================
 M4f SLICE 4 — IN PROGRESS (integrator_init_from_camera body + ray dP/dD port)
 ================================================================================
-STATUS: steps 1-4 DONE, ALL GATES MET on all 3 configs + all regressions.
-Ready to commit (message stated first). Tree = uncommitted slice-4 edits on
-top of 3971926b6.
+STATUS: SLICE 4 COMPLETE + COMMITTED/PUSHED. HEAD 25fed9b97 (on top of the
+user's break-time commits 0e3e8eb58 "host hook for kernels.cpp" and
+d7d982245 "host hook for queue.cpp", which carried the slice-4 body; my
+canary fix + this checkpoint rode on top as 25fed9b97 "M4f slice 4: fix
+probe canary fills in init_from_camera body gate"). All gates green (see
+4b below). Untracked: empty 0-byte `log` file in repo root (stray, user's
+call).
 
 SCOPE (user-confirmed this session): ONE slice = (a) port ray differentials
 dP/dD into math_core camera_sample_perspective/camera_sample (camera.h:109-119,
@@ -94,9 +98,9 @@ sample-independent; host and GPU agree, sample enters elsewhere.
   narrow), init-from-camera GATE MET, state-init GATE MET (def + narrow),
   film-queue GATE MET (def + narrow, re-run because kernels.cpp changed).
   0 Validation Error / 0 VUID in every run.
-5) [NEXT] commit slice-4 changes (state message first), then queue.cpp
-film/queue dispatch plumbing (queue.cpp:135), then the M5 gate (Cornell box
-vs Cycles CPU).
+5) [DONE] committed 25fed9b97 (message stated before git commit) + pushed.
+6) [NEXT] queue.cpp film/queue dispatch plumbing (queue.cpp:135), then the
+M5 gate (Cornell box vs Cycles CPU).
 
 TRAPS CARRIED: env vars reset every shell call; cmd /c 1>log 2>&1; slangc NOT
 in build; RX570: no pointer OpBitcast before atomics (constraint 4: push rb
