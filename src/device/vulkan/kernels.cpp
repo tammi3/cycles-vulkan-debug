@@ -5220,6 +5220,15 @@ bool vulkan_init_from_camera_body_probe(VulkanDevice *dev)
                reinterpret_cast<const char *>(&st0) + s.host, s.elem);
       }
     }
+    /* Canary words after each padded payload: the GPU must leave them
+     * untouched, so they are part of the upload (a memset-0 upload would
+     * make the canary compare trivially fail against IFCB_CANARY). */
+    for (const auto &s : sl) {
+      const size_t bytes = (size_t)s.elem * num_cases;
+      const size_t pay_end = s.off + ((bytes + 3) & ~(size_t)3);
+      for (uint32_t w = 0; w < IFCB_CANARY_WORDS; w++)
+        memcpy(input_soa[v].data() + pay_end + (size_t)w * 4, &IFCB_CANARY, 4);
+    }
   }
 
   /* ---- 12. EXPECTED bytes from the REAL integrator_init_from_camera ----
@@ -5494,12 +5503,16 @@ bool vulkan_init_from_camera_body_probe(VulkanDevice *dev)
     }
     if (!upload(res.soa_memory, soa_run.data(), soa_bytes)) return false;
 
-    /* out: sentinel prefill (a slot the shader never wrote stays obvious)
-     * + canary tail. */
+    /* out: sentinel prefill on the PAYLOAD (a slot the shader never wrote
+     * stays obvious) + canary on the tail (the tail is compared against
+     * IFCB_CANARY, not SENTINEL). */
     {
       std::vector<uint8_t> out_s((size_t)out_bytes, 0);
-      for (size_t k = 0; k < (size_t)out_bytes; k += 4)
+      const size_t payload = (size_t)num_cases * 4;
+      for (size_t k = 0; k < payload; k += 4)
         memcpy(out_s.data() + k, &IFCB_SENTINEL, 4);
+      for (size_t k = payload; k < (size_t)out_bytes; k += 4)
+        memcpy(out_s.data() + k, &IFCB_CANARY, 4);
       if (!upload(res.out_memory, out_s.data(), out_bytes)) return false;
     }
     /* counters: zero payload + canary tail (from word 19 = byte 76). */

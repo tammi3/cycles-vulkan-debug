@@ -1,7 +1,9 @@
 ================================================================================
 M4f SLICE 4 — IN PROGRESS (integrator_init_from_camera body + ray dP/dD port)
 ================================================================================
-STATUS: research + baseline done, NO source edits yet (tree clean @ 3971926b6).
+STATUS: steps 1-4 DONE, ALL GATES MET on all 3 configs + all regressions.
+Ready to commit (message stated first). Tree = uncommitted slice-4 edits on
+top of 3971926b6.
 
 SCOPE (user-confirmed this session): ONE slice = (a) port ray differentials
 dP/dD into math_core camera_sample_perspective/camera_sample (camera.h:109-119,
@@ -52,9 +54,49 @@ DEFENSIVE width==0 guard (Cycles = host div-by-zero; cannot fire in gate).
 cache_miss + is_zero(T) branches ported faithfully, documented UNREACHABLE
 in covered config. Compile check via slice-1 probe: slangc+spirv-val 0,
 slice-1 SPV UNCHANGED at 40296 B (body dead-code-eliminated there).
-4) init_from_camera_body_probe.slang + host hook +
-queue.cpp decl. 5) slangc+spirv-val both variants, 3-config gates, regressions,
-negatives, commit (state message first), lastsession.txt.
+4) [CODE DONE, FIRST RUN DONE] init_from_camera_body_probe.slang (entry
+init_from_camera_body_main, 64 thr/wg, BodyCase 20 B / BodyParams 264 B /
+BodyOut 4 B / BodyPush 56 B) + vulkan_init_from_camera_body_probe() in
+kernels.cpp (4 chunks after slice-3's hook; 45 regions, 37-slice table,
+name-based masks, 768 cases, 4 CLEAN variants V0/V1/V2/V3 + 4 negatives
+N1 tile_offset+1, N2 restart sample seed+1 as SoA INPUT, N3 is_inside_volume
+flip, N4 tile_sample_offset+1; host reference = REAL
+integrator_init_from_camera) + queue.cpp decl+call. slangc+spirv-val 0 both
+variants (default 57200 B, narrow 54652 B). Build clean first try (all
+static_asserts passed). FIRST GATE RUN (RX570 default, layer on, VUID 0):
+all 4 CLEAN variants match the real reference on EVERY data region (V0/V1/V2
+152 diffs = 148 SoA canary + 4 out tail only, max_norm_err=2.33934e-07 =
+ULP level; V3 same); all 4 negatives DETECTED with exactly the designed
+masks (N1: rpi 768 + rows idx16000 + ext idx0; N2: path.sample 768; N4:
+path.sample 768; N3: queued 384 words + counters 0x300) and NO data-region
+spillover. GATE NOT MET solely on the 2 canary fills (harness bugs, FIXED
+after the run, not yet re-verified): (a) input_soa never wrote IFCB_CANARY
+into the per-slice canary words -> gpu 0x0 vs ref 0x6a6a6a6a (148 words);
+(b) out buffer filled entirely with IFCB_SENTINEL incl. the tail -> tail
+gpu 0xabababab vs ref 0x6a6a6a6a (4 words). Fixes applied in kernels.cpp:
+canary words written per slice after the input_soa build loop; out payload
+= SENTINEL, tail = CANARY.
+OBSERVATION (recorded, not a probe fault): N2 and N4 both show their diff
+only in path.sample (768 words) - path_rng_pixel_init output is
+sample-independent; host and GPU agree, sample enters elsewhere.
+4b) [DONE - all gates] rebuild clean; canary fixes verified:
+- RX570 default + layer: CLEAN PASS (V0/V1/V2/V3 = 0/60920 diffs, canaries
+  intact; max_norm_err 2.33934e-07 / 2.85881e-07 / 2.33934e-07 / 0), all
+  4 negatives DETECTED with exactly the designed masks (N1 770 = rpi 768 +
+  rows 1 + ext 1; N2 768 sample; N3 386 = queued 384 + counters 2 [slots
+  2/5 = 0x300]; N4 768 sample), NO spillover => GATE MET, VUID 0, layer
+  confirmed active ("Insert instance layer VK_LAYER_KHRONOS_validation").
+- RX570 narrow: identical numbers => GATE MET, VUID 0.
+- SwiftShader default (ICD ...Microsoft-Edge-WebView\vk_swiftshader_icd.
+  json): same region patterns, max_norm_err 1.19232e-07 (differs from
+  RX570 = SwiftShader really ran) => GATE MET, VUID 0.
+- Regressions RX570: math GATE MET, state-access ALL CHECKS PASSED (def +
+  narrow), init-from-camera GATE MET, state-init GATE MET (def + narrow),
+  film-queue GATE MET (def + narrow, re-run because kernels.cpp changed).
+  0 Validation Error / 0 VUID in every run.
+5) [NEXT] commit slice-4 changes (state message first), then queue.cpp
+film/queue dispatch plumbing (queue.cpp:135), then the M5 gate (Cornell box
+vs Cycles CPU).
 
 TRAPS CARRIED: env vars reset every shell call; cmd /c 1>log 2>&1; slangc NOT
 in build; RX570: no pointer OpBitcast before atomics (constraint 4: push rb
