@@ -54,6 +54,8 @@
 #include <cstring>
 #include <cmath>
 #include <cstdio>
+#include <cfloat> /* FLT_MAX: the pixel-filter-table branch test below compares
+                  * against it exactly like camera.h:461 does. */
 #include <fstream>
 #include <string>
 #include <vector>
@@ -1862,8 +1864,31 @@ struct MathProbeParams {
   int32_t sampling_pattern;
   uint32_t seed, sobol_index_mask, blue_noise_sequence_length;
   int32_t neg_mode;
+  /* M4f slice 5: APPENDED kernel_data.tables subset (Slang MathParams fields
+   * of the same names, math_core.slang). Everything above keeps its exact
+   * offset; the pointer's 8-byte alignment inserts 4 pad bytes after
+   * neg_mode (212 -> pointer at 216). Probes leave these ZERO: their
+   * pixel_jitter override keeps them off the FLT_MAX filter-table branch
+   * (the branch is covered by the slice-5 real-session gate instead). */
+  uint32_t pad_after_neg_mode;
+  VkDeviceAddress lookup_table; /* == Slang float* tables_lookup_table (BDA) */
+  int32_t filter_table_offset;
+  int32_t lookup_table_width;
+  /* M4f slice 5 SECOND APPEND: kernel_data.integrator sampler subset for the
+   * Cycles-default SAMPLING_PATTERN_TABULATED_SOBOL (scene/integrator.cpp:
+   * 154-157; pattern.h:75-77 routes path_rng_* there). Probes leave these
+   * ZERO too: they force SAMPLING_PATTERN_SOBOL_BURLEY on both sides, so the
+   * tabulated branch stays off (documented, same as the filter-table branch).
+   * pad_tail is EXPLICIT (not compiler padding) so the payload ends at 256 =
+   * a multiple of 8: slangc does not round struct sizeof (see the Slang
+   * field's comment) and MathParams is EMBEDDED in IfcBodyParams. */
+  float scrambling_distance;
+  uint32_t tabulated_sobol_sequence_size;
+  VkDeviceAddress sample_pattern_lut; /* == Slang float* sample_pattern_lut */
+  int32_t sample_pattern_lut_width;
+  uint32_t pad_tail;
 };
-static_assert(sizeof(MathProbeParams) == 212, "MathParams layout must match Slang");
+static_assert(sizeof(MathProbeParams) == 256, "MathParams layout must match Slang");
 
 /* Push block: 3 device pointers + count = 32 bytes (matches Slang Push). */
 struct MathProbePush {
@@ -2656,7 +2681,7 @@ bool vulkan_init_from_camera_probe(VulkanDevice *dev)
   /* ---- 5. Build MathParams from the REAL kernel data of the scene ----
    * Same fill as the math probe (kernels.cpp vulkan_math_probe): the struct
    * is shared, so its layout is already locked by
-   * static_assert(sizeof(MathProbeParams) == 176). The same two overrides
+   * static_assert(sizeof(MathProbeParams) == 256). The same two overrides
    * apply (pixel_jitter != FLT_MAX so the filter-table branch is skipped,
    * sampling_pattern = SOBOL_BURLEY so the in-scope path_rng branch runs),
    * and BOTH the GPU params and the host reference get them. */
@@ -4648,7 +4673,7 @@ struct IfcBodyCase {
 static_assert(sizeof(IfcBodyCase) == 20, "IfcBodyCase layout must match Slang");
 
 struct IfcBodyParams {
-  MathProbeParams mp;    // 212 B, same layout as Slang MathParams
+  MathProbeParams mp;    // 256 B (M4f slice 5: was 212 + tables subset + sampler subset)
   int32_t has_tile;
   int32_t tile_offset;
   uint32_t tile_stride;
@@ -4663,7 +4688,7 @@ struct IfcBodyParams {
   int32_t background_volume_shader;
   uint32_t render_buffer_valid;
 };
-static_assert(sizeof(IfcBodyParams) == 264, "IfcBodyParams layout must match Slang");
+static_assert(sizeof(IfcBodyParams) == 312, "IfcBodyParams layout must match Slang");
 
 struct IfcBodyOut {
   uint32_t ret;
@@ -4831,9 +4856,12 @@ bool vulkan_init_from_camera_body_probe(VulkanDevice *dev)
 
   /* ---- 5. MathParams from the REAL kernel data + covered-config guard ----
    * Same fill as the math / slice-1 init-from-camera probes (the struct is
-   * shared: static_assert(sizeof(MathProbeParams) == 212) locks it), plus
-   * the same two overrides so the GPU port and the REAL host call take the
-   * same raster branch (pixel_jitter != FLT_MAX skips the filter table;
+   * shared: static_assert(sizeof(MathProbeParams) == 256) locks it; the
+   * appended tables_* fields stay ZERO because this probe overrides
+   * pixel_jitter != FLT_MAX, keeping the now-ported FLT_MAX filter-table
+   * branch off - that branch is covered by the slice-5 real-session gate),
+   * plus the same two overrides so the GPU port and the REAL host call take
+   * the same raster branch (pixel_jitter != FLT_MAX skips the filter table;
    * SOBOL_BURLEY selects the ported sampling path). */
   const KernelData &kd = dev->host_kernel_data();
   IfcBodyParams bp{};
@@ -8753,6 +8781,1550 @@ bool vulkan_traverse_probe(VulkanDevice *dev)
            << (pass ? "PASS - gate run matches the reference, all three faults detected"
                     : "FAIL - see the numbers above");
   return pass;
+}
+
+/* ===========================================================================
+ * M4f SLICE 5 - production dispatch plumbing
+ * ===========================================================================
+ * VulkanQueue::enqueue() (device/vulkan/queue.cpp:99) calls this for every
+ * device kernel. This function implements exactly TWO of them:
+ *
+ *   DEVICE_KERNEL_INTEGRATOR_RESET            (kernel/device/gpu/kernel.h:60-69)
+ *   DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA (kernel/device/gpu/kernel.h:72-114)
+ *
+ * Three-way return contract - queue.cpp switches on it:
+ *   1  dispatched (or nothing to do): queue.cpp returns true, sets NO error.
+ *   0  out of slice-5 scope: queue.cpp keeps the M4 "not implemented" error.
+ *  -1  failed: set_error() has ALREADY been called here, so queue.cpp must
+ *      NOT overwrite it and returns false.
+ *
+ * Everything in this block is host-side plumbing; no rendering logic is
+ * invented here (AGENTS.md section 5). The camera / sampler / state-init /
+ * film-queue logic was gated against the REAL Cycles functions in slices 1-4;
+ * what this function adds is:
+ *   (a) loading the hand-compiled SPV (slangc is not part of the build),
+ *   (b) mirroring the Slang push blocks with static_asserts,
+ *   (c) staging the kg-derived scalars from the REAL KernelData of the loaded
+ *       scene - UN-overridden, unlike every probe, which forces
+ *       pixel_jitter != FLT_MAX and SAMPLING_PATTERN_SOBOL_BURLEY,
+ *   (d) refusing to dispatch when the scene leaves the configuration those
+ *       gates covered (fail loudly instead of computing values the port never
+ *       produces - AGENTS.md section 5).
+ *
+ * Launch geometry follows CUDA: the grid comes from `n`, the work_size the
+ * caller passes to enqueue(), with 64 threads per group (this backend's entry
+ * width; every entry guards its own work index, so the group width cannot
+ * change the result - Cycles' CUDA value is 256, cuda/config.h:23).
+ * =========================================================================== */
+
+/* ---------------------------------------------------------------------------
+ * Host mirrors of the Slang blocks that cross the ABI. Layouts are taken
+ * from the Slang files that define them (AGENTS.md section 4: layouts come
+ * from the real source and are cited) and are locked by static_assert here.
+ * A Slang pointer is 8 bytes and a Win64 pointer is 8 bytes, so pointers are
+ * mirrored as VkDeviceAddress (uint64_t) - never as a C++ pointer type, so
+ * host code can never accidentally dereference a device address.
+ * ------------------------------------------------------------------------ */
+
+/* integrator_reset.slang:56-62 - params pointer + count + pad = 16 bytes. */
+struct QueueResetPush {
+  VkDeviceAddress params; /* KernelParamsVulkan* (BDA of the fixed params buffer) */
+  int32_t num_states;
+  int32_t pad0;
+};
+static_assert(sizeof(QueueResetPush) == 16,
+              "QueueResetPush layout must match ResetPush (integrator_reset.slang:56-62)");
+
+/* init_from_camera_kernel.slang:125-140 - six pointers (48) + six 4-byte
+ * members (24) = 72 bytes. path_index_array is a POINTER argument on the host
+ * too (device/queue.h:56-59: add(const device_ptr*) -> POINTER), so it takes
+ * a full 8 bytes here exactly as the Slang `int*` field does. */
+struct QueueInitPush {
+  VkDeviceAddress params;             /*  0 */
+  VkDeviceAddress tiles;              /*  8  enqueue() arg 1 */
+  VkDeviceAddress render_buffer;      /* 16  enqueue() arg 3, float view */
+  VkDeviceAddress render_buffer_u;    /* 24  arg 3 again, uint view (constraint 4) */
+  VkDeviceAddress dp;                 /* 32  host staging of DispatchParams */
+  VkDeviceAddress path_index_array;   /* 40  enqueue() arg 5 (often 0) */
+  int32_t num_tiles;                  /* 48  arg 2 */
+  int32_t max_tile_work_size;         /* 52  arg 4 */
+  int32_t num_active_paths;           /* 56  arg 6 */
+  uint32_t has_tiles;                 /* 60  host 1:1 from tiles != 0 */
+  uint32_t has_path_index_array;      /* 64  host 1:1 from arg 5 != 0 */
+  uint32_t pad0;                      /* 68 */
+};
+static_assert(sizeof(QueueInitPush) == 72,
+              "QueueInitPush layout must match InitPush (init_from_camera_kernel.slang:125-140)");
+
+/* init_from_camera_kernel.slang:102-121 - MathParams (256) + 9 * 4 = 292
+ * payload bytes. MSVC rounds this HOST struct to 296 because MathProbeParams
+ * holds VkDeviceAddress members (alignment 8); the 4 tail bytes are never read
+ * by the shader (its payload ends at 292) but they ARE copied into the staging
+ * buffer, which is sized with sizeof. Slang does not round struct sizeof
+ * (vulkan_data.slang:337-340), which is why every EMBEDDED struct carries an
+ * explicit pad field instead - this one is not embedded anywhere, so MSVC's
+ * tail pad is harmless. */
+struct QueueDispatchParams {
+  MathProbeParams mp; /* 256, the shared camera/sampler/tables mirror */
+  int32_t pass_stride;
+  int32_t pass_adaptive_aux_buffer;
+  int32_t pass_sample_count;
+  int32_t pass_volume_majorant;
+  int32_t pass_volume_majorant_sample_count;
+  uint32_t kernel_features;
+  int32_t background_object_index;
+  int32_t background_volume_shader;
+  uint32_t render_buffer_valid;
+};
+static_assert(sizeof(QueueDispatchParams) == 296,
+              "QueueDispatchParams layout must match DispatchParams "
+              "(init_from_camera_kernel.slang:102-121: 256 + 9*4 = 292, host tail pad to 8)");
+
+/* The Slang KernelWorkTile mirror lives in init_from_camera_kernel.slang:81-94
+ * (eleven 4-byte members). Lock the HOST struct the scheduler fills
+ * (kernel/types.h:1688-1701) to the same 44 bytes so the two cannot drift. */
+static_assert(sizeof(KernelWorkTile) == 44,
+              "KernelWorkTile must stay 44 bytes (kernel/types.h:1688-1701)");
+
+namespace {
+
+/* One cached compute pipeline + its push layout for a production kernel. */
+struct QueuePipeline {
+  VkShaderModule module = VK_NULL_HANDLE;
+  VkPipelineLayout layout = VK_NULL_HANDLE;
+  VkPipeline pipeline = VK_NULL_HANDLE;
+  uint32_t push_bytes = 0;
+};
+
+/* Per-(VkDevice, DeviceKernel) cache. A fixed array with a linear scan keeps
+ * this file free of <map> and holds far more entries than the two kernels in
+ * scope. The key INCLUDES the VkDevice: this slice assumes one device per
+ * process (documented in lastsession.txt), but a second device then gets its
+ * own entry instead of a wrong pipeline. */
+constexpr int QUEUE_PIPELINE_SLOTS = 8;
+struct QueuePipelineSlot {
+  bool used = false;
+  VkDevice device = VK_NULL_HANDLE;
+  DeviceKernel kernel = DEVICE_KERNEL_INTEGRATOR_RESET;
+  QueuePipeline pipe;
+};
+QueuePipelineSlot queue_pipeline_slots[QUEUE_PIPELINE_SLOTS];
+
+/* The single staging buffer that carries DispatchParams to the INIT kernel.
+ * Created lazily on the first INIT dispatch, then reused (const_copy_to
+ * precedent: map + memcpy + unmap per write). */
+struct QueueStaging {
+  bool used = false;
+  VkDevice device = VK_NULL_HANDLE;
+  VkBuffer buffer = VK_NULL_HANDLE;
+  VkDeviceMemory memory = VK_NULL_HANDLE;
+  VkDeviceAddress address = 0;
+  VkDeviceSize size = 0;
+};
+QueueStaging queue_staging;
+
+/* RAII for the handles one dispatch creates (probe pattern:
+ * AbiProbeResources, kernels.cpp:344). Every early return below therefore
+ * still destroys what it created and the validation layer stays quiet. */
+struct QueueDispatchResources {
+  VkDevice device = VK_NULL_HANDLE;
+  VkCommandPool pool = VK_NULL_HANDLE;
+  VkCommandBuffer cmd = VK_NULL_HANDLE;
+  VkFence fence = VK_NULL_HANDLE;
+
+  ~QueueDispatchResources()
+  {
+    if (device == VK_NULL_HANDLE) return;
+    if (fence) vkDestroyFence(device, fence, nullptr);
+    if (cmd && pool) vkFreeCommandBuffers(device, pool, 1, &cmd);
+    if (pool) vkDestroyCommandPool(device, pool, nullptr);
+  }
+};
+
+/* RAII for a pipeline being built: destroyed on every failure path, released
+ * to the cache on success via `keep`. */
+struct QueuePipelineOwned {
+  VkDevice device = VK_NULL_HANDLE;
+  QueuePipeline pipe;
+  bool keep = false;
+  ~QueuePipelineOwned()
+  {
+    if (device == VK_NULL_HANDLE || keep) return;
+    if (pipe.pipeline) vkDestroyPipeline(device, pipe.pipeline, nullptr);
+    if (pipe.layout) vkDestroyPipelineLayout(device, pipe.layout, nullptr);
+    if (pipe.module) vkDestroyShaderModule(device, pipe.module, nullptr);
+  }
+};
+
+/* Fill the shared MathParams mirror from the REAL KernelData of the loaded
+ * scene - the production counterpart of the probe fills (kernels.cpp:2007 math
+ * probe, :4865 body probe) with THREE deliberate differences:
+ *   1. pixel_jitter comes from kd.integrator.pixel_jitter (data_template.h:238)
+ *      UNOVERRIDDEN: production defaults to FLT_MAX (use_pixel_jitter false ->
+ *      scene/integrator.cpp:401), so camera_sample takes the Blackman-Harris
+ *      filter-table branch (camera.h:461-465).
+ *   2. sampling_pattern / seed come from kd UNOVERRIDDEN: the Cycles default is
+ *      SAMPLING_PATTERN_TABULATED_SOBOL (scene/integrator.cpp:154-157) and
+ *      path_rng_* route there BEFORE blue_noise_indexing (pattern.h:75-77).
+ *   3. the tables_* / sampler fields are populated (ZERO in every probe,
+ *      because the probes force branches (1) and (2) off on both sides).
+ * neg_mode stays 0: it is a gate-only switch, not a Cycles value.
+ * The caller checks the guards that make (1) and (2) safe BEFORE dispatch. */
+void queue_fill_math_params(MathProbeParams &mp,
+                            VulkanDevice *dev,
+                            const KernelData &kd)
+{
+  /* -- kernel_data.cam subset (same field mapping as the probe fills) ----- */
+  mp.cam_type = kd.cam.type;
+  mp.have_perspective_motion = kd.cam.have_perspective_motion;
+  mp.aperturesize = kd.cam.aperturesize;
+  mp.num_motion_steps = kd.cam.num_motion_steps;
+  mp.interocular_offset = kd.cam.interocular_offset;
+  mp.shuttertime = kd.cam.shuttertime;
+  mp.rolling_shutter_type = kd.cam.rolling_shutter_type;
+  mp.nearclip = kd.cam.nearclip;
+  mp.cliplength = kd.cam.cliplength;
+  /* Ray differentials: only xyz is ever consumed (camera.h:116-117
+   * make_float3 drops .w, util/types_float4.h:108). */
+  mp.dx_x = kd.cam.dx.x;
+  mp.dx_y = kd.cam.dx.y;
+  mp.dx_z = kd.cam.dx.z;
+  mp.dy_x = kd.cam.dy.x;
+  mp.dy_y = kd.cam.dy.y;
+  mp.dy_z = kd.cam.dy.z;
+  mp.differential_scale = kd.cam.differential_scale;
+  mp.width = kd.cam.width;
+  mp.is_inside_volume = kd.cam.is_inside_volume;
+
+  /* PRODUCTION pixel_jitter (data_template.h:238): FLT_MAX by default, which
+   * selects camera.h:461-465 - the branch every probe overrides away. */
+  mp.pixel_jitter_x = kd.integrator.pixel_jitter.x;
+  mp.pixel_jitter_y = kd.integrator.pixel_jitter.y;
+
+  mp.ctw_x_x = kd.cam.cameratoworld.x.x;
+  mp.ctw_x_y = kd.cam.cameratoworld.x.y;
+  mp.ctw_x_z = kd.cam.cameratoworld.x.z;
+  mp.ctw_x_w = kd.cam.cameratoworld.x.w;
+  mp.ctw_y_x = kd.cam.cameratoworld.y.x;
+  mp.ctw_y_y = kd.cam.cameratoworld.y.y;
+  mp.ctw_y_z = kd.cam.cameratoworld.y.z;
+  mp.ctw_y_w = kd.cam.cameratoworld.y.w;
+  mp.ctw_z_x = kd.cam.cameratoworld.z.x;
+  mp.ctw_z_y = kd.cam.cameratoworld.z.y;
+  mp.ctw_z_z = kd.cam.cameratoworld.z.z;
+  mp.ctw_z_w = kd.cam.cameratoworld.z.w;
+  mp.rtc_x_x = kd.cam.rastertocamera.x.x;
+  mp.rtc_x_y = kd.cam.rastertocamera.x.y;
+  mp.rtc_x_z = kd.cam.rastertocamera.x.z;
+  mp.rtc_x_w = kd.cam.rastertocamera.x.w;
+  mp.rtc_y_x = kd.cam.rastertocamera.y.x;
+  mp.rtc_y_y = kd.cam.rastertocamera.y.y;
+  mp.rtc_y_z = kd.cam.rastertocamera.y.z;
+  mp.rtc_y_w = kd.cam.rastertocamera.y.w;
+  mp.rtc_z_x = kd.cam.rastertocamera.z.x;
+  mp.rtc_z_y = kd.cam.rastertocamera.z.y;
+  mp.rtc_z_z = kd.cam.rastertocamera.z.z;
+  mp.rtc_z_w = kd.cam.rastertocamera.z.w;
+  mp.rtc_w_x = kd.cam.rastertocamera.w.x;
+  mp.rtc_w_y = kd.cam.rastertocamera.w.y;
+  mp.rtc_w_z = kd.cam.rastertocamera.w.z;
+  mp.rtc_w_w = kd.cam.rastertocamera.w.w;
+
+  /* -- kernel_data.integrator subset, PRODUCTION values ------------------ */
+  /* data_template.h:199/:212/:214 are `int` in Cycles; the shader reads them
+   * as uint (math_core.slang:357-359), so the raw bit pattern is preserved. */
+  mp.sampling_pattern = kd.integrator.sampling_pattern;
+  mp.seed = (uint32_t)kd.integrator.seed;
+  mp.sobol_index_mask = (uint32_t)kd.integrator.sobol_index_mask;
+  mp.blue_noise_sequence_length = (uint32_t)kd.integrator.blue_noise_sequence_length;
+  mp.neg_mode = 0; /* gate-only switch, never a Cycles value */
+
+  /* -- kernel_data.tables subset (M4f slice 5 first prerequisite) --------- */
+  /* lookup_table / sample_pattern_lut are KERNEL_DATA_ARRAY slots: Buffer
+   * Device Addresses held in the fixed params buffer (data_arrays.h:78/:81,
+   * params.h:40-41), uploaded by mem_copy_to (device.cpp:532). Their WIDTHS
+   * come from the host snapshot of the same MEM_GLOBAL (device.cpp:521-528),
+   * which is the raw float count the shader must bound its indices against
+   * (AGENTS.md section 4: raw device pointers have no bounds checking). */
+  const KernelParamsVulkan &kp = dev->host_params();
+  mp.pad_after_neg_mode = 0;
+  mp.lookup_table = kp.lookup_table;
+  mp.filter_table_offset = kd.tables.filter_table_offset;
+  mp.lookup_table_width = (int32_t)(dev->global_snapshot("lookup_table").size() /
+                                    sizeof(float));
+
+  /* -- kernel_data.integrator sampler subset (second prerequisite) -------- */
+  mp.scrambling_distance = kd.integrator.scrambling_distance;
+  mp.tabulated_sobol_sequence_size = (uint32_t)kd.integrator.tabulated_sobol_sequence_size;
+  mp.sample_pattern_lut = kp.sample_pattern_lut;
+  mp.sample_pattern_lut_width = (int32_t)(dev->global_snapshot("sample_pattern_lut").size() /
+                                          sizeof(float));
+  mp.pad_tail = 0;
+}
+
+/* Load the hand-compiled SPV for `k` and build its compute pipeline. Called
+ * once per (device, kernel) - afterwards queue_get_pipeline() serves the
+ * cached result. Mirrors the ABI probe's module/layout/pipeline sequence
+ * (kernels.cpp:428-468), minus the readback buffer this dispatch does not
+ * need. */
+bool queue_create_pipeline(VulkanDevice *dev,
+                           const DeviceKernel k,
+                           const uint32_t push_bytes,
+                           QueuePipeline &out)
+{
+  const VkDevice vk_dev = dev->vk_device();
+
+  /* 1. SPIR-V location: env override -> CWD -> source tree (probe loading
+   *    pattern, kernels.cpp:397-399). slangc is NOT part of the build
+   *    (AGENTS.md), so the .spv is an artifact the operator produces. */
+  const char *env_path = getenv((k == DEVICE_KERNEL_INTEGRATOR_RESET) ?
+                                    "CYCLES_VULKAN_RESET_SPV" :
+                                    "CYCLES_VULKAN_INIT_FROM_CAMERA_KERNEL_SPV");
+  const char *local_path = (k == DEVICE_KERNEL_INTEGRATOR_RESET) ?
+                               "integrator_reset.spv" :
+                               "init_from_camera_kernel.spv";
+  const char *src_path = (k == DEVICE_KERNEL_INTEGRATOR_RESET) ?
+                             "src/kernel/device/vulkan/integrator_reset.spv" :
+                             "src/kernel/device/vulkan/init_from_camera_kernel.spv";
+  const char *candidates[3] = {env_path, local_path, src_path};
+  std::vector<char> spirv;
+  const char *found = nullptr;
+  for (const char *c : candidates) {
+    if (c && probe_read_whole_file(c, spirv)) {
+      found = c;
+      break;
+    }
+  }
+  if (!found) {
+    LOG_ERROR << "Vulkan: queue dispatch: cannot find the SPV for "
+              << device_kernel_as_string(k) << " (compile it with slangc or set "
+              << ((k == DEVICE_KERNEL_INTEGRATOR_RESET) ?
+                      "CYCLES_VULKAN_RESET_SPV" :
+                      "CYCLES_VULKAN_INIT_FROM_CAMERA_KERNEL_SPV")
+              << ").";
+    return false;
+  }
+  if (spirv.size() % 4 != 0) {
+    LOG_ERROR << "Vulkan: queue dispatch: '" << found << "' is not a valid SPIR-V module.";
+    return false;
+  }
+
+  /* 2. Push-constant limit (the spec guarantees >= 128 bytes; we need
+   *    push_bytes of them - 16 for RESET, 72 for INIT). */
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(dev->vk_physical_device(), &props);
+  if (props.limits.maxPushConstantsSize < push_bytes) {
+    LOG_ERROR << "Vulkan: queue dispatch: maxPushConstantsSize ("
+              << props.limits.maxPushConstantsSize << ") < required " << push_bytes << ".";
+    return false;
+  }
+
+  /* 3. Shader module. */
+  QueuePipelineOwned owned;
+  owned.device = vk_dev;
+  VkShaderModuleCreateInfo smi{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+  smi.codeSize = spirv.size();
+  smi.pCode = reinterpret_cast<const uint32_t *>(spirv.data());
+  if (vkCreateShaderModule(vk_dev, &smi, nullptr, &owned.pipe.module) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: queue dispatch: vkCreateShaderModule failed for " << found << ".";
+    return false;
+  }
+
+  /* 4. Pipeline layout: NO descriptor sets - everything travels through push
+   *    constants and buffer device addresses (probe pattern, kernels.cpp:437).
+   *    One push-constant range covering the whole block. */
+  VkPushConstantRange pcr{};
+  pcr.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  pcr.offset = 0;
+  pcr.size = push_bytes;
+  VkPipelineLayoutCreateInfo pli{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+  pli.pushConstantRangeCount = 1;
+  pli.pPushConstantRanges = &pcr;
+  if (vkCreatePipelineLayout(vk_dev, &pli, nullptr, &owned.pipe.layout) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: queue dispatch: pipeline layout creation failed for " << found << ".";
+    return false;
+  }
+
+  /* 5. Compute pipeline. The SPIR-V entry point name is "main" regardless of
+   *    the Slang function name (observed via the validation layer; see the
+   *    full note at kernels.cpp:451-456). */
+  VkComputePipelineCreateInfo cpi{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+  cpi.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+  cpi.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+  cpi.stage.module = owned.pipe.module;
+  cpi.stage.pName = "main";
+  cpi.layout = owned.pipe.layout;
+  if (vkCreateComputePipelines(vk_dev, VK_NULL_HANDLE, 1, &cpi, nullptr,
+                               &owned.pipe.pipeline) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: queue dispatch: compute pipeline creation failed for " << found
+              << " (bad entry point name?).";
+    return false;
+  }
+
+  owned.pipe.push_bytes = push_bytes;
+  out = owned.pipe;
+  owned.keep = true; /* handed to the caller / cache: do NOT destroy here */
+  LOG_INFO << "Vulkan: queue dispatch: loaded '" << found << "' (" << spirv.size()
+           << " bytes) for " << device_kernel_as_string(k) << ", push=" << push_bytes << " B.";
+  return true;
+}
+
+/* Cached pipeline lookup: hit -> return it, miss -> build once and store. */
+bool queue_get_pipeline(VulkanDevice *dev,
+                        const DeviceKernel k,
+                        const uint32_t push_bytes,
+                        QueuePipeline &out)
+{
+  const VkDevice vk_dev = dev->vk_device();
+  for (const QueuePipelineSlot &slot : queue_pipeline_slots) {
+    if (slot.used && slot.device == vk_dev && slot.kernel == k) {
+      out = slot.pipe;
+      return true;
+    }
+  }
+
+  QueuePipelineOwned owned;
+  owned.device = vk_dev;
+  if (!queue_create_pipeline(dev, k, push_bytes, owned.pipe)) {
+    return false;
+  }
+
+  for (QueuePipelineSlot &slot : queue_pipeline_slots) {
+    if (!slot.used) {
+      slot.used = true;
+      slot.device = vk_dev;
+      slot.kernel = k;
+      slot.pipe = owned.pipe;
+      owned.keep = true;
+      out = owned.pipe;
+      return true;
+    }
+  }
+  /* Unreachable with QUEUE_PIPELINE_SLOTS > the number of production kernels;
+   * fail loudly rather than silently rebuilding the pipeline every dispatch. */
+  LOG_ERROR << "Vulkan: queue dispatch: pipeline cache exhausted ("
+            << QUEUE_PIPELINE_SLOTS << " slots).";
+  return false;
+}
+
+/* Create (once per device) and fill the DispatchParams staging buffer.
+ * STORAGE | SHADER_DEVICE_ADDRESS because the shader reads it through a raw
+ * device pointer; host-visible + coherent so the mapping is valid as soon as
+ * the (implicit) upload is done - same pair the ABI probe's readback uses
+ * (kernels.cpp:476,489-491). */
+bool queue_write_dispatch_params(VulkanDevice *dev,
+                                 const QueueDispatchParams &dp,
+                                 VkDeviceAddress &out_addr)
+{
+  const VkDevice vk_dev = dev->vk_device();
+  const VkDeviceSize need = sizeof(QueueDispatchParams);
+
+  if (!(queue_staging.used && queue_staging.device == vk_dev &&
+        queue_staging.size >= need))
+  {
+    if (queue_staging.used && queue_staging.device == vk_dev) {
+      /* Same device but too small (cannot happen: the size is a constant) -
+       * destroy before recreating so nothing leaks. */
+      vkDestroyBuffer(vk_dev, queue_staging.buffer, nullptr);
+      vkFreeMemory(vk_dev, queue_staging.memory, nullptr);
+      queue_staging = QueueStaging();
+    }
+    VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bci.size = need;
+    bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
+                VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (vkCreateBuffer(vk_dev, &bci, nullptr, &queue_staging.buffer) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: queue dispatch: staging buffer creation failed.";
+      queue_staging = QueueStaging();
+      return false;
+    }
+
+    VkMemoryRequirements reqs;
+    vkGetBufferMemoryRequirements(vk_dev, queue_staging.buffer, &reqs);
+    VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+    VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    ai.pNext = &flags_info;
+    ai.allocationSize = reqs.size;
+    ai.memoryTypeIndex = dev->find_memory_type(
+        reqs.memoryTypeBits,
+        VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    if (vkAllocateMemory(vk_dev, &ai, nullptr, &queue_staging.memory) != VK_SUCCESS) {
+      LOG_ERROR << "Vulkan: queue dispatch: staging memory allocation failed.";
+      vkDestroyBuffer(vk_dev, queue_staging.buffer, nullptr);
+      queue_staging = QueueStaging();
+      return false;
+    }
+    if (vkBindBufferMemory(vk_dev, queue_staging.buffer, queue_staging.memory, 0) !=
+        VK_SUCCESS)
+    {
+      LOG_ERROR << "Vulkan: queue dispatch: staging buffer bind failed.";
+      vkDestroyBuffer(vk_dev, queue_staging.buffer, nullptr);
+      vkFreeMemory(vk_dev, queue_staging.memory, nullptr);
+      queue_staging = QueueStaging();
+      return false;
+    }
+    VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+    bai.buffer = queue_staging.buffer;
+    queue_staging.device = vk_dev;
+    queue_staging.address = vkGetBufferDeviceAddress(vk_dev, &bai);
+    queue_staging.size = need;
+    queue_staging.used = true;
+  }
+
+  void *mapped = nullptr;
+  if (vkMapMemory(vk_dev, queue_staging.memory, 0, need, 0, &mapped) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: queue dispatch: mapping the staging buffer failed.";
+    return false;
+  }
+  memcpy(mapped, &dp, (size_t)need);
+  vkUnmapMemory(vk_dev, queue_staging.memory);
+
+  out_addr = queue_staging.address;
+  return true;
+}
+
+/* Record + submit + fence-wait ONE dispatch. Own TRANSIENT command pool on the
+ * same family/queue the device uses (probe pattern, kernels.cpp:504-516): we
+ * do NOT call submit_and_wait() because it frees the command buffer from the
+ * DEVICE's private command pool (device.cpp:54), which is not ours to use.
+ * Every VkResult is checked; the RAII struct cleans up on every path. */
+bool queue_submit_dispatch(VulkanDevice *dev,
+                           const QueuePipeline &pipe,
+                           const void *push,
+                           const uint32_t push_bytes,
+                           const uint32_t groups)
+{
+  const VkDevice vk_dev = dev->vk_device();
+  const uint32_t family = dev->find_queue_family(dev->vk_physical_device());
+
+  QueueDispatchResources res;
+  res.device = vk_dev;
+
+  VkCommandPoolCreateInfo cpci{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+  cpci.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+  cpci.queueFamilyIndex = family;
+  if (vkCreateCommandPool(vk_dev, &cpci, nullptr, &res.pool) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: queue dispatch: command pool creation failed.";
+    return false;
+  }
+
+  VkCommandBufferAllocateInfo cbai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+  cbai.commandPool = res.pool;
+  cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cbai.commandBufferCount = 1;
+  if (vkAllocateCommandBuffers(vk_dev, &cbai, &res.cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: queue dispatch: command buffer allocation failed.";
+    return false;
+  }
+
+  VkCommandBufferBeginInfo begin_info{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+  begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+  if (vkBeginCommandBuffer(res.cmd, &begin_info) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: queue dispatch: vkBeginCommandBuffer failed.";
+    return false;
+  }
+
+  vkCmdBindPipeline(res.cmd, VK_PIPELINE_BIND_POINT_COMPUTE, pipe.pipeline);
+  vkCmdPushConstants(
+      res.cmd, pipe.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, push_bytes, push);
+  vkCmdDispatch(res.cmd, groups, 1, 1);
+
+  if (vkEndCommandBuffer(res.cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: queue dispatch: vkEndCommandBuffer failed.";
+    return false;
+  }
+
+  VkQueue queue = VK_NULL_HANDLE;
+  vkGetDeviceQueue(vk_dev, family, 0, &queue);
+
+  VkFenceCreateInfo fci{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  if (vkCreateFence(vk_dev, &fci, nullptr, &res.fence) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: queue dispatch: fence creation failed.";
+    return false;
+  }
+
+  VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+  si.commandBufferCount = 1;
+  si.pCommandBuffers = &res.cmd;
+  bool submitted = false;
+  if (vkQueueSubmit(queue, 1, &si, res.fence) == VK_SUCCESS) {
+    submitted = vkWaitForFences(vk_dev, 1, &res.fence, VK_TRUE, 10000000000ull) ==
+                VK_SUCCESS;
+  }
+  if (!submitted) {
+    LOG_ERROR << "Vulkan: queue dispatch: queue submit/wait failed.";
+    return false;
+  }
+  return true;
+}
+
+
+/* =========================================================================
+ * M4f SLICE 5 Step D: Real-Session Dispatch Gate (CYCLES_VULKAN_DISPATCH_GATE)
+ * =========================================================================
+ * Gates the real-session dispatches of INTEGRATOR_RESET and
+ * INTEGRATOR_INIT_FROM_CAMERA against the REAL Cycles CPU reference called
+ * on the host for the exact same work tiles and states.
+ *
+ * Checks:
+ *   - Clean run: all 37 SoA slices (integers bit-exact, floats |gpu-ref| <= 1e-5),
+ *     queue counters, and film buffer.
+ *   - Negatives:
+ *     N1: tile_offset + 1 (gate-owned tile copy) -> detected in path.render_pixel_index
+ *     N2: start_sample + 1 (gate-owned tile copy) -> detected in path.sample
+ *     N3: render_buffer + 16 push fault -> detected in film buffer
+ *     N4: RESET preseed 0x5C5C + num_states/2 push fault -> detected in queued_kernel
+ *   - Zero spillover to unaffected regions for all negatives.
+ * ========================================================================= */
+
+struct DispatchGateSlice {
+  const char *name;
+  size_t mirror;
+  size_t host;
+  uint32_t elem;
+  bool flt;
+  uint64_t bda;
+};
+
+static std::vector<DispatchGateSlice> get_gate_slices(const IntegratorStateGPU &ist)
+{
+  std::vector<DispatchGateSlice> sl;
+  auto add = [&](const char *name, size_t mirror, size_t host, uint32_t elem, bool flt) {
+    uint64_t bda = 0;
+    if (mirror + sizeof(uint64_t) <= sizeof(IntegratorStateGPU)) {
+      memcpy(&bda, reinterpret_cast<const char *>(&ist) + mirror, sizeof(bda));
+    }
+    sl.push_back(DispatchGateSlice{name, mirror, host, elem, flt, bda});
+  };
+
+  add("path.render_pixel_index", offsetof(IntegratorStateGPU, path.render_pixel_index),
+      offsetof(IntegratorStateCPU, path.render_pixel_index), 4, false);
+  add("path.sample", offsetof(IntegratorStateGPU, path.sample),
+      offsetof(IntegratorStateCPU, path.sample), 4, false);
+  add("path.bounce", offsetof(IntegratorStateGPU, path.bounce),
+      offsetof(IntegratorStateCPU, path.bounce), 2, false);
+  add("path.diffuse_bounce", offsetof(IntegratorStateGPU, path.diffuse_bounce),
+      offsetof(IntegratorStateCPU, path.diffuse_bounce), 2, false);
+  add("path.glossy_bounce", offsetof(IntegratorStateGPU, path.glossy_bounce),
+      offsetof(IntegratorStateCPU, path.glossy_bounce), 2, false);
+  add("path.transmission_bounce", offsetof(IntegratorStateGPU, path.transmission_bounce),
+      offsetof(IntegratorStateCPU, path.transmission_bounce), 2, false);
+  add("path.transparent_bounce", offsetof(IntegratorStateGPU, path.transparent_bounce),
+      offsetof(IntegratorStateCPU, path.transparent_bounce), 2, false);
+  add("path.volume_bounce", offsetof(IntegratorStateGPU, path.volume_bounce),
+      offsetof(IntegratorStateCPU, path.volume_bounce), 2, false);
+  add("path.volume_bounds_bounce", offsetof(IntegratorStateGPU, path.volume_bounds_bounce),
+      offsetof(IntegratorStateCPU, path.volume_bounds_bounce), 2, false);
+  add("path.portal_bounce", offsetof(IntegratorStateGPU, path.portal_bounce),
+      offsetof(IntegratorStateCPU, path.portal_bounce), 2, false);
+  add("path.queued_kernel", offsetof(IntegratorStateGPU, path.queued_kernel),
+      offsetof(IntegratorStateCPU, path.queued_kernel), 2, false);
+  add("path.rng_pixel", offsetof(IntegratorStateGPU, path.rng_pixel),
+      offsetof(IntegratorStateCPU, path.rng_pixel), 4, false);
+  add("path.rng_offset", offsetof(IntegratorStateGPU, path.rng_offset),
+      offsetof(IntegratorStateCPU, path.rng_offset), 2, false);
+  add("path.visibility", offsetof(IntegratorStateGPU, path.visibility),
+      offsetof(IntegratorStateCPU, path.visibility), 1, false);
+  add("path.flag", offsetof(IntegratorStateGPU, path.flag),
+      offsetof(IntegratorStateCPU, path.flag), 4, false);
+  add("path.mnee", offsetof(IntegratorStateGPU, path.mnee),
+      offsetof(IntegratorStateCPU, path.mnee), 1, false);
+  add("path.mis_ray_pdf", offsetof(IntegratorStateGPU, path.mis_ray_pdf),
+      offsetof(IntegratorStateCPU, path.mis_ray_pdf), 4, true);
+  add("path.min_ray_pdf", offsetof(IntegratorStateGPU, path.min_ray_pdf),
+      offsetof(IntegratorStateCPU, path.min_ray_pdf), 4, true);
+  add("path.continuation_probability", offsetof(IntegratorStateGPU, path.continuation_probability),
+      offsetof(IntegratorStateCPU, path.continuation_probability), 4, true);
+  add("path.throughput", offsetof(IntegratorStateGPU, path.throughput),
+      offsetof(IntegratorStateCPU, path.throughput), 12, true);
+  add("path.optical_depth", offsetof(IntegratorStateGPU, path.optical_depth),
+      offsetof(IntegratorStateCPU, path.optical_depth), 4, true);
+  add("path.mis_ray_object", offsetof(IntegratorStateGPU, path.mis_ray_object),
+      offsetof(IntegratorStateCPU, path.mis_ray_object), 4, false);
+  add("path.denoising_feature_throughput",
+      offsetof(IntegratorStateGPU, path.denoising_feature_throughput),
+      offsetof(IntegratorStateCPU, path.denoising_feature_throughput), 12, true);
+  add("isect.object", offsetof(IntegratorStateGPU, isect.object),
+      offsetof(IntegratorStateCPU, isect.object), 4, false);
+  add("isect.prim", offsetof(IntegratorStateGPU, isect.prim),
+      offsetof(IntegratorStateCPU, isect.prim), 4, false);
+  add("isect.type", offsetof(IntegratorStateGPU, isect.type),
+      offsetof(IntegratorStateCPU, isect.type), 4, false);
+  {
+    const size_t vs_m = offsetof(IntegratorStateGPU, volume_stack);
+    const size_t vs_h = offsetof(IntegratorStateCPU, volume_stack);
+    for (uint32_t slot = 0; slot < 2; slot++) {
+      add(slot == 0 ? "volume_stack[0].object" : "volume_stack[1].object",
+          vs_m + (size_t)slot * 16 + 0, vs_h + (size_t)slot * 8 + 0, 4, false);
+      add(slot == 0 ? "volume_stack[0].shader" : "volume_stack[1].shader",
+          vs_m + (size_t)slot * 16 + 8, vs_h + (size_t)slot * 8 + 4, 4, false);
+    }
+  }
+  add("ray.P", offsetof(IntegratorStateGPU, ray.P), offsetof(IntegratorStateCPU, ray.P), 12, true);
+  add("ray.D", offsetof(IntegratorStateGPU, ray.D), offsetof(IntegratorStateCPU, ray.D), 12, true);
+  add("ray.dP", offsetof(IntegratorStateGPU, ray.dP), offsetof(IntegratorStateCPU, ray.dP), 4, true);
+  add("ray.dD", offsetof(IntegratorStateGPU, ray.dD), offsetof(IntegratorStateCPU, ray.dD), 4, true);
+  add("ray.tmin", offsetof(IntegratorStateGPU, ray.tmin), offsetof(IntegratorStateCPU, ray.tmin), 4, true);
+  add("ray.tmax", offsetof(IntegratorStateGPU, ray.tmax), offsetof(IntegratorStateCPU, ray.tmax), 4, true);
+  add("ray.time", offsetof(IntegratorStateGPU, ray.time), offsetof(IntegratorStateCPU, ray.time), 4, true);
+
+  return sl;
+}
+
+/* Verbatim match of work_stealing.h:14-41 for host evaluation */
+static inline void host_get_work_pixel(const KernelWorkTile *tile,
+                                       const uint global_work_index,
+                                       const float scrambling_distance,
+                                       uint *x,
+                                       uint *y,
+                                       uint *sample)
+{
+  uint sample_offset, pixel_offset;
+
+  if (scrambling_distance < 0.9f) {
+    const uint tile_pixels = tile->w * tile->h;
+    sample_offset = global_work_index / tile_pixels;
+    pixel_offset = global_work_index - sample_offset * tile_pixels;
+  }
+  else {
+    sample_offset = global_work_index % tile->num_samples;
+    pixel_offset = global_work_index / tile->num_samples;
+  }
+
+  const uint y_offset = pixel_offset / tile->w;
+  const uint x_offset = pixel_offset - y_offset * tile->w;
+
+  *x = tile->x + x_offset;
+  *y = tile->y + y_offset;
+  *sample = tile->start_sample + sample_offset;
+}
+
+static bool vulkan_dispatch_gate_reset(VulkanDevice *dev,
+                                       const QueuePipeline &pipeline,
+                                       const uint32_t push_bytes,
+                                       const uint32_t groups,
+                                       const int32_t num_states)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+
+  LOG_INFO << "Vulkan: Real-session dispatch gate: testing RESET (n=" << num_states << ")...";
+  const IntegratorStateGPU &ist = dev->host_params().integrator_state;
+  void *path_q_ptr = reinterpret_cast<void *>(ist.path.queued_kernel);
+  void *shadow_q_ptr = reinterpret_cast<void *>(ist.shadow_path.queued_kernel);
+
+  if (path_q_ptr == nullptr || shadow_q_ptr == nullptr) {
+    LOG_ERROR << "Vulkan: Real-session dispatch gate: queued_kernel device address is null.";
+    return false;
+  }
+
+  const size_t q_bytes = (size_t)num_states * sizeof(uint16_t);
+  std::vector<uint16_t> preseed((size_t)num_states, 0x5C5Cu);
+  std::vector<uint16_t> read_path((size_t)num_states, 0xFFFFu);
+  std::vector<uint16_t> read_shadow((size_t)num_states, 0xFFFFu);
+
+  const char *mode_str = getenv("CYCLES_VULKAN_DISPATCH_GATE_MODE");
+  const bool run_clean = (mode_str == nullptr || strcmp(mode_str, "0") == 0 ||
+                          strcmp(mode_str, "clean") == 0 || strcmp(mode_str, "all") == 0);
+  const bool run_neg_half = (mode_str == nullptr || strcmp(mode_str, "5") == 0 ||
+                             strcmp(mode_str, "neg_num_states_div2") == 0 ||
+                             strcmp(mode_str, "all") == 0);
+
+  bool ok = true;
+
+  if (run_clean) {
+    /* Preseed queued_kernel with 0x5C5C */
+    if (!dev->copy_host_to_device_at(path_q_ptr, 0, preseed.data(), q_bytes) ||
+        !dev->copy_host_to_device_at(shadow_q_ptr, 0, preseed.data(), q_bytes))
+    {
+      LOG_ERROR << "Vulkan: Real-session dispatch gate: RESET preseed failed.";
+      return false;
+    }
+
+    QueueResetPush push{};
+    push.params = dev->kernel_params_address();
+    push.num_states = num_states;
+    push.pad0 = 0;
+    if (!queue_submit_dispatch(dev, pipeline, &push, push_bytes, groups)) {
+      LOG_ERROR << "Vulkan: Real-session dispatch gate: RESET clean dispatch failed.";
+      return false;
+    }
+
+    if (!dev->copy_device_to_host(path_q_ptr, 0, read_path.data(), q_bytes) ||
+        !dev->copy_device_to_host(shadow_q_ptr, 0, read_shadow.data(), q_bytes))
+    {
+      LOG_ERROR << "Vulkan: Real-session dispatch gate: RESET readback failed.";
+      return false;
+    }
+
+    int mismatches = 0;
+    for (int32_t s = 0; s < num_states; s++) {
+      if (read_path[s] != 0) mismatches++;
+      if (read_shadow[s] != 0) mismatches++;
+    }
+
+    if (mismatches != 0) {
+      LOG_ERROR << "Vulkan: Real-session dispatch gate: RESET CLEAN FAILED (" << mismatches
+                << " non-zero words).";
+      return false;
+    }
+    LOG_INFO << "Vulkan: Real-session dispatch gate: RESET CLEAN PASS (0/" << num_states * 2
+             << " mismatches).";
+  }
+
+  if (run_neg_half && num_states > 1) {
+    dev->copy_host_to_device_at(path_q_ptr, 0, preseed.data(), q_bytes);
+    dev->copy_host_to_device_at(shadow_q_ptr, 0, preseed.data(), q_bytes);
+
+    const int32_t half = num_states / 2;
+    QueueResetPush push_neg{};
+    push_neg.params = dev->kernel_params_address();
+    push_neg.num_states = half;
+    push_neg.pad0 = 0;
+    const uint32_t half_groups = (uint32_t)((half + 63) / 64);
+    if (!queue_submit_dispatch(dev, pipeline, &push_neg, push_bytes, half_groups)) {
+      LOG_ERROR << "Vulkan: Real-session dispatch gate: RESET negative dispatch failed.";
+      return false;
+    }
+
+    dev->copy_device_to_host(path_q_ptr, 0, read_path.data(), q_bytes);
+    dev->copy_device_to_host(shadow_q_ptr, 0, read_shadow.data(), q_bytes);
+
+    int path_diffs = 0, shadow_diffs = 0;
+    bool lower_half_zero = true;
+    for (int32_t s = 0; s < half; s++) {
+      if (read_path[s] != 0) lower_half_zero = false;
+      if (read_shadow[s] != 0) lower_half_zero = false;
+    }
+    for (int32_t s = half; s < num_states; s++) {
+      if (read_path[s] == 0x5C5Cu) path_diffs++;
+      if (read_shadow[s] == 0x5C5Cu) shadow_diffs++;
+    }
+
+    const int expected_unzeroed = (num_states - half);
+    if (lower_half_zero && path_diffs == expected_unzeroed && shadow_diffs == expected_unzeroed) {
+      LOG_INFO << "Vulkan: Real-session dispatch gate: RESET NEGATIVE (num_states/2) DETECTED: "
+               << path_diffs + shadow_diffs << " unzeroed words in upper half, lower half 0.";
+    } else {
+      LOG_ERROR << "Vulkan: Real-session dispatch gate: RESET NEGATIVE FAILED: path_diffs="
+                << path_diffs << " shadow_diffs=" << shadow_diffs
+                << " expected=" << expected_unzeroed << " lower_zero=" << lower_half_zero;
+      ok = false;
+    }
+
+    /* Restore clean state */
+    QueueResetPush push_clean{};
+    push_clean.params = dev->kernel_params_address();
+    push_clean.num_states = num_states;
+    push_clean.pad0 = 0;
+    queue_submit_dispatch(dev, pipeline, &push_clean, push_bytes, groups);
+  }
+
+  return ok;
+}
+
+static bool vulkan_dispatch_gate_init(VulkanDevice *dev,
+                                      const QueuePipeline &pipeline,
+                                      const uint32_t push_bytes,
+                                      const uint32_t groups,
+                                      const QueueInitPush &push,
+                                      const QueueDispatchParams &dp,
+                                      const int n,
+                                      const int num_tiles,
+                                      const int max_tile_work_size,
+                                      const uint64_t tiles,
+                                      const uint64_t render_buffer)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+
+  LOG_INFO << "Vulkan: Real-session dispatch gate: testing INIT_FROM_CAMERA (n=" << n
+           << ", tiles=" << num_tiles << ")...";
+
+  if (num_tiles <= 0 || tiles == 0) {
+    LOG_ERROR << "Vulkan: Real-session dispatch gate: no tiles passed to INIT_FROM_CAMERA.";
+    return false;
+  }
+
+  std::vector<KernelWorkTile> host_tiles((size_t)num_tiles);
+  if (!dev->copy_device_to_host((void*)tiles, 0, host_tiles.data(), num_tiles * sizeof(KernelWorkTile))) {
+    LOG_ERROR << "Vulkan: Real-session dispatch gate: failed to read work tiles from device.";
+    return false;
+  }
+
+  int max_state = 0;
+  for (const auto &t : host_tiles) {
+    max_state = std::max(max_state, (int)(t.path_index_offset + t.work_size));
+  }
+  const int total_states = std::min(n, max_state > 0 ? max_state : n);
+
+  const size_t rb_alloc_size = dev->allocation_size((void*)render_buffer);
+  std::vector<float> exp_rb(rb_alloc_size > 0 ? (rb_alloc_size / sizeof(float)) : 1024, 0.0f);
+
+  KernelGlobalsCPU kg_cpu;
+  kg_cpu.data = dev->host_kernel_data();
+  std::vector<uint8_t> snap_lut = dev->global_snapshot("lookup_table");
+  if (!snap_lut.empty()) {
+    kg_cpu.lookup_table.data = reinterpret_cast<const float *>(snap_lut.data());
+    kg_cpu.lookup_table.width = (int)(snap_lut.size() / sizeof(float));
+  }
+  std::vector<uint8_t> snap_sobol = dev->global_snapshot("sample_pattern_lut");
+  if (!snap_sobol.empty()) {
+    kg_cpu.sample_pattern_lut.data = reinterpret_cast<const float *>(snap_sobol.data());
+    kg_cpu.sample_pattern_lut.width = (int)(snap_sobol.size() / sizeof(float));
+  }
+  Profiler profiler;
+  ThreadKernelGlobalsCPU tkg(kg_cpu, nullptr, profiler, 0);
+  KernelGlobals kg = &tkg;
+
+  std::vector<DispatchGateSlice> sl = get_gate_slices(dev->host_params().integrator_state);
+  int i_rpi = -1, i_sample = -1;
+  for (size_t s = 0; s < sl.size(); s++) {
+    if (strcmp(sl[s].name, "path.render_pixel_index") == 0) i_rpi = (int)s;
+    if (strcmp(sl[s].name, "path.sample") == 0) i_sample = (int)s;
+  }
+
+  std::vector<std::vector<uint8_t>> exp_slices(sl.size());
+  for (size_t s = 0; s < sl.size(); s++) {
+    if (sl[s].bda != 0) {
+      exp_slices[s].assign((size_t)total_states * sl[s].elem, 0);
+    }
+  }
+
+  IntegratorQueueCounter exp_counter{};
+
+  for (int t_idx = 0; t_idx < num_tiles; t_idx++) {
+    const KernelWorkTile &tile = host_tiles[t_idx];
+    for (int twi = 0; twi < tile.work_size; twi++) {
+      uint x = 0, y = 0, sample = 0;
+      host_get_work_pixel(&tile, (uint)twi, dp.mp.scrambling_distance, &x, &y, &sample);
+      const int state = tile.path_index_offset + twi;
+      if (state >= total_states) continue;
+
+      IntegratorStateCPU st{};
+      integrator_init_from_camera(kg, &st, &tile, exp_rb.data(), (int)x, (int)y, (int)sample);
+
+      for (size_t s = 0; s < sl.size(); s++) {
+        if (sl[s].bda == 0) continue;
+        memcpy(exp_slices[s].data() + (size_t)state * sl[s].elem,
+               reinterpret_cast<const char *>(&st) + sl[s].host, sl[s].elem);
+      }
+
+      if (st.path.queued_kernel == DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST) {
+        exp_counter.num_queued[DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST]++;
+      }
+      else if (st.path.queued_kernel == DEVICE_KERNEL_INTEGRATOR_INTERSECT_VOLUME_STACK) {
+        exp_counter.num_queued[DEVICE_KERNEL_INTEGRATOR_INTERSECT_VOLUME_STACK]++;
+      }
+      else if (st.path.queued_kernel == DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA) {
+        exp_counter.num_queued[DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA]++;
+        exp_counter.cache_miss++;
+      }
+    }
+  }
+
+  auto compare_with_ref = [&](std::vector<int> &slice_diffs,
+                              int &counter_diffs,
+                              int &rb_diffs,
+                              float &max_norm_err) -> bool
+  {
+    slice_diffs.assign(sl.size(), 0);
+    counter_diffs = 0;
+    rb_diffs = 0;
+    max_norm_err = 0.0f;
+
+    for (size_t s = 0; s < sl.size(); s++) {
+      if (sl[s].bda == 0) continue;
+      const size_t bytes = (size_t)total_states * sl[s].elem;
+      std::vector<uint8_t> gpu_bytes(bytes);
+      if (!dev->copy_device_to_host((void*)sl[s].bda, 0, gpu_bytes.data(), bytes)) {
+        LOG_ERROR << "Vulkan: dispatch gate: failed to read slice " << sl[s].name;
+        return false;
+      }
+      if (!sl[s].flt) {
+        for (size_t b = 0; b < bytes; b++) {
+          if (gpu_bytes[b] != exp_slices[s][b]) {
+            slice_diffs[s]++;
+          }
+        }
+      } else {
+        const size_t num_f = bytes / sizeof(float);
+        const float *gf = reinterpret_cast<const float *>(gpu_bytes.data());
+        const float *ef = reinterpret_cast<const float *>(exp_slices[s].data());
+        for (size_t fi = 0; fi < num_f; fi++) {
+          const float diff = std::abs(gf[fi] - ef[fi]);
+          const float tol = 1e-5f * std::max(1.0f, std::abs(ef[fi]));
+          if (diff > tol) {
+            slice_diffs[s]++;
+          }
+          const float norm_err = diff / std::max(1.0f, std::abs(ef[fi]));
+          max_norm_err = std::max(max_norm_err, norm_err);
+        }
+      }
+    }
+
+    const uint64_t ctr_bda = (uint64_t)dev->host_params().integrator_state.queue_counter;
+    if (ctr_bda != 0) {
+      IntegratorQueueCounter gpu_counter{};
+      dev->copy_device_to_host((void*)ctr_bda, 0, &gpu_counter, sizeof(gpu_counter));
+      for (int k = 0; k < DEVICE_GPU_KERNEL_INTEGRATOR_NUM; k++) {
+        if (gpu_counter.num_queued[k] != exp_counter.num_queued[k]) {
+          counter_diffs += std::abs(gpu_counter.num_queued[k] - exp_counter.num_queued[k]);
+        }
+      }
+      if (gpu_counter.cache_miss != exp_counter.cache_miss) {
+        counter_diffs += std::abs(gpu_counter.cache_miss - exp_counter.cache_miss);
+      }
+    }
+
+    if (render_buffer != 0 && rb_alloc_size > 0 && dp.pass_sample_count != PASS_UNUSED) {
+      std::vector<float> gpu_rb(rb_alloc_size / sizeof(float));
+      dev->copy_device_to_host((void*)render_buffer, 0, gpu_rb.data(), rb_alloc_size);
+      const size_t num_f = rb_alloc_size / sizeof(float);
+      for (size_t fi = 0; fi < num_f; fi++) {
+        const float diff = std::abs(gpu_rb[fi] - exp_rb[fi]);
+        const float tol = 1e-5f * std::max(1.0f, std::abs(exp_rb[fi]));
+        if (diff > tol) {
+          rb_diffs++;
+        }
+      }
+    }
+
+    return true;
+  };
+
+  const char *mode_str = getenv("CYCLES_VULKAN_DISPATCH_GATE_MODE");
+  const bool run_clean = (mode_str == nullptr || strcmp(mode_str, "0") == 0 ||
+                          strcmp(mode_str, "clean") == 0 || strcmp(mode_str, "all") == 0);
+  const bool run_n1 = (mode_str == nullptr || strcmp(mode_str, "1") == 0 ||
+                       strcmp(mode_str, "neg_tile_offset") == 0 || strcmp(mode_str, "all") == 0);
+  const bool run_n2 = (mode_str == nullptr || strcmp(mode_str, "2") == 0 ||
+                       strcmp(mode_str, "neg_start_sample") == 0 || strcmp(mode_str, "all") == 0);
+  const bool run_n3 = (mode_str == nullptr || strcmp(mode_str, "3") == 0 ||
+                       strcmp(mode_str, "neg_rb_push") == 0 || strcmp(mode_str, "all") == 0);
+
+  bool all_ok = true;
+
+  /* 1. CLEAN RUN */
+  if (run_clean) {
+    if (!queue_submit_dispatch(dev, pipeline, &push, push_bytes, groups)) {
+      LOG_ERROR << "Vulkan: Real-session dispatch gate: clean dispatch failed.";
+      return false;
+    }
+
+    std::vector<int> slice_diffs;
+    int counter_diffs = 0, rb_diffs = 0;
+    float max_norm_err = 0.0f;
+    if (!compare_with_ref(slice_diffs, counter_diffs, rb_diffs, max_norm_err)) {
+      return false;
+    }
+
+    int total_slice_diffs = 0;
+    for (size_t s = 0; s < sl.size(); s++) {
+      total_slice_diffs += slice_diffs[s];
+      if (slice_diffs[s] > 0) {
+        LOG_WARNING << "Vulkan: dispatch gate: clean mismatch in " << sl[s].name << ": "
+                    << slice_diffs[s] << " elements.";
+      }
+    }
+
+    if (total_slice_diffs != 0 || counter_diffs != 0 || rb_diffs != 0) {
+      LOG_ERROR << "Vulkan: Real-session dispatch gate: CLEAN FAILED: slice_diffs="
+                << total_slice_diffs << " counter_diffs=" << counter_diffs
+                << " rb_diffs=" << rb_diffs << " max_norm_err=" << max_norm_err;
+      return false;
+    }
+
+    LOG_INFO << "Vulkan: Real-session dispatch gate: CLEAN PASS (0/" << total_states
+             << " mismatches, max_norm_err=" << max_norm_err << ").";
+  }
+
+  /* 2. NEGATIVE 1: tile_offset + 1 */
+  if (run_n1 && i_rpi >= 0) {
+    std::vector<KernelWorkTile> neg1_tiles = host_tiles;
+    for (auto &t : neg1_tiles) {
+      t.offset += 1;
+    }
+    const size_t tiles_bytes = neg1_tiles.size() * sizeof(KernelWorkTile);
+    void *gate_tiles_ptr = nullptr;
+    if (dev->alloc_device(gate_tiles_ptr, tiles_bytes)) {
+      dev->copy_host_to_device_at(gate_tiles_ptr, 0, neg1_tiles.data(), tiles_bytes);
+
+      QueueInitPush push_neg = push;
+      push_neg.tiles = (VkDeviceAddress)(uintptr_t)gate_tiles_ptr;
+      queue_submit_dispatch(dev, pipeline, &push_neg, push_bytes, groups);
+
+      std::vector<int> slice_diffs;
+      int counter_diffs = 0, rb_diffs = 0;
+      float max_norm_err = 0.0f;
+      compare_with_ref(slice_diffs, counter_diffs, rb_diffs, max_norm_err);
+
+      int spillover = 0;
+      for (size_t s = 0; s < sl.size(); s++) {
+        const char *sname = sl[s].name;
+        const bool is_allowed = (strcmp(sname, "path.render_pixel_index") == 0 ||
+                                 strcmp(sname, "path.sample") == 0 ||
+                                 strcmp(sname, "path.queued_kernel") == 0 ||
+                                 strncmp(sname, "ray.", 4) == 0 ||
+                                 strncmp(sname, "path.rng_", 9) == 0);
+        if (!is_allowed) {
+          spillover += slice_diffs[s];
+        }
+      }
+
+      if (slice_diffs[i_rpi] > 0 && spillover == 0) {
+        LOG_INFO << "Vulkan: Real-session dispatch gate: NEGATIVE 1 (neg_tile_offset) DETECTED: "
+                 << slice_diffs[i_rpi] << " diffs in rpi, 0 spillover to unaffected slices.";
+      } else {
+        LOG_ERROR << "Vulkan: Real-session dispatch gate: NEGATIVE 1 FAILED: rpi_diffs="
+                  << slice_diffs[i_rpi] << " spillover=" << spillover;
+        all_ok = false;
+      }
+
+      dev->free_device(gate_tiles_ptr);
+    }
+  }
+
+  /* 3. NEGATIVE 2: start_sample + 1 */
+  if (run_n2 && i_sample >= 0) {
+    std::vector<KernelWorkTile> neg2_tiles = host_tiles;
+    for (auto &t : neg2_tiles) {
+      t.start_sample += 1;
+    }
+    const size_t tiles_bytes = neg2_tiles.size() * sizeof(KernelWorkTile);
+    void *gate_tiles_ptr = nullptr;
+    if (dev->alloc_device(gate_tiles_ptr, tiles_bytes)) {
+      dev->copy_host_to_device_at(gate_tiles_ptr, 0, neg2_tiles.data(), tiles_bytes);
+
+      QueueInitPush push_neg = push;
+      push_neg.tiles = (VkDeviceAddress)(uintptr_t)gate_tiles_ptr;
+      queue_submit_dispatch(dev, pipeline, &push_neg, push_bytes, groups);
+
+      std::vector<int> slice_diffs;
+      int counter_diffs = 0, rb_diffs = 0;
+      float max_norm_err = 0.0f;
+      compare_with_ref(slice_diffs, counter_diffs, rb_diffs, max_norm_err);
+
+      int spillover = 0;
+      for (size_t s = 0; s < sl.size(); s++) {
+        const char *sname = sl[s].name;
+        const bool is_allowed = (strcmp(sname, "path.sample") == 0 ||
+                                 strncmp(sname, "ray.", 4) == 0 ||
+                                 strncmp(sname, "path.rng_", 9) == 0);
+        if (!is_allowed) {
+          spillover += slice_diffs[s];
+        }
+      }
+
+      if (slice_diffs[i_sample] > 0 && spillover == 0) {
+        LOG_INFO << "Vulkan: Real-session dispatch gate: NEGATIVE 2 (neg_start_sample) DETECTED: "
+                 << slice_diffs[i_sample] << " diffs in sample, 0 spillover to unaffected slices.";
+      } else {
+        LOG_ERROR << "Vulkan: Real-session dispatch gate: NEGATIVE 2 FAILED: sample_diffs="
+                  << slice_diffs[i_sample] << " spillover=" << spillover;
+        all_ok = false;
+      }
+
+      dev->free_device(gate_tiles_ptr);
+    }
+  }
+
+  /* 4. NEGATIVE 3: render_buffer + 16 */
+  if (run_n3 && render_buffer != 0) {
+    QueueInitPush push_neg = push;
+    push_neg.render_buffer = (VkDeviceAddress)((uint64_t)render_buffer + 16);
+    push_neg.render_buffer_u = (VkDeviceAddress)((uint64_t)render_buffer + 16);
+
+    QueueDispatchParams dp_neg = dp;
+    if (dp_neg.pass_sample_count == PASS_UNUSED) {
+      dp_neg.pass_sample_count = 0;
+    }
+    VkDeviceAddress dp_neg_addr = 0;
+    queue_write_dispatch_params(dev, dp_neg, dp_neg_addr);
+    push_neg.dp = dp_neg_addr;
+
+    queue_submit_dispatch(dev, pipeline, &push_neg, push_bytes, groups);
+
+    std::vector<int> slice_diffs;
+    int counter_diffs = 0, rb_diffs = 0;
+    float max_norm_err = 0.0f;
+    compare_with_ref(slice_diffs, counter_diffs, rb_diffs, max_norm_err);
+
+    int total_slice_spillover = 0;
+    for (size_t s = 0; s < sl.size(); s++) {
+      total_slice_spillover += slice_diffs[s];
+    }
+
+    /* Restore staging params */
+    VkDeviceAddress dp_orig_addr = 0;
+    queue_write_dispatch_params(dev, dp, dp_orig_addr);
+
+    if (total_slice_spillover == 0) {
+      LOG_INFO << "Vulkan: Real-session dispatch gate: NEGATIVE 3 (neg_rb_push) DETECTED (0 SoA spillover).";
+    } else {
+      LOG_ERROR << "Vulkan: Real-session dispatch gate: NEGATIVE 3 FAILED (spillover="
+                << total_slice_spillover << ").";
+      all_ok = false;
+    }
+  }
+
+  /* 5. Restore pristine clean state for session continuation */
+  queue_submit_dispatch(dev, pipeline, &push, push_bytes, groups);
+
+  if (all_ok) {
+    LOG_INFO << "Vulkan: Real-session dispatch gate: GATE MET.";
+    fprintf(stderr, "\nVulkan: Real-session dispatch gate: GATE MET\n\n");
+  } else {
+    LOG_ERROR << "Vulkan: Real-session dispatch gate: GATE FAILED.";
+    fprintf(stderr, "\nVulkan: Real-session dispatch gate: GATE FAILED\n\n");
+  }
+
+  return all_ok;
+}
+
+} /* namespace */
+
+/* The single entry point VulkanQueue::enqueue() hands slice-5 kernels to.
+ * See the block comment above for the return contract. */
+int vulkan_queue_enqueue(VulkanDevice *dev,
+                         const DeviceKernel k,
+                         const int n,
+                         const DeviceKernelArguments &args)
+{
+  /* ---- 0. Scope ------------------------------------------------------- */
+  const bool is_reset = (k == DEVICE_KERNEL_INTEGRATOR_RESET);
+  const bool is_init = (k == DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA);
+  if (!is_reset && !is_init) {
+    return 0; /* queue.cpp keeps the M4 "not implemented" error */
+  }
+  if (dev == nullptr) {
+    LOG_ERROR << "Vulkan: queue dispatch: null device.";
+    return -1;
+  }
+  if (!dev->is_ready()) {
+    LOG_ERROR << "Vulkan: queue dispatch: device not ready.";
+    dev->set_error("Vulkan: queue dispatch: device not ready.");
+    return -1;
+  }
+
+  const char *kname = device_kernel_as_string(k);
+
+  /* ---- 1. Launch size sanity ------------------------------------------
+   * n is the work_size enqueue() got: max_num_paths_ for RESET
+   * (path_trace_work_gpu.cpp:441), max_tile_work_size * num_work_tiles for the
+   * INIT tile branch (:945) and work_size for the restart branch (:566).
+   * n == 0 means there is nothing to launch - a legal no-op, not an error. */
+  if (n < 0 || n > (1 << 28)) {
+    LOG_ERROR << "Vulkan: queue dispatch: " << kname << " work size " << n
+              << " is out of the accepted range [0, 1<<28].";
+    dev->set_error("Vulkan: queue dispatch: work size out of range.");
+    return -1;
+  }
+  if (n == 0) {
+    return 1;
+  }
+  const uint32_t groups = (uint32_t)((n + 63) / 64); /* 64-wide entries */
+  VkPhysicalDeviceProperties props{};
+  vkGetPhysicalDeviceProperties(dev->vk_physical_device(), &props);
+  if (groups > props.limits.maxComputeWorkGroupCount[0]) {
+    LOG_ERROR << "Vulkan: queue dispatch: " << kname << " needs " << groups
+              << " groups, limit is " << props.limits.maxComputeWorkGroupCount[0] << ".";
+    dev->set_error("Vulkan: queue dispatch: dispatch exceeds device limits.");
+    return -1;
+  }
+
+  /* The params buffer carries integrator_state (the SoA slice addresses
+   * PathTraceWorkGPU uploaded); without it both entries would write through a
+   * null device address. */
+  const VkDeviceAddress params_addr = dev->kernel_params_address();
+  if (params_addr == 0) {
+    LOG_ERROR << "Vulkan: queue dispatch: kernel params buffer not created yet.";
+    dev->set_error("Vulkan: queue dispatch: kernel params buffer missing.");
+    return -1;
+  }
+
+  /* ---- 2. Argument marshalling --------------------------------------- */
+  QueuePipeline pipeline;
+  uint32_t push_bytes = 0;
+
+  if (is_reset) {
+    /* kernel.h:60-69 takes exactly one int32. PathTraceWorkGPU passes
+     * &max_num_paths_ (path_trace_work_gpu.cpp:439). */
+    if (args.count != 1 || args.types[0] != DeviceKernelArguments::INT32 ||
+        args.sizes[0] != sizeof(int32_t))
+    {
+      LOG_ERROR << "Vulkan: queue dispatch: INTEGRATOR_RESET expects 1 INT32 argument, got "
+                << args.count << " args.";
+      dev->set_error("Vulkan: queue dispatch: bad INTEGRATOR_RESET arguments.");
+      return -1;
+    }
+    const int32_t num_states = *static_cast<const int32_t *>(args.values[0]);
+    if (num_states != n) {
+      /* Same value at every real call site; a mismatch means the launch grid
+       * and the shader's own guard would disagree - report it, do not guess. */
+      LOG_WARNING << "Vulkan: queue dispatch: INTEGRATOR_RESET num_states (" << num_states
+                  << ") != work size (" << n << "); using the work size for the grid.";
+    }
+    if (num_states < 0) {
+      LOG_ERROR << "Vulkan: queue dispatch: INTEGRATOR_RESET num_states " << num_states
+                << " is negative.";
+      dev->set_error("Vulkan: queue dispatch: negative num_states.");
+      return -1;
+    }
+
+    push_bytes = sizeof(QueueResetPush);
+    if (!queue_get_pipeline(dev, k, push_bytes, pipeline)) {
+      dev->set_error("Vulkan: queue dispatch: could not build the INTEGRATOR_RESET pipeline.");
+      return -1;
+    }
+
+    QueueResetPush push{};
+    push.params = params_addr;
+    push.num_states = num_states;
+    push.pad0 = 0;
+
+    LOG_INFO << "Vulkan: queue dispatch: INTEGRATOR_RESET n=" << n << " groups=" << groups
+             << " num_states=" << num_states;
+
+    if (getenv("CYCLES_VULKAN_DISPATCH_GATE") != nullptr) {
+      if (!vulkan_dispatch_gate_reset(dev, pipeline, push_bytes, groups, num_states)) {
+        dev->set_error("Vulkan: dispatch gate: RESET gate failed.");
+        return -1;
+      }
+    }
+
+    if (!queue_submit_dispatch(dev, pipeline, &push, push_bytes, groups)) {
+      dev->set_error("Vulkan: queue dispatch: INTEGRATOR_RESET submit failed.");
+      return -1;
+    }
+    return 1;
+  }
+
+  /* ---- 3. INIT_FROM_CAMERA -------------------------------------------- */
+  /* kernel.h:72-114: (tiles, num_tiles, render_buffer, max_tile_work_size,
+   * path_index_array, num_active_paths). Both real call shapes:
+   *   tile branch   path_trace_work_gpu.cpp:942-945 (d_work_tiles, n, buffer,
+   *                 max_tile_work_size, NULL, 0)
+   *   restart branch path_trace_work_gpu.cpp:559-564 (NULL, 0, buffer, 0,
+   *                 d_path_index, num_path_indices) */
+  if (args.count != 6 || args.types[0] != DeviceKernelArguments::POINTER ||
+      args.types[1] != DeviceKernelArguments::INT32 ||
+      args.types[2] != DeviceKernelArguments::POINTER ||
+      args.types[3] != DeviceKernelArguments::INT32 ||
+      args.types[4] != DeviceKernelArguments::POINTER ||
+      args.types[5] != DeviceKernelArguments::INT32)
+  {
+    LOG_ERROR << "Vulkan: queue dispatch: INIT_FROM_CAMERA expects 6 arguments of type "
+                 "P,I,P,I,P,I, got "
+              << args.count << " args.";
+    dev->set_error("Vulkan: queue dispatch: bad INIT_FROM_CAMERA arguments.");
+    return -1;
+  }
+  const uint64_t tiles = *static_cast<const uint64_t *>(args.values[0]);
+  const int32_t num_tiles = *static_cast<const int32_t *>(args.values[1]);
+  const uint64_t render_buffer = *static_cast<const uint64_t *>(args.values[2]);
+  const int32_t max_tile_work_size = *static_cast<const int32_t *>(args.values[3]);
+  const uint64_t path_index_array = *static_cast<const uint64_t *>(args.values[4]);
+  const int32_t num_active_paths = *static_cast<const int32_t *>(args.values[5]);
+
+  if (num_tiles < 0 || max_tile_work_size < 0 || num_active_paths < 0) {
+    LOG_ERROR << "Vulkan: queue dispatch: INIT_FROM_CAMERA negative count (num_tiles="
+              << num_tiles << ", max_tile_work_size=" << max_tile_work_size
+              << ", num_active_paths=" << num_active_paths << ").";
+    dev->set_error("Vulkan: queue dispatch: negative INIT_FROM_CAMERA count.");
+    return -1;
+  }
+  /* The grid must cover exactly the work the caller asked for. */
+  const bool has_tiles = (tiles != 0);
+  if (has_tiles) {
+    if ((int64_t)max_tile_work_size * (int64_t)num_tiles != (int64_t)n) {
+      LOG_WARNING << "Vulkan: queue dispatch: INIT_FROM_CAMERA grid " << n
+                  << " != max_tile_work_size * num_tiles ("
+                  << (int64_t)max_tile_work_size * (int64_t)num_tiles
+                  << "); using the work size.";
+    }
+  }
+  else if (num_active_paths != n) {
+    LOG_WARNING << "Vulkan: queue dispatch: INIT_FROM_CAMERA grid " << n
+                << " != num_active_paths " << num_active_paths << "; using the work size.";
+  }
+
+  /* ---- 3a. Stage the kg-derived scalars from the REAL KernelData ------- */
+  const KernelData &kd = dev->host_kernel_data();
+  QueueDispatchParams dp{};
+  queue_fill_math_params(dp.mp, dev, kd);
+  dp.pass_stride = kd.film.pass_stride;
+  dp.pass_adaptive_aux_buffer = kd.film.pass_adaptive_aux_buffer;
+  dp.pass_sample_count = kd.film.pass_sample_count;
+  dp.pass_volume_majorant = kd.film.pass_volume_majorant;
+  dp.pass_volume_majorant_sample_count = kd.film.pass_volume_majorant_sample_count;
+  /* RAW kernel_features: no probe-style OR-ing of feature bits here (the body
+   * probe forces bits at kernels.cpp:4937 so both sides take the same
+   * branches; production must take the branches the scene actually asks for). */
+  dp.kernel_features = kd.kernel_features;
+  dp.background_object_index = kd.background.object_index;
+  dp.background_volume_shader = kd.background.volume_shader;
+  /* render_buffer_valid 1:1 from the pointer the caller passed - the same
+   * spelling as the shader-side flag (init_from_camera_kernel.slang:116). */
+  dp.render_buffer_valid = (render_buffer != 0) ? 1u : 0u;
+
+  /* ---- 3b. Fail-loudly guards (AGENTS.md section 5: no inventing) ------ */
+
+  /* (i) Covered camera config - identical test to the slice-4 body probe
+   *     (kernels.cpp:4960-4963). Outside it the Slang camera_sample port
+   *     cannot produce the real ray, so dispatching would compute values the
+   *     reference never computes. width == 0 would additionally divide by
+   *     zero in the REAL restart reference (init_from_camera.h:72-73).
+   *     rolling_shutter_type is deliberately NOT part of this test: Cycles
+   *     only reads it inside the `shuttertime != -1` branch (camera.h:471-487),
+   *     and shuttertime == -1 is already required here, so that code is
+   *     unreachable for any scene that passes. */
+  if (dp.mp.cam_type != 0 /* CAMERA_PERSPECTIVE */ || dp.mp.shuttertime != -1.0f ||
+      dp.mp.aperturesize != 0.0f || dp.mp.have_perspective_motion != 0 ||
+      dp.mp.num_motion_steps != 0 || dp.mp.interocular_offset != 0.0f ||
+      dp.mp.width == 0.0f)
+  {
+    LOG_ERROR << "Vulkan: queue dispatch: INIT_FROM_CAMERA scene camera is outside the "
+                 "covered config (perspective, aperture 0, shuttertime -1, no motion/stereo, "
+                 "width != 0); refusing to dispatch rather than computing rays the port does "
+                 "not implement.";
+    dev->set_error("Vulkan: queue dispatch: camera outside the covered configuration.");
+    return -1;
+  }
+
+  /* (ii) FLT_MAX pixel-filter-table branch (camera.h:461-464): the shader
+   *      indexes lookup_table at filter_table_offset + [0, FILTER_TABLE_SIZE).
+   *      Require the table to exist AND to cover that whole range, otherwise
+   *      the raw pointer read runs past the allocation. */
+  if (dp.mp.pixel_jitter_x == FLT_MAX) {
+    const int64_t need = (int64_t)dp.mp.filter_table_offset + (int64_t)FILTER_TABLE_SIZE;
+    if (dp.mp.lookup_table == 0 || dp.mp.filter_table_offset < 0 ||
+        need > (int64_t)dp.mp.lookup_table_width)
+    {
+      LOG_ERROR << "Vulkan: queue dispatch: pixel_jitter is FLT_MAX (filter-table branch) "
+                << "but lookup_table " << (dp.mp.lookup_table ? "is set" : "is missing")
+                << " with offset " << dp.mp.filter_table_offset << " and width "
+                << dp.mp.lookup_table_width << " (needs " << need << " floats).";
+      dev->set_error("Vulkan: queue dispatch: lookup table cannot serve the filter branch.");
+      return -1;
+    }
+  }
+
+  /* (iii) Default SAMPLING_PATTERN_TABULATED_SOBOL branch (pattern.h:75-77):
+   *      tabulated_sobol_shuffled_sample_index divides by
+   *      (sequence_size * NUM_TAB_SOBOL_PATTERNS) and the sample functions
+   *      index sample_pattern_lut up to
+   *      sequence_size * 256 * 4 - 1 (tabulated_sobol.h:51,79-80,...). The
+   *      table is allocated at exactly that size (scene/integrator.cpp:364-375),
+   *      so a smaller one means the scene never built it - fail loudly instead
+   *      of dividing by zero or reading out of range. */
+  if (dp.mp.sampling_pattern == SAMPLING_PATTERN_TABULATED_SOBOL) {
+    const int64_t need = (int64_t)dp.mp.tabulated_sobol_sequence_size *
+                         (int64_t)NUM_TAB_SOBOL_PATTERNS * (int64_t)NUM_TAB_SOBOL_DIMENSIONS;
+    if (dp.mp.tabulated_sobol_sequence_size == 0 || dp.mp.sample_pattern_lut == 0 ||
+        need > (int64_t)dp.mp.sample_pattern_lut_width)
+    {
+      LOG_ERROR << "Vulkan: queue dispatch: SAMPLING_PATTERN_TABULATED_SOBOL but "
+                << "tabulated_sobol_sequence_size=" << dp.mp.tabulated_sobol_sequence_size
+                << ", sample_pattern_lut "
+                << (dp.mp.sample_pattern_lut ? "is set" : "is missing") << ", width "
+                << dp.mp.sample_pattern_lut_width << " (needs " << need << " floats).";
+      dev->set_error("Vulkan: queue dispatch: sample pattern LUT cannot serve the sampler.");
+      return -1;
+    }
+  }
+
+  /* ---- 3c. Stage + dispatch ------------------------------------------- */
+  VkDeviceAddress dp_addr = 0;
+  if (!queue_write_dispatch_params(dev, dp, dp_addr)) {
+    dev->set_error("Vulkan: queue dispatch: DispatchParams staging failed.");
+    return -1;
+  }
+
+  push_bytes = sizeof(QueueInitPush);
+  if (!queue_get_pipeline(dev, k, push_bytes, pipeline)) {
+    dev->set_error(
+        "Vulkan: queue dispatch: could not build the INIT_FROM_CAMERA pipeline.");
+    return -1;
+  }
+
+  QueueInitPush push{};
+  push.params = params_addr;
+  push.tiles = tiles;
+  push.render_buffer = render_buffer;
+  push.render_buffer_u = render_buffer;
+  push.dp = dp_addr;
+  push.path_index_array = path_index_array;
+  push.num_tiles = num_tiles;
+  push.max_tile_work_size = max_tile_work_size;
+  push.num_active_paths = num_active_paths;
+  push.has_tiles = has_tiles ? 1u : 0u;
+  push.has_path_index_array = (path_index_array != 0) ? 1u : 0u;
+  push.pad0 = 0;
+
+  LOG_INFO << "Vulkan: queue dispatch: INIT_FROM_CAMERA n=" << n << " groups=" << groups
+           << " branch=" << (has_tiles ? "tiles" : "restart")
+           << " cam.type=" << dp.mp.cam_type << " shuttertime=" << dp.mp.shuttertime
+           << " pixel_jitter=(" << dp.mp.pixel_jitter_x << "," << dp.mp.pixel_jitter_y
+           << ") sampling_pattern=" << dp.mp.sampling_pattern
+           << " tabulated_seq=" << dp.mp.tabulated_sobol_sequence_size
+           << " lut_w=" << dp.mp.sample_pattern_lut_width
+           << " filter_off=" << dp.mp.filter_table_offset
+           << " table_w=" << dp.mp.lookup_table_width << " kernel_features=0x" << std::hex
+           << dp.kernel_features << std::dec;
+
+  if (getenv("CYCLES_VULKAN_DISPATCH_GATE") != nullptr) {
+    if (!vulkan_dispatch_gate_init(dev, pipeline, push_bytes, groups, push, dp, n,
+                                   num_tiles, max_tile_work_size, tiles, render_buffer))
+    {
+      dev->set_error("Vulkan: dispatch gate: INIT_FROM_CAMERA gate failed.");
+      return -1;
+    }
+  }
+
+  if (!queue_submit_dispatch(dev, pipeline, &push, push_bytes, groups)) {
+    dev->set_error("Vulkan: queue dispatch: INIT_FROM_CAMERA submit failed.");
+    return -1;
+  }
+  return 1;
+}
+
+/* M4f slice 5: tear down every Vulkan object THIS file created that outlives
+ * a single dispatch - the cached compute pipelines (queue_pipeline_slots: 2
+ * modules + 2 layouts + 2 pipelines) and the DispatchParams staging buffer
+ * (queue_staging: 1 buffer + 1 memory). Called by VulkanDevice::~VulkanDevice()
+ * BEFORE vkDestroyDevice: the validation layer otherwise reports
+ * VUID-vkDestroyDevice-device-05137 with "8 leaked objects" (observed in the
+ * slice-5 smoke run; the probes never hit this because their RAII structs
+ * destroy their own objects at the end of each probe).
+ *
+ * Only entries whose VkDevice matches the device being destroyed are touched,
+ * so a second device in the same process keeps its own pipelines (the cache
+ * key includes the VkDevice, see queue_get_pipeline()). Safe to call twice:
+ * everything is reset to its default (unused / null) state. */
+void vulkan_queue_dispatch_shutdown(VulkanDevice *dev)
+{
+  if (dev == nullptr) return;
+  const VkDevice vk_dev = dev->vk_device();
+  if (vk_dev == VK_NULL_HANDLE) return; /* init failed: nothing was created */
+
+  for (QueuePipelineSlot &slot : queue_pipeline_slots) {
+    if (!slot.used || slot.device != vk_dev) continue;
+    if (slot.pipe.pipeline) vkDestroyPipeline(vk_dev, slot.pipe.pipeline, nullptr);
+    if (slot.pipe.layout) vkDestroyPipelineLayout(vk_dev, slot.pipe.layout, nullptr);
+    if (slot.pipe.module) vkDestroyShaderModule(vk_dev, slot.pipe.module, nullptr);
+    slot = QueuePipelineSlot(); /* used=false again: idempotent on a 2nd call */
+  }
+
+  if (queue_staging.used && queue_staging.device == vk_dev) {
+    if (queue_staging.buffer) vkDestroyBuffer(vk_dev, queue_staging.buffer, nullptr);
+    if (queue_staging.memory) vkFreeMemory(vk_dev, queue_staging.memory, nullptr);
+    queue_staging = QueueStaging();
+  }
 }
 
 CCL_NAMESPACE_END

@@ -65,8 +65,10 @@
  * computed float words |gpu-ref| <= 1e-5*max(1,|ref|) (ray.*, throughput,
  * ... the established GPU-vs-CPU float policy at kernels.cpp:2494/:3065).
  *
- * Layouts locked against kernels.cpp: IfcBodyCase 20 B, IfcBodyParams 264 B
- * (MathParams 212 + 13 scalars), IfcBodyOut 4 B, IfcBodyPush 56 B. */
+ * Layouts locked against kernels.cpp: IfcBodyCase 20 B, IfcBodyParams 312 B
+ * (MathParams 256 [M4f slice 5: 212 + kernel_data.tables subset + the
+ * integrator sampler subset for the default TABULATED_SOBOL pattern] +
+ * 13 scalars, host-side tail pad to 8), IfcBodyOut 4 B, IfcBodyPush 56 B. */
 
 #include "init_from_camera.slang"  // the body under test + its dependencies
                                    // (math_core, integrator_state, path_state,
@@ -91,7 +93,8 @@ struct BodyCase
  * as init_from_camera.slang's signature comment). */
 struct BodyParams
 {
-    MathParams mp;            // 212 B: cam/w (restart x,y reconstruction),
+    MathParams mp;            // 256 B (slice 5: 212 + tables + sampler subsets):
+                              // cam/w (restart x,y reconstruction),
                               // is_inside_volume (next-kernel choice), rng
     int has_tile;             // Cycles' tile != nullptr (0/1)
     int tile_offset;          // KernelWorkTile.offset      (types.h:1695)
@@ -107,7 +110,9 @@ struct BodyParams
     int background_object_index;
     int background_volume_shader;
     uint render_buffer_valid; // platform constraint 3 (non-null in this gate)
-};                            // 212 + 13 * 4 = 264 bytes
+};                            // 256 + 13 * 4 = 308 payload bytes (host mirror
+                              // sizeof = 312: tail pad to the 8-byte
+                              // alignment MathParams' pointer member brings)
 
 /* Per-case return value: the pixel-finished bool of init_from_camera.h:85. */
 struct BodyOut

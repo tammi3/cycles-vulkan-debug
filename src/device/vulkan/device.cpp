@@ -230,9 +230,19 @@ VulkanDevice::VulkanDevice(const DeviceInfo &info, Stats &stats, Profiler &profi
   init_host_memory();
 }
 
+/* M4f slice 5: destroys the compute pipelines + DispatchParams staging buffer
+ * that the production dispatch path (kernels.cpp) caches in file-static state.
+ * Declared here (same pattern as the probe hooks in queue.cpp) because only
+ * this destructor knows when the VkDevice goes away; those objects are keyed
+ * by VkDevice and must not outlive it (VUID-vkDestroyDevice-device-05137). */
+void vulkan_queue_dispatch_shutdown(VulkanDevice *device);
+
 VulkanDevice::~VulkanDevice() {
   if (device != VK_NULL_HANDLE) vkDeviceWaitIdle(device);
-  
+
+  /* Must run while the VkDevice is still alive. */
+  vulkan_queue_dispatch_shutdown(this);
+
   if (const_buffer != VK_NULL_HANDLE) vkDestroyBuffer(device, const_buffer, nullptr);
   if (const_memory != VK_NULL_HANDLE) vkFreeMemory(device, const_memory, nullptr);
   if (cmd_pool != VK_NULL_HANDLE) vkDestroyCommandPool(device, cmd_pool, nullptr);
@@ -448,9 +458,11 @@ bool VulkanDevice::load_kernels(uint)
      * and Scene::device_update() bails out at src/scene/scene.cpp:244
      * (device->have_error()) *before* any device array is uploaded, so
      * const_copy_to()/mem_copy_to() would never run. Returning true WITHOUT
-     * set_error() lets the scene upload proceed; the first
-     * VulkanQueue::enqueue() then reports the M4 error and the session stops
-     * cleanly (src/device/vulkan/queue.cpp:30-35).
+     * set_error() lets the scene upload proceed; VulkanQueue::enqueue() then
+     * dispatches what M4f slice 5 implements (RESET + INIT_FROM_CAMERA) and
+     * reports the M4 error for the first kernel that is not implemented yet,
+     * at which point the session stops cleanly (the `dispatched == 0` branch
+     * of VulkanQueue::enqueue()).
      * Default behaviour (variable unset) is unchanged. */
     LOG_WARNING << "Vulkan: CYCLES_VULKAN_ALLOW_NO_KERNELS=1 set -- continuing "
                  << "without compiled kernels; dispatch will fail (M4).";
@@ -531,7 +543,38 @@ void VulkanDevice::mem_copy_to(device_memory &mem) {
     // = BDA address), written into the constant buffer at the symbol's offset.
     const_copy_to(mem.global_name(), &mem.device_pointer, sizeof(device_ptr));
   } else {
-    generic_copy_to(mem);
+    /* Mirror CUDADevice::mem_copy_to (cuda/device_impl.cpp:599-607).
+     *
+     * Why the allocation is needed here: GPUDevice::generic_copy_to() is a
+     * SILENT NO-OP when device_pointer is 0 (device/device.cpp:940-942), but
+     * device_vector::alloc() only allocates HOST memory and deliberately
+     * leaves device_pointer at 0 (device/memory.h:394-410; the device side
+     * is created lazily by device_alloc()/copy paths). Without the alloc
+     * below, the FIRST copy_to_device() of a fresh device_vector uploaded
+     * nothing at all, so PathTraceWorkGPU::enqueue_work_tiles() passed a
+     * null device address for the INIT_FROM_CAMERA tiles
+     * (path_trace_work_gpu.cpp:914-936) and the tile branch of the kernel
+     * degenerated into a no-op - observed in the M4f slice-5 smoke run
+     * (lastsession.txt). CUDA allocates first, then copies; we now do the
+     * same. MEM_GLOBAL keeps its own branch above (it allocates too).
+     *
+     * generic_alloc() reports OOM through set_error(); the LOG_ERROR below
+     * adds the buffer name for context. memory_size() == 0 is skipped
+     * because a 0-byte VkBuffer is invalid (vkCreateBuffer requires > 0)
+     * and there is nothing to upload anyway. */
+    if (!mem.device_pointer) {
+      if (mem.memory_size() > 0) {
+        generic_alloc(mem);
+      }
+      generic_copy_to(mem);
+      if (!mem.device_pointer && mem.memory_size() > 0) {
+        LOG_ERROR << "Vulkan: failed to allocate '" << mem.name_ << "' ("
+                  << mem.memory_size() << " bytes) for upload.";
+      }
+    }
+    else if (mem.is_resident(this)) {
+      generic_copy_to(mem);
+    }
   }
 }
 void VulkanDevice::mem_move_to_host(device_memory &) {}
@@ -823,6 +866,258 @@ void VulkanDevice::copy_host_to_device(void *device_pointer, void *host_pointer,
 
   vkDestroyBuffer(device, staging, nullptr);
   vkFreeMemory(device, staging_mem, nullptr);
+}
+
+/* M4f slice 5: last-uploaded host contents of a MEM_GLOBAL kernel array by
+ * name. global_last_uploaded is filled in mem_copy_to (device.cpp:521-528)
+ * for every MEM_GLOBAL - the same bytes that were copied into the device
+ * buffer - so the slice-5 gate's CPU reference (which needs kernel_array
+ * data + width for kernel_data_fetch) reads exactly what the GPU sees. */
+vector<uint8_t> VulkanDevice::global_snapshot(const char *name) const {
+  if (name == nullptr) {
+    return vector<uint8_t>();
+  }
+  for (const auto &entry : global_last_uploaded) {
+    const device_memory *mem = entry.first;
+    if (mem != nullptr && mem->global_name() != nullptr &&
+        strcmp(mem->global_name(), name) == 0)
+    {
+      return entry.second;
+    }
+  }
+  return vector<uint8_t>();
+}
+
+/* M4f slice 5: device -> host download of a raw device allocation (see the
+ * declaration comment in device_impl.h). Staging mirror image of
+ * copy_host_to_device: TRANSFER_DST staging, one vkCmdCopyBuffer from the
+ * allocation's buffer, then map + memcpy out. The command buffer comes from
+ * the device's own pool and is released by submit_and_wait, exactly like
+ * mem_copy_from (device.cpp:600-628). */
+bool VulkanDevice::copy_device_to_host(const void *device_pointer,
+                                       const size_t offset,
+                                       void *host,
+                                       const size_t size)
+{
+  if (!is_ready()) {
+    LOG_ERROR << "Vulkan: copy_device_to_host: device not ready.";
+    return false;
+  }
+  if (device_pointer == nullptr || host == nullptr || size == 0) {
+    LOG_ERROR << "Vulkan: copy_device_to_host: null pointer or zero size (size="
+              << size << ").";
+    return false;
+  }
+  const uint64_t addr = (uint64_t)(uintptr_t)device_pointer;
+  auto it = address_to_alloc_map.find(addr);
+  if (it == address_to_alloc_map.end()) {
+    LOG_ERROR << "Vulkan: copy_device_to_host: unknown device address " << addr
+              << " (must be an allocation BASE address).";
+    return false;
+  }
+
+  /* Word-round like copy_host_to_device (device.cpp:818); if the allocation
+   * cannot cover the rounded size, fall back to the exact byte count (a
+   * byte-granular vkCmdCopyBuffer size is legal - only vkCmdUpdateBuffer
+   * requires word multiples). NEVER read past the allocation either way. */
+  size_t copy_bytes = (size + 3) / 4 * 4;
+  if (copy_bytes > it->second.size) {
+    copy_bytes = size;
+  }
+  if (offset > it->second.size || copy_bytes > it->second.size - offset) {
+    LOG_ERROR << "Vulkan: copy_device_to_host: request of " << size << " bytes at offset "
+              << offset << " exceeds allocation of " << it->second.size << " bytes.";
+    return false;
+  }
+
+  /* Staging buffer: host-visible + coherent so the mapping after the fence is
+   * immediately valid (same memory type mem_copy_from uses, device.cpp:596). */
+  VkBuffer staging;
+  VkDeviceMemory staging_mem;
+  VkBufferCreateInfo st_info{};
+  st_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  st_info.size = copy_bytes;
+  st_info.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+  if (vkCreateBuffer(device, &st_info, nullptr, &staging) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: copy_device_to_host: staging buffer creation failed.";
+    return false;
+  }
+
+  VkMemoryRequirements st_reqs;
+  vkGetBufferMemoryRequirements(device, staging, &st_reqs);
+  VkMemoryAllocateInfo st_alloc{};
+  st_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  st_alloc.allocationSize = st_reqs.size;
+  st_alloc.memoryTypeIndex = find_memory_type(
+      st_reqs.memoryTypeBits,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (vkAllocateMemory(device, &st_alloc, nullptr, &staging_mem) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: copy_device_to_host: staging memory allocation failed.";
+    vkDestroyBuffer(device, staging, nullptr);
+    return false;
+  }
+  if (vkBindBufferMemory(device, staging, staging_mem, 0) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: copy_device_to_host: staging buffer bind failed.";
+    vkDestroyBuffer(device, staging, nullptr);
+    vkFreeMemory(device, staging_mem, nullptr);
+    return false;
+  }
+
+  VkCommandBufferAllocateInfo cmd_alloc{};
+  cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  cmd_alloc.commandPool = cmd_pool;
+  cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cmd_alloc.commandBufferCount = 1;
+  VkCommandBuffer cmd;
+  if (vkAllocateCommandBuffers(device, &cmd_alloc, &cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: copy_device_to_host: command buffer allocation failed.";
+    vkDestroyBuffer(device, staging, nullptr);
+    vkFreeMemory(device, staging_mem, nullptr);
+    return false;
+  }
+
+  VkCommandBufferBeginInfo begin_info{};
+  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  vkBeginCommandBuffer(cmd, &begin_info);
+
+  VkBufferCopy copy_region{};
+  copy_region.size = copy_bytes;
+  copy_region.srcOffset = offset;
+  vkCmdCopyBuffer(cmd, it->second.buffer, staging, 1, &copy_region);
+
+  vkEndCommandBuffer(cmd);
+  /* submit_and_wait submits, fence-waits and frees `cmd` from cmd_pool
+   * (device.cpp:39-55), so the mapping below sees completed data. */
+  submit_and_wait(cmd);
+
+  void *mapped;
+  vkMapMemory(device, staging_mem, 0, copy_bytes, 0, &mapped);
+  memcpy(host, mapped, copy_bytes);
+  vkUnmapMemory(device, staging_mem);
+
+  vkDestroyBuffer(device, staging, nullptr);
+  vkFreeMemory(device, staging_mem, nullptr);
+  return true;
+}
+
+/* M4f slice 5: host -> device upload of `size` bytes at `offset` inside an allocation.
+ * Symmetric mirror of copy_device_to_host. */
+bool VulkanDevice::copy_host_to_device_at(void *device_pointer,
+                                          const size_t offset,
+                                          const void *host,
+                                          const size_t size)
+{
+  if (!is_ready()) {
+    LOG_ERROR << "Vulkan: copy_host_to_device_at: device not ready.";
+    return false;
+  }
+  if (device_pointer == nullptr || host == nullptr || size == 0) {
+    LOG_ERROR << "Vulkan: copy_host_to_device_at: null pointer or zero size (size="
+              << size << ").";
+    return false;
+  }
+  const uint64_t addr = (uint64_t)(uintptr_t)device_pointer;
+  auto it = address_to_alloc_map.find(addr);
+  if (it == address_to_alloc_map.end()) {
+    LOG_ERROR << "Vulkan: copy_host_to_device_at: unknown device address " << addr
+              << " (must be an allocation BASE address).";
+    return false;
+  }
+
+  size_t copy_bytes = (size + 3) / 4 * 4;
+  if (copy_bytes > it->second.size) {
+    copy_bytes = size;
+  }
+  if (offset > it->second.size || copy_bytes > it->second.size - offset) {
+    LOG_ERROR << "Vulkan: copy_host_to_device_at: request of " << size << " bytes at offset "
+              << offset << " exceeds allocation of " << it->second.size << " bytes.";
+    return false;
+  }
+
+  VkBuffer staging;
+  VkDeviceMemory staging_mem;
+  VkBufferCreateInfo st_info{};
+  st_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+  st_info.size = copy_bytes;
+  st_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+  st_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  if (vkCreateBuffer(device, &st_info, nullptr, &staging) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: copy_host_to_device_at: staging buffer creation failed.";
+    return false;
+  }
+
+  VkMemoryRequirements st_reqs;
+  vkGetBufferMemoryRequirements(device, staging, &st_reqs);
+  VkMemoryAllocateInfo st_alloc{};
+  st_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+  st_alloc.allocationSize = st_reqs.size;
+  st_alloc.memoryTypeIndex = find_memory_type(
+      st_reqs.memoryTypeBits,
+      VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+  if (vkAllocateMemory(device, &st_alloc, nullptr, &staging_mem) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: copy_host_to_device_at: staging memory allocation failed.";
+    vkDestroyBuffer(device, staging, nullptr);
+    return false;
+  }
+  if (vkBindBufferMemory(device, staging, staging_mem, 0) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: copy_host_to_device_at: staging buffer bind failed.";
+    vkDestroyBuffer(device, staging, nullptr);
+    vkFreeMemory(device, staging_mem, nullptr);
+    return false;
+  }
+
+  void *mapped;
+  if (vkMapMemory(device, staging_mem, 0, copy_bytes, 0, &mapped) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: copy_host_to_device_at: staging buffer map failed.";
+    vkDestroyBuffer(device, staging, nullptr);
+    vkFreeMemory(device, staging_mem, nullptr);
+    return false;
+  }
+  memcpy(mapped, host, size);
+  if (copy_bytes > size) {
+    memset(reinterpret_cast<uint8_t *>(mapped) + size, 0, copy_bytes - size);
+  }
+  vkUnmapMemory(device, staging_mem);
+
+  VkCommandBufferAllocateInfo cmd_alloc{};
+  cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+  cmd_alloc.commandPool = cmd_pool;
+  cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+  cmd_alloc.commandBufferCount = 1;
+  VkCommandBuffer cmd;
+  if (vkAllocateCommandBuffers(device, &cmd_alloc, &cmd) != VK_SUCCESS) {
+    LOG_ERROR << "Vulkan: copy_host_to_device_at: command buffer allocation failed.";
+    vkDestroyBuffer(device, staging, nullptr);
+    vkFreeMemory(device, staging_mem, nullptr);
+    return false;
+  }
+
+  VkCommandBufferBeginInfo begin_info{};
+  begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+  vkBeginCommandBuffer(cmd, &begin_info);
+
+  VkBufferCopy copy_region{};
+  copy_region.size = copy_bytes;
+  copy_region.srcOffset = 0;
+  copy_region.dstOffset = offset;
+  vkCmdCopyBuffer(cmd, staging, it->second.buffer, 1, &copy_region);
+
+  vkEndCommandBuffer(cmd);
+  submit_and_wait(cmd);
+
+  vkDestroyBuffer(device, staging, nullptr);
+  vkFreeMemory(device, staging_mem, nullptr);
+  return true;
+}
+
+size_t VulkanDevice::allocation_size(const void *device_pointer) const {
+  if (device_pointer == nullptr) return 0;
+  const uint64_t addr = (uint64_t)(uintptr_t)device_pointer;
+  auto it = address_to_alloc_map.find(addr);
+  if (it != address_to_alloc_map.end()) {
+    return it->second.size;
+  }
+  return 0;
 }
 
 void VulkanDevice::get_device_memory_info(size_t &total, size_t &free) {

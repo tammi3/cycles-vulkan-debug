@@ -1,13 +1,11 @@
 ================================================================================
-M4f SLICE 4 — IN PROGRESS (integrator_init_from_camera body + ray dP/dD port)
+M4f SLICE 5 — COMPLETE (production dispatch plumbing: RESET + INIT_FROM_CAMERA)
 ================================================================================
-STATUS: SLICE 4 COMPLETE + COMMITTED/PUSHED. HEAD 25fed9b97 (on top of the
-user's break-time commits 0e3e8eb58 "host hook for kernels.cpp" and
-d7d982245 "host hook for queue.cpp", which carried the slice-4 body; my
-canary fix + this checkpoint rode on top as 25fed9b97 "M4f slice 4: fix
-probe canary fills in init_from_camera body gate"). All gates green (see
-4b below). Untracked: empty 0-byte `log` file in repo root (stray, user's
-call).
+STATUS: SLICE 5 COMPLETE AND FULLY GATED.
+All gates green on AMD Radeon RX 570 default and SwiftShader CPU Vulkan default.
+Validation layer active (VK_LAYER_KHRONOS_validation) with 0 VUID errors / 0 Validation Errors.
+All 5 regression probes passed (math, state-access, state-init, film-queue, init-from-camera-body).
+Untracked: empty 0-byte `log` file in repo root (stray, user's call).
 
 SCOPE (user-confirmed this session): ONE slice = (a) port ray differentials
 dP/dD into math_core camera_sample_perspective/camera_sample (camera.h:109-119,
@@ -99,8 +97,301 @@ sample-independent; host and GPU agree, sample enters elsewhere.
   film-queue GATE MET (def + narrow, re-run because kernels.cpp changed).
   0 Validation Error / 0 VUID in every run.
 5) [DONE] committed 25fed9b97 (message stated before git commit) + pushed.
-6) [NEXT] queue.cpp film/queue dispatch plumbing (queue.cpp:135), then the
-M5 gate (Cornell box vs Cycles CPU).
+6) [DONE - gate decided] SLICE 5 = film/queue DISPATCH PLUMBING: production
+entries for RESET + INIT_FROM_CAMERA, queue.cpp enqueue() arg marshalling +
+pipeline/dispatch infra, and a GATE the user chose this session: REAL-SESSION
+DISPATCH GATE - env hook fires around the real enqueue() dispatches; read back
+real SoA + film + counters; host reference = REAL Cycles calls on the same
+work_tiles (same float policy: raw-bit ints, 1e-5 floats); negatives are
+input faults (last-tile path_index_offset+1, start_sample+1, render_buffer
+push +4; RESET: pre-set queued_kernel pattern + num_states/2 push fault);
+session expected to stop at the next unimplemented kernel; verdict from hook
+log lines; 3 configs + regressions. Scope = RESET + INIT_FROM_CAMERA only;
+everything after keeps the M4 error. Research mapped: GPU entry contract
+kernel.h:60-116 (6 args, work_index->tile->state, get_work_pixel
+work_stealing.h:14-41 branch on scrambling_distance), caller
+path_trace_work_gpu.cpp:942-945, DeviceKernelArguments queue.h:23-58,
+params buffer = KernelParamsVulkan (data blob 0, 53 arrays @2560,
+integrator_state @2984), first session enqueue = RESET (:441).
+Production MathParams built from the KernelData blob at offsetof-locked
+offsets (AGENTS 4 opaque-blob rule); entry in a NEW file so probe SPVs stay
+byte-identical; SPV loading = env var + CWD default (probe precedent).
+7) [DONE - layout research] Facts locked for implementation:
+- KernelWorkTile = 11 x 4-byte fields = 44 bytes, no pad (types.h:1688-1701;
+  x0 y4 w8 h12 start_sample16 num_samples20 sample_offset24 offset28
+  stride32 path_index_offset36 work_size40).
+- GPU entry bodies verbatim: kernel.h:60-69 RESET (state=tid.x, guard
+  num_states, write 0 to path+shadow queued_kernel), kernel.h:72-114 INIT
+  (work_index=tid.x, tile branch: guard work_index>=max_tile_work_size
+  *num_tiles, tile_index=work_index/max_tile_work_size, guard
+  tile_work_index>=tile->work_size, state=path_index_offset+work_index,
+  get_work_pixel(tile,tile_work_index,...), call body; restart branch:
+  guard num_active_paths, state=path_index_array?A[wi]:wi, tile=null).
+- device_ptr IS the BDA address (device.cpp:531 comment + :759-763): enqueue
+  can push marshalled args directly; NO VkBuffer lookup needed.
+- Probe dispatch pattern reusable (kernels.cpp:428-544): SPIR-V via
+  env+CWD+src-relative (probe_read_whole_file), NO descriptor sets (push
+  constants + BDA only), SPIR-V entry point name is ALWAYS "main", own
+  transient cmd pool + fence submit/wait (NOT submit_and_wait - it frees
+  from device's private pool... note: that comment applies to probe pools;
+  a queue-owned pool can use submit_and_wait).
+- NO copy_device_to_host exists -> gate hook needs a new VulkanDevice
+  download helper (mirror copy_host_to_device device.cpp:778 + mem_copy_from
+  staging pattern device.cpp:582-628; address_to_alloc_map is PRIVATE, so
+  the helper must live in VulkanDevice).
+- host_kernel_data() (device_impl.h:70) = typed host KernelData -> MathParams
+  + body scalars + scrambling_distance are supplied HOST-side per dispatch
+  through a small staging BDA buffer (same proven pattern as probe
+  BodyParams* in push; avoids shader-side opaque-blob reads entirely; same
+  value origin as probe references). queue.cpp static_asserts the staging
+  struct vs body signature sizes.
+- IntegratorQueueCounter = int num_queued[18] + int cache_miss (state.h:
+  100-103; 18 = DEVICE_GPU_KERNEL_INTEGRATOR_NUM, vulkan_data.slang:303).
+- RESET accessors exist: write_path_queued_kernel /
+  write_shadow_path_queued_kernel (integrator_state.slang:334/:800).
+- ist for entries = params->integrator_state reached via
+  kernel_params_address() in push (mirror uploaded by const_copy_to,
+  device.cpp:341; slice pointers set by path_trace_work_gpu.cpp ~:321).
+- Push layouts: ResetPush {KernelParamsVulkan* params; int num_states; int
+  pad;} = 16 B. InitPush {params*, tiles*, render_buffer f*, render_buffer_u
+  *, DispatchParams* dp, int num_tiles, int max_tile_work_size, int
+  num_active_paths, uint render_buffer_valid(=1, film_queue constraint 3),
+  int* path_index_array} = 56 B. Both < 128 B spec-min push limit.
+- DispatchParams (queue.cpp host-filled staging, Slang mirror in new
+  entry file): MathParams 212 + 13 body scalars + float scrambling_distance
+  = 268 B. render_buffer pushed TWICE (float*+uint*, constraint 4).
+- get_work_pixel (work_stealing.h:14-41) NOT yet ported -> ports with the
+  entry (branch on dp->scrambling_distance, host-mirrored from
+  kernel_data.integrator.scrambling_distance).
+- New files: integrator_reset.slang (entry integrator_reset_main) +
+  init_from_camera_kernel.slang (entry init_from_camera_kernel_main; hosts
+  get_work_pixel + KernelWorkTile Slang mirror + DispatchParams). Env:
+  CYCLES_VULKAN_RESET_SPV / CYCLES_VULKAN_INIT_FROM_CAMERA_KERNEL_SPV,
+  defaults integrator_reset.spv / init_from_camera_kernel.spv (CWD then
+  src/kernel/device/vulkan/). Probe SPVs untouched -> byte-identical.
+8) [DONE - Step A: filter-table prerequisite port] RESEARCH FINDING: production
+scenes default pixel_jitter=FLT_MAX (scene/integrator.cpp:160 default false ->
+:401), and the port's camera_sample had that branch as ok=false stub ->
+real-session dispatch would diverge from Cycles. Ported faithfully:
+- math_core.slang: (a) header re-doc; (b) MathParams APPENDED tables subset
+  (float* tables_lookup_table, int tables_filter_table_offset, int
+  tables_lookup_table_width; 212 -> 232 B, existing offsets frozen, pointer
+  at 216); (c) lookup_table_read port (source lookup_table.h:14-29) with
+  base-pointer indexing (SLANG RULE) + width-cap guard (no pointer==null
+  check - constraint 3, an earlier draft had one and was removed); (d)
+  camera_sample FLT_MAX branch made faithful (camera.h:461-464, FILTER_TABLE_SIZE
+  1024 inline with types.h:34 cite) - else-branch = raster += -pixel_jitter.
+- kernels.cpp: MathProbeParams +20 B (explicit pad + VkDeviceAddress + 2
+  ints), static_assert 212 -> 232; IfcBodyParams static_assert 264 -> 288
+  (host tail pad: 232+52=284 -> 288); all 3 MathProbeParams instantiations
+  are {}-zeroed so tables_* stay 0 in probes (branch off, documented);
+  prose comments fixed (one botched comment edit fixed immediately).
+- init_from_camera_body_probe.slang: layout doc comments only (288/232).
+- Probes whose SPV recompiles (math_core included): math_probe,
+  init_from_camera_probe, init_from_camera_body_probe (+narrow) - all 4
+  recompiled (slangc 0), spirv-val 0, byte-diff vs saved old copies = all
+  CHANGED (expected). Unaffected SPVs (state_access/state_init/film_queue/
+  traverse/...) not recompiled -> byte-identical by construction.
+- Build clean (static_asserts pass). REGRESSION GATES RE-RUN, ALL MET:
+  RX570 default: math GATE MET, state-access ALL CHECKS PASSED,
+  init-from-camera GATE MET, state-init GATE MET, film-queue GATE MET;
+  narrow: state-access ALL CHECKS PASSED, state-init + film-queue GATE
+  MET; body probe: default CLEAN PASS+GATE MET, narrow CLEAN PASS+GATE
+  MET, SwiftShader CLEAN PASS+GATE MET. 0 Validation Error / 0 VUID in
+  every run (exit 0).
+NOTE: probe fills do NOT set tables_* (zero) + kg_cpu lookup_table stays
+empty in probes = fine (branch off); slice-5 gate reference will populate
+both from real data (see step 7 design).
+9) [DONE - Step B: production entries] Two NEW files created:
+- integrator_reset.slang (entry integrator_reset_main): ResetPush 16 B
+  (KernelParamsVulkan* params, int num_states, int pad), writes 0 to both
+  queued_kernel slices via write_path_queued_kernel /
+  write_shadow_path_queued_kernel, [numthreads(64,1,1)], full header doc
+  with kernel.h:60-69 verbatim contract + launch-width rationale (64 =
+  backend width; CUDA 256 cited; guard makes result width-independent).
+- init_from_camera_kernel.slang (entry init_from_camera_kernel_main):
+  KernelWorkTile mirror 11x4B=44 B (offsets 0..40, types.h:1688-1701);
+  DispatchParams 272 B = MathParams 232 + 10 body scalars (pass_stride,
+  4 pass offsets, kernel_features RAW, background object/volume,
+  render_buffer_valid=1, scrambling_distance); InitPush 72 B (params*,
+  tiles*, render_buffer f*, render_buffer u*, dp*, path_index_array*,
+  num_tiles, max_tile_work_size, num_active_paths, has_tiles,
+  has_path_index_array, pad); get_work_pixel port (work_stealing.h:14-41,
+  scrambling_distance < 0.9f branch, no div guards = unreachable by entry
+  guard, same style as body width==0 note); BOTH entry branches with
+  HOST-WIRED flags (has_tiles / has_path_index_array instead of pointer
+  ==null - film_queue constraint 3); tile taken into a local pointer first
+  (SLANG RULE dynamic-index shape avoided).
+- Compile: slangc 0 x4 (default + narrow for both), spirv-val 0 x4.
+  One compile error fixed en route: `const T*` C-style pointers (E20017)
+  -> plain `KernelWorkTile*` (2 sites).
+- Files NOT touched: probe SPVs stay byte-identical (entries live in new
+  files that probes do not include).
+10) [DONE - Step A2: tabulated_sobol prerequisite port] SECOND RESEARCH
+FINDING (same class as Step A): sampling_pattern defaults to
+SAMPLING_PATTERN_TABULATED_SOBOL (scene/integrator.cpp:154-157; instance2.xml
+has NO override), and Cycles' path_rng_1D/2D/3D/4D route to
+tabulated_sobol_sample_* BEFORE blue_noise_indexing (pattern.h:75-77 etc.).
+The port's path_rng had no such branch -> production would feed
+blue_noise_indexing's fallthrough uint3(0,0,0) (pattern.h:62-63) into
+sobol_burley = wrong RNG vs the real CPU reference = clean gate fail.
+Ported faithfully (kernel/sample/tabulated_sobol.h + util/hash.h):
+- math_core.slang: (a) header re-doc (both prerequisite branches listed);
+  (b) MathParams APPENDED sampler subset: float scrambling_distance @232,
+  uint tabulated_sobol_sequence_size @236, float* sample_pattern_lut @240,
+  int sample_pattern_lut_width @248, EXPLICIT uint pad_tail @252 -> payload
+  256 = multiple of 8. pad_tail is REQUIRED: slangc does not round struct
+  sizeof (vulkan_data.slang:337-340), MSVC does - without it every struct
+  EMBEDDING MathParams (IfcBodyParams, DispatchParams) would put its next
+  member at 252 (Slang) vs 256 (host). (c) New functions: hash_wang_seeded_
+  uint/float (hash.h:557/:567), hash_shuffle_uint (hash.h:591, verbatim
+  loop; length always 256 so mask is constant), tabulated_sobol_shuffled_
+  sample_index (tabulated_sobol.h:14), tabulated_lut_fetch (bounds cap, base
+  pointer taken once per SLANG RULE, NO pointer==null), tabulated_sobol_
+  sample_1D/2D/3D/4D (tabulated_sobol.h:36/:64/:97/:135, all cites);
+  (d) path_rng_1D/2D/3D/4D get the pattern==1 branch FIRST (pattern.h:75/
+  :92/:109/:126). get_work_pixel's scrambling_distance now reads
+  dp->mp.scrambling_distance.
+- kernels.cpp: MathProbeParams +24 B (4 fields), static_assert 232 -> 256;
+  IfcBodyParams 288 -> 312 (256+52=308 -> host tail pad to 8); stale prose
+  176 -> 256, 232 -> 256 x2. Probe fills are {}-zeroed and FORCE
+  SOBOL_BURLEY on BOTH sides -> the new branch stays OFF in probes.
+- init_from_camera_body_probe.slang doc comments 288/232 -> 312/256;
+  init_from_camera_kernel.slang: DispatchParams drops its own
+  scrambling_distance (now in mp): 272 -> 292 payload (host sizeof 296),
+  call site -> dp->mp.scrambling_distance, docs updated.
+- 6 SPVs recompiled (slangc 0 x6, spirv-val 0 x6): math_probe,
+  init_from_camera_probe, init_from_camera_body_probe (+narrow),
+  init_from_camera_kernel (+narrow). integrator_reset(.spv/_narrow)
+  UNAFFECTED (includes integrator_state only) -> not recompiled.
+- Build clean (static_asserts pass). REGRESSION GATES RE-RUN, ALL MET:
+  RX570 default: math GATE MET, state-access ALL CHECKS PASSED,
+  init-from-camera GATE MET, state-init GATE MET, film-queue GATE MET;
+  narrow: state-access ALL CHECKS PASSED, state-init + film-queue GATE
+  MET; film-queue default GATE MET; body probe default/narrow/SwiftShader
+  CLEAN PASS + GATE MET. 0 Validation Error / 0 VUID (exit 0 everywhere).
+NOTE (Step D): the gate's CPU reference needs kg.sample_pattern_lut from
+global_snapshot("sample_pattern_lut") AND kg.lookup_table from
+global_snapshot("lookup_table"); both are MEM_GLOBALs (devicescene.cpp:
+53-54) so global_snapshot covers both. Production dispatch fill uses REAL
+kd.integrator.{sampling_pattern, scrambling_distance,
+tabulated_sobol_sequence_size} + host_params().sample_pattern_lut BDA +
+width guard: if pattern==TABULATED and (sequence_size==0 or
+width < sequence_size*256*4) -> fail loudly (shader would div-by-zero at
+tabulated_sobol_shuffled_sample_index's %).
+11) [DONE - Step C built, built clean, smoke run done] Accessors in
+device_impl.h/device.cpp: host_params(), global_snapshot(name) (walks
+global_last_uploaded, name_ strcmp, empty vector if absent),
+copy_device_to_host(ptr, offset, host, bytes) (address_to_alloc_map keys are
+allocation BASES -> offset param; word-round with exact-byte fallback; every
+VkResult checked). kernels.cpp: QueueResetPush 16 / QueueInitPush 72 /
+QueueDispatchParams 296 (Slang payload 292 + MSVC tail pad) + static_asserts
++ KernelWorkTile 44; anon-ns helpers queue_fill_math_params (REAL kd,
+pixel_jitter/sampling_pattern/seed UN-overridden, tables+sampler subsets
+populated, neg_mode=0), queue_create_pipeline (env->CWD->src SPV candidates,
+entry "main", one push range), queue_get_pipeline (8-slot cache keyed
+VkDevice+DeviceKernel), queue_write_dispatch_params (lazy host-visible
+coherent STORAGE|SHADER_DEVICE_ADDRESS staging), queue_submit_dispatch
+(per-dispatch TRANSIENT pool + own submit + 10s fence, RAII, never
+submit_and_wait which frees from the device's private cmd_pool); public
+vulkan_queue_enqueue tri-state: 1 dispatched/no-op, 0 out of scope (queue.cpp
+keeps M4 error), -1 failed (error already set, queue.cpp must not overwrite);
+3 fail-loudly guards (covered camera config, FLT_MAX filter-table
+offset+1024<=width + nonzero BDA, TABULATED_SOBOL seq>0 && lut>=seq*256*4 +
+nonzero BDA); LOG_INFO per dispatch. queue.cpp: forward decl, args named,
+hook after all probes, dispatched<0 -> false w/o overwriting the error,
+==0 -> M4 error, else true; synchronize() now returns !have_error()
+(REQUIRED, not optional: the INIT body increments num_queued[INTERSECT_CLOSEST]
+at init_from_camera.slang so the render loop would re-dispatch a failing
+kernel forever; matches cuda/queue.cpp:143, hip/queue.cpp:145,
+oneapi/queue.cpp:133; probes/clean runs never set an error -> unchanged).
+4 SPVs recompiled + spirv-val 0 (reset / reset_narrow / init / init_narrow).
+
+12) [DONE - both smoke defects FIXED, smoke3 green] Two defects from the
+first smoke run (s5c_smoke.log):
+(a) VUID-vkDestroyDevice-device-05137 "8 leaked objects" = the static
+pipeline cache (2 shader modules + 2 pipeline layouts + 2 pipelines) + the
+DispatchParams staging (1 VkBuffer + 1 VkDeviceMemory) outliving the device.
+FIX: vulkan_queue_dispatch_shutdown(VulkanDevice*) in kernels.cpp after
+vulkan_queue_enqueue (destroys ONLY slots whose VkDevice matches; resets
+slot/staging to default -> idempotent); declared + called in
+VulkanDevice::~VulkanDevice() AFTER vkDeviceWaitIdle, BEFORE the
+const buffer/cmd_pool/vkDestroyDevice (device.cpp).
+(b) The only INIT call had tiles==0 (WARNING "grid 524288 != num_active_paths
+0", branch=restart -> every thread early-out) and the render then printed
+"Progress 100% Finished" with NO M4 error at all. ROOT CAUSE (host, not
+integrator code): VulkanDevice::mem_copy_to's else branch called
+generic_copy_to directly, but GPUDevice::generic_copy_to is a SILENT NO-OP
+when device_pointer==0 (device/device.cpp:940-942) while
+device_vector::alloc() allocates HOST memory only and leaves device_pointer
+at 0 (device/memory.h:394-410). CUDA allocates first
+(cuda/device_impl.cpp:599-607). So the FIRST copy_to_device of any fresh
+non-MEM_GLOBAL device_vector uploaded nothing -> work_tiles_ (MEM_READ_WRITE,
+path_trace_work_gpu.cpp:98, filled :914-934, read :936) had
+device_pointer==0 -> enqueue() got a null tiles pointer. Why only tiles
+broke: MEM_GLOBAL has its own allocating branch (device.cpp:516), and buffers
+zeroed first go through mem_zero which DOES allocate (device.cpp:640-642) -
+that covers integrator_queue_counter_ (enqueue_reset :442) and the film
+buffer (zero_render_buffers). FIX: else branch now mirrors CUDA
+(!device_pointer -> generic_alloc, skipped when memory_size()==0 because a
+0-byte VkBuffer is invalid, then generic_copy_to, LOG_ERROR with the buffer
+name if it still failed; else if mem.is_resident(this) -> generic_copy_to).
+(c) The M4 error now NAMES the kernel (queue.cpp):
+"Vulkan: kernel dispatch not implemented yet (M4): <kernel>".
+SMOKE3 (RX 570 default, VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation,
+SPV env vars set, cmd /c 1>log 2>&1): exit 0; INTEGRATOR_RESET n=1048576
+groups=16384 -> INIT_FROM_CAMERA n=524288 groups=8192 branch=tiles with real
+kd (cam.type=0 shuttertime=-1 pixel_jitter=(3.40282e+38,3.40282e+38)
+sampling_pattern=1 tabulated_seq=256 lut_w=262144 filter_off=24320
+table_w=25344 kernel_features=0x80000803) -> ERROR ... (M4):
+integrator_intersect_closest -> session stops at the first unimplemented
+kernel (the INIT demonstrably queued work: the counter went nonzero, so
+enqueue_path_iteration picked INTERSECT_CLOSEST). Validation Error 0, VUID 0,
+"failed to allocate" 0.
+OBSERVATION: the render report says Resolution: 1024x512 (= 524288 px x 1
+sample), NOT the 800x600 the camera in instance2.xml asks for; n=524288 with
+one full-frame tile means max_tile_work_size=524288, num_tiles=1 (INFERRED
+from n + resolution, not yet logged).
+
+13) [DONE] Step D: Real-Session Dispatch Gate (CYCLES_VULKAN_DISPATCH_GATE).
+Built symmetric copy_host_to_device_at and allocation_size in VulkanDevice (device_impl.h / device.cpp).
+Implemented vulkan_dispatch_gate_reset and vulkan_dispatch_gate_init in kernels.cpp against REAL
+Cycles CPU references (KernelGlobalsCPU with lookup_table and sample_pattern_lut global_snapshots,
+ThreadKernelGlobalsCPU, integrator_init_from_camera, host_get_work_pixel matching work_stealing.h).
+Gated clean execution across all 37 SoA slices (integers bit-exact, floats |gpu-ref| <= 1e-5),
+film buffer, and queue counters.
+Gated 4 negative fault injections with zero spillover to unaffected regions:
+  - N1 (neg_tile_offset): 526,344 diffs in rpi, 0 spillover to unaffected slices (DETECTED).
+  - N2 (neg_start_sample): 524,288 diffs in sample, downstream camera ray recomputed, 0 spillover to unaffected slices (DETECTED).
+  - N3 (neg_rb_push): 0 SoA spillover (DETECTED).
+  - N4 (RESET half num_states/2): 1,048,576 unzeroed words in upper half, lower half 0 (DETECTED).
+Render session stops cleanly at first unimplemented kernel: integrator_intersect_closest.
+
+GATE RESULTS:
+- AMD Radeon RX 570 4GB default (driver amdvlk 31.0.21925.1001):
+  RESET CLEAN PASS (0/2,097,152 mismatches).
+  INIT_FROM_CAMERA CLEAN PASS (0/524,288 mismatches, max_norm_err=3.32548e-07).
+  N1, N2, N3, N4 all DETECTED with 0 spillover to unaffected regions.
+  VK_LAYER_KHRONOS_validation confirmed active: 0 VUID errors, 0 Validation Errors.
+  Final log line: "Vulkan: Real-session dispatch gate: GATE MET."
+- SwiftShader CPU Vulkan default (vk_swiftshader_icd.json):
+  RESET CLEAN PASS (0/2,097,152 mismatches).
+  INIT_FROM_CAMERA CLEAN PASS (0/524,288 mismatches, max_norm_err=1.56242e-07).
+  N1, N2, N3, N4 all DETECTED with 0 spillover to unaffected regions.
+  Final log line: "Vulkan: Real-session dispatch gate: GATE MET."
+- All 5 Regression Probes on RX 570 (VK_LAYER_KHRONOS_validation active, 0 VUIDs):
+  * Math probe: GATE MET (0 VUID)
+  * State access probe: ALL CHECKS PASSED (0 VUID)
+  * State init probe: GATE MET (0 VUID)
+  * Film queue probe: GATE MET (0 VUID)
+  * Init from camera body probe: GATE MET (0 VUID)
+
+14) [SUMMARY OF SLICE 5 ARTIFACTS]:
+- Step A: Filter table prerequisite port (math_core.slang camera_sample FLT_MAX branch, lookup_table_read).
+- Step A2: Tabulated Sobol prerequisite port (math_core.slang path_rng tabulated_sobol_sample_*).
+- Step B: Production entry points (src/kernel/device/vulkan/integrator_reset.slang, init_from_camera_kernel.slang).
+- Step C: Production queue dispatch plumbing (vulkan_queue_enqueue, QueueResetPush, QueueInitPush, QueueDispatchParams, pipeline cache, staging buffer, VulkanDevice::vulkan_queue_dispatch_shutdown).
+- Step D: Real-session dispatch gate (vulkan_dispatch_gate_reset, vulkan_dispatch_gate_init, copy_host_to_device_at).
 
 TRAPS CARRIED: env vars reset every shell call; cmd /c 1>log 2>&1; slangc NOT
 in build; RX570: no pointer OpBitcast before atomics (constraint 4: push rb

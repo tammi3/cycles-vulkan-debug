@@ -17,12 +17,26 @@
  *   - sobol_burley (+ integer form), sobol_burley_sample_1D/2D/3D/4D
  *   - blue_noise_indexing, path_rng_pixel_init, path_rng_1D/2D/3D/4D
  *   - camera_sample_perspective, camera_sample (perspective branch + clipping)
- * NOT covered (stated, deferred): SAMPLING_PATTERN_TABULATED_SOBOL /
- *   BLUE_NOISE_* (tabulated_sobol table + morton path not exercised), DOF
- *   (aperturesize > 0), motion blur / shutter table (shuttertime != -1),
- *   panorama / orthographic / custom cameras, the FLT_MAX pixel-filter-table
- *   branch (needs kernel_data.tables.lookup_table, not passed in S1a), stereo,
- *   and ray differentials (dP/dD are not part of the S1a comparison). */
+ * NOT covered by the S1a probe (stated, deferred): DOF (aperturesize > 0),
+ * motion blur / shutter table (shuttertime != -1), panorama / orthographic /
+ * custom cameras, stereo, and ray differentials (dP/dD are not part of the
+ * S1a comparison).
+ * Two branches were stubs here until M4f slice 5, because production scenes
+ * hit them and the real-session dispatch gate would diverge from Cycles:
+ * 1. The FLT_MAX pixel-filter-table branch (camera.h:461-464): production
+ *    defaults to pixel_jitter == FLT_MAX (scene/integrator.cpp:160 default
+ *    false -> :401 make_float2(FLT_MAX)). Ported faithfully
+ *    (lookup_table_read below, source kernel/util/lookup_table.h:14-29),
+ *    fed through MathParams.tables_* (appended fields).
+ * 2. SAMPLING_PATTERN_TABULATED_SOBOL: the Cycles DEFAULT sampling pattern
+ *    (scene/integrator.cpp:154-157), which path_rng_1D/2D/3D/4D route to
+ *    tabulated_sobol_sample_* BEFORE blue_noise_indexing (pattern.h:75-77
+ *    etc.). Ported faithfully below (kernel/sample/tabulated_sobol.h),
+ *    fed through MathParams.tabulated_sobol_* / sample_pattern_lut_*.
+ * The S1a/S1/S4 probes OVERRIDE pixel_jitter != FLT_MAX and force
+ * SAMPLING_PATTERN_SOBOL_BURLEY on both sides, so BOTH branches stay
+ * UNEXERCISED by the probe gates - they are exercised by the slice-5
+ * real-session gate (production fill keeps the real default values). */
 
 /* ---------------------------------------------------------------------------
  * Bit / math primitives (util/math_base.h, util/hash.h).
@@ -345,13 +359,257 @@ struct MathParams
     uint blue_noise_sequence_length; // integrator.blue_noise_sequence_length (unused in SOBOL_BURLEY)
     // -- gate-only negative-test switch (NOT in Cycles) --------------------
     int neg_mode;                  // 0 clean, 1 sobol table, 2 seed xor, 3 transpose rastertocamera
-};
+    // -- kernel_data.tables subset (M4f slice 5, APPENDED - every field above
+    // keeps its slice-1/4 offset so existing host mirrors stay valid in
+    // front) ---------------------------------------------------------------
+    // kernel_data.tables.lookup_table is a KERNEL_DATA_ARRAY slot: a Buffer
+    // Device Address, not data inside the 2560-byte blob (data_arrays.h:78,
+    // params.h:40-41). Passed as a POINTER member (the traverse.slang:50
+    // pattern), never a uint64->pointer conversion (no OpIntToPtr).
+    float* tables_lookup_table;    // BDA of the filter/BSDF lookup tables
+    int tables_filter_table_offset;// kernel_data.tables.filter_table_offset (types.h:1335)
+    int tables_lookup_table_width; // table length in floats (host: MEM_GLOBAL
+                                   // snapshot size / 4) - bounds cap for the
+                                   // raw pointer (AGENTS.md section 4: check
+                                   // every index against its count)
+    // -- kernel_data.integrator subset for the default sampling pattern
+    // (M4f slice 5 second prerequisite, APPENDED - offsets above frozen) ----
+    // scene/integrator.cpp:154-157 makes SAMPLING_PATTERN_TABULATED_SOBOL the
+    // DEFAULT, and pattern.h:75-77 routes path_rng_* to tabulated_sobol_*,
+    // which needs these three + the seed already above.
+    float scrambling_distance;     // integrator.scrambling_distance (default 1.0,
+                                   // integrator.cpp:158) - tabulated_sobol's
+                                   // < 1.0f Cranley-Patterson branches AND
+                                   // get_work_pixel's < 0.9f branch read it
+    uint tabulated_sobol_sequence_size; // integrator.tabulated_sobol_sequence_size
+                                   // (integrator.cpp:370) - power of two
+    float* sample_pattern_lut;     // BDA of the sample_pattern_lut MEM_GLOBAL
+                                   // (data_arrays.h; devicescene.cpp:54)
+    int sample_pattern_lut_width;  // table length in floats - bounds cap
+    uint pad_tail;                 // EXPLICIT tail pad so the payload ends at a
+                                   // multiple of 8: slangc does not round struct
+                                   // sizeof (vulkan_data.slang:337-340), MSVC
+                                   // does - without this field every struct that
+                                   // EMBEDS MathParams (IfcBodyParams,
+                                   // DispatchParams) would put its next member at
+                                   // 252 on the Slang side and 256 on the host.
+};                                 // 232 -> 256 bytes (payload = sizeof on both
+                                   // sides; pad212->216 came from the pointer)
 
 /* ---------------------------------------------------------------------------
- * pattern.h (kernel/sample/pattern.h). SOBOL_BURLEY path ported; the
- * TABULATED_SOBOL / BLUE_NOISE_* branches are not exercised by the gate scene
- * and are reported as not covered.
+ * pattern.h (kernel/sample/pattern.h). Both routing branches are ported now:
+ * SOBOL_BURLEY -> blue_noise_indexing below, and the Cycles-default
+ * SAMPLING_PATTERN_TABULATED_SOBOL -> tabulated_sobol_* (M4f slice 5).
  * ------------------------------------------------------------------------- */
+
+/* ---------------------------------------------------------------------------
+ * Tabulated Sobol sampler (kernel/sample/tabulated_sobol.h) + its two hash
+ * helpers (util/hash.h). Ported for M4f slice 5: TABULATED_SOBOL is the
+ * Cycles default sampling pattern (scene/integrator.cpp:154-157), so the
+ * production dispatch would otherwise feed path_rng_* into the
+ * blue_noise_indexing fallthrough (uint3(0,0,0), pattern.h:62-63) and
+ * produce values the real CPU call never computes.
+ * ------------------------------------------------------------------------- */
+
+// source: util/hash.h:557-564 (hash_wang_seeded_uint, modified Wang hash).
+uint hash_wang_seeded_uint(uint i, uint seed)
+{
+    i = (i ^ 61u) ^ seed;
+    i += i << 3;
+    i ^= i >> 4;
+    i *= 0x27d4eb2du;
+    return i;
+}
+
+// source: util/hash.h:567-570 (hash_wang_seeded_float).
+float hash_wang_seeded_float(uint i, uint seed)
+{
+    return uint_to_float_excl(hash_wang_seeded_uint(i, seed));
+}
+
+// source: util/hash.h:591-618 (hash_shuffle_uint). The permutation loop is
+// reproduced verbatim; `length` is NUM_TAB_SOBOL_PATTERNS = 256 on every call
+// site (types.h:1732), so `i % length` and the mask are compile-time
+// constants and the do-while terminates as in Cycles.
+uint hash_shuffle_uint(uint i, uint length, uint seed)
+{
+    i = i % length;
+    const uint mask = (1u << (32u - count_leading_zeros(length - 1u))) - 1u;
+    do {
+        i ^= seed;
+        i *= 0xe170893du;
+        i ^= seed >> 16;
+        i ^= (i & mask) >> 4;
+        i ^= seed >> 8;
+        i *= 0x0929eb3fu;
+        i ^= seed >> 23;
+        i ^= (i & mask) >> 1;
+        i *= 1u | (seed >> 27);
+        i *= 0x6935fa69u;
+        i ^= (i & mask) >> 11;
+        i *= 0x74dcb303u;
+        i ^= (i & mask) >> 2;
+        i *= 0x9e501cc3u;
+        i ^= (i & mask) >> 2;
+        i *= 0xc860a3dfu;
+        i &= mask;
+        i ^= i >> 5;
+    } while (i >= length);
+    return i;
+}
+
+// source: kernel/sample/tabulated_sobol.h:14-34
+// (tabulated_sobol_shuffled_sample_index). The `% (sample_count *
+// NUM_TAB_SOBOL_PATTERNS)` divisor is 0 only when sequence_size == 0, which
+// the host refuses to dispatch for this pattern (fail-loudly guard in
+// device/vulkan/kernels.cpp vulkan_queue_enqueue).
+uint tabulated_sobol_shuffled_sample_index(MathParams p, uint sample, uint dimension, uint seed)
+{
+    const uint sample_count = p.tabulated_sobol_sequence_size;
+    /* source: :26 - NUM_TAB_SOBOL_PATTERNS = 256 (kernel/types.h:1732). */
+    const uint pattern_i = hash_shuffle_uint(dimension, 256u, seed);
+    /* source: :28 - sample_count is a power of two, so this is a mask. */
+    const uint sample_mask = sample_count - 1u;
+    /* source: :29-31 */
+    const uint sample_shuffled = nested_uniform_scramble(sample,
+                                                         hash_wang_seeded_uint(dimension, seed));
+    sample = (sample & ~sample_mask) | (sample_shuffled & sample_mask);
+    /* source: :33 */
+    return ((pattern_i * sample_count) + sample) % (sample_count * 256u);
+}
+
+// Bounds-checked read of sample_pattern_lut (AGENTS.md section 4: raw device
+// pointers have no bounds checking). Base pointer taken ONCE (SLANG RULE).
+// The cap cannot fire when the host staging check passed (host verifies
+// width >= sequence_size * 256 * 4 before dispatch for this pattern);
+// same unreachable-guard style as lookup_table_read above.
+float tabulated_lut_fetch(MathParams p, uint index)
+{
+    float* lut = p.sample_pattern_lut;
+    if (index >= (uint)p.sample_pattern_lut_width) {
+        return 0.0f;
+    }
+    return lut[index];
+}
+
+// source: kernel/sample/tabulated_sobol.h:36-62 (tabulated_sobol_sample_1D).
+// kernel_data.integrator.* arrive as MathParams fields (same "kg -> explicit
+// cited scalars" mapping the body uses); kernel_data_fetch(sample_pattern_lut,
+// ...) -> tabulated_lut_fetch above. `neg` (gate-only, NOT in Cycles) is not
+// applied here: the probes force SOBOL_BURLEY so this branch never runs with
+// neg == 1, and the slice-5 gate faults inputs, not the RNG.
+float tabulated_sobol_sample_1D(MathParams p, uint sample, uint rng_hash, uint dimension)
+{
+    /* source: :41-47 */
+    uint seed = rng_hash;
+    if (p.scrambling_distance < 1.0f) {
+        seed = p.seed;
+    }
+    /* source: :50-51 - NUM_TAB_SOBOL_DIMENSIONS = 4 (kernel/types.h:1731) */
+    const uint index = tabulated_sobol_shuffled_sample_index(p, sample, dimension, seed);
+    float x = tabulated_lut_fetch(p, index * 4u);
+    /* source: :54-59 - Cranley-Patterson rotation when scrambling */
+    if (p.scrambling_distance < 1.0f) {
+        const float jitter_x = hash_wang_seeded_float(dimension, rng_hash) *
+                               p.scrambling_distance;
+        x += jitter_x;
+        x -= floor(x);
+    }
+    return x;
+}
+
+// source: kernel/sample/tabulated_sobol.h:64-95 (tabulated_sobol_sample_2D).
+float2 tabulated_sobol_sample_2D(MathParams p, uint sample, uint rng_hash, uint dimension)
+{
+    /* source: :69-75 */
+    uint seed = rng_hash;
+    if (p.scrambling_distance < 1.0f) {
+        seed = p.seed;
+    }
+    /* source: :78-80 */
+    const uint index = tabulated_sobol_shuffled_sample_index(p, sample, dimension, seed);
+    float x = tabulated_lut_fetch(p, index * 4u);
+    float y = tabulated_lut_fetch(p, index * 4u + 1u);
+    /* source: :83-92 */
+    if (p.scrambling_distance < 1.0f) {
+        const float jitter_x = hash_wang_seeded_float(dimension, rng_hash) *
+                               p.scrambling_distance;
+        const float jitter_y = hash_wang_seeded_float(dimension, rng_hash ^ 0xca0e1151u) *
+                               p.scrambling_distance;
+        x += jitter_x;
+        y += jitter_y;
+        x -= floor(x);
+        y -= floor(y);
+    }
+    return float2(x, y);
+}
+
+// source: kernel/sample/tabulated_sobol.h:97-133 (tabulated_sobol_sample_3D).
+float3 tabulated_sobol_sample_3D(MathParams p, uint sample, uint rng_hash, uint dimension)
+{
+    /* source: :102-108 */
+    uint seed = rng_hash;
+    if (p.scrambling_distance < 1.0f) {
+        seed = p.seed;
+    }
+    /* source: :111-114 */
+    const uint index = tabulated_sobol_shuffled_sample_index(p, sample, dimension, seed);
+    float x = tabulated_lut_fetch(p, index * 4u);
+    float y = tabulated_lut_fetch(p, index * 4u + 1u);
+    float z = tabulated_lut_fetch(p, index * 4u + 2u);
+    /* source: :117-129 */
+    if (p.scrambling_distance < 1.0f) {
+        const float jitter_x = hash_wang_seeded_float(dimension, rng_hash) *
+                               p.scrambling_distance;
+        const float jitter_y = hash_wang_seeded_float(dimension, rng_hash ^ 0xca0e1151u) *
+                               p.scrambling_distance;
+        const float jitter_z = hash_wang_seeded_float(dimension, rng_hash ^ 0xbf604c5au) *
+                               p.scrambling_distance;
+        x += jitter_x;
+        y += jitter_y;
+        z += jitter_z;
+        x -= floor(x);
+        y -= floor(y);
+        z -= floor(z);
+    }
+    return float3(x, y, z);
+}
+
+// source: kernel/sample/tabulated_sobol.h:135-176 (tabulated_sobol_sample_4D).
+float4 tabulated_sobol_sample_4D(MathParams p, uint sample, uint rng_hash, uint dimension)
+{
+    /* source: :140-146 */
+    uint seed = rng_hash;
+    if (p.scrambling_distance < 1.0f) {
+        seed = p.seed;
+    }
+    /* source: :149-153 */
+    const uint index = tabulated_sobol_shuffled_sample_index(p, sample, dimension, seed);
+    float x = tabulated_lut_fetch(p, index * 4u);
+    float y = tabulated_lut_fetch(p, index * 4u + 1u);
+    float z = tabulated_lut_fetch(p, index * 4u + 2u);
+    float w = tabulated_lut_fetch(p, index * 4u + 3u);
+    /* source: :156-172 */
+    if (p.scrambling_distance < 1.0f) {
+        const float jitter_x = hash_wang_seeded_float(dimension, rng_hash) *
+                               p.scrambling_distance;
+        const float jitter_y = hash_wang_seeded_float(dimension, rng_hash ^ 0xca0e1151u) *
+                               p.scrambling_distance;
+        const float jitter_z = hash_wang_seeded_float(dimension, rng_hash ^ 0xbf604c5au) *
+                               p.scrambling_distance;
+        const float jitter_w = hash_wang_seeded_float(dimension, rng_hash ^ 0x99634d1du) *
+                               p.scrambling_distance;
+        x += jitter_x;
+        y += jitter_y;
+        z += jitter_z;
+        w += jitter_w;
+        x -= floor(x);
+        y -= floor(y);
+        z -= floor(z);
+        w -= floor(w);
+    }
+    return float4(x, y, z, w);
+}
 
 // source: kernel/sample/pattern.h:34 (blue_noise_indexing). SOBOL_BURLEY
 // branch is the one the gate uses; the two blue-noise branches are ported
@@ -378,32 +636,47 @@ uint3 blue_noise_indexing(MathParams p, uint pixel_index, uint sample)
     return uint3(0u, 0u, 0u); // kernel_assert(false) in Cycles.
 }
 
-// source: kernel/sample/pattern.h:66 (path_rng_1D). Only the SOBOL_BURLEY
-// path is ported; the TABULATED_SOBOL branch (tabulated_sobol_sample_1D) is
-// not covered.
+// source: kernel/sample/pattern.h:66 (path_rng_1D). The TABULATED_SOBOL
+// branch (pattern.h:75-77, the Cycles default) is checked FIRST exactly as
+// Cycles does, then the SOBOL_BURLEY / blue-noise path.
 float path_rng_1D(MathParams p, uint rng_pixel, uint sample, int dimension, bool neg)
 {
+    if (p.sampling_pattern == 1) { // SAMPLING_PATTERN_TABULATED_SOBOL (types.h:123)
+        return tabulated_sobol_sample_1D(p, sample, rng_pixel, (uint)dimension);
+    }
     uint3 index = blue_noise_indexing(p, rng_pixel, sample);
     return sobol_burley_sample_1D(index.x, (uint)dimension, index.y, index.z, neg);
 }
 
-// source: kernel/sample/pattern.h:83 (path_rng_2D). SOBOL_BURLEY path only.
+// source: kernel/sample/pattern.h:83 (path_rng_2D). TABULATED_SOBOL branch
+// at pattern.h:92-94 first, then the SOBOL_BURLEY path.
 float2 path_rng_2D(MathParams p, uint rng_pixel, uint sample, int dimension, bool neg)
 {
+    if (p.sampling_pattern == 1) { // SAMPLING_PATTERN_TABULATED_SOBOL (types.h:123)
+        return tabulated_sobol_sample_2D(p, sample, rng_pixel, (uint)dimension);
+    }
     uint3 index = blue_noise_indexing(p, rng_pixel, sample);
     return sobol_burley_sample_2D(index.x, (uint)dimension, index.y, index.z, neg);
 }
 
-// source: kernel/sample/pattern.h:100 (path_rng_3D). SOBOL_BURLEY path only.
+// source: kernel/sample/pattern.h:100 (path_rng_3D). TABULATED_SOBOL branch
+// at pattern.h:109-111 first, then the SOBOL_BURLEY path.
 float3 path_rng_3D(MathParams p, uint rng_pixel, uint sample, int dimension, bool neg)
 {
+    if (p.sampling_pattern == 1) { // SAMPLING_PATTERN_TABULATED_SOBOL (types.h:123)
+        return tabulated_sobol_sample_3D(p, sample, rng_pixel, (uint)dimension);
+    }
     uint3 index = blue_noise_indexing(p, rng_pixel, sample);
     return sobol_burley_sample_3D(index.x, (uint)dimension, index.y, index.z, neg);
 }
 
-// source: kernel/sample/pattern.h:117 (path_rng_4D). SOBOL_BURLEY path only.
+// source: kernel/sample/pattern.h:117 (path_rng_4D). TABULATED_SOBOL branch
+// at pattern.h:126-128 first, then the SOBOL_BURLEY path.
 float4 path_rng_4D(MathParams p, uint rng_pixel, uint sample, int dimension, bool neg)
 {
+    if (p.sampling_pattern == 1) { // SAMPLING_PATTERN_TABULATED_SOBOL (types.h:123)
+        return tabulated_sobol_sample_4D(p, sample, rng_pixel, (uint)dimension);
+    }
     uint3 index = blue_noise_indexing(p, rng_pixel, sample);
     return sobol_burley_sample_4D(index.x, (uint)dimension, index.y, index.z, neg);
 }
@@ -532,10 +805,52 @@ void camera_sample_perspective(MathParams p, float2 raster_xy,
     ray_tmax = p.cliplength * z_inv;
 }
 
+// source: kernel/util/lookup_table.h:14-29 (lookup_table_read). FAITHFUL port
+// plus ONE defensive cap (AGENTS.md section 4: raw device pointers have no
+// bounds checking): the index is checked against tables_lookup_table_width
+// and 0.0f is returned out of range instead of reading past the buffer. The
+// cap cannot fire when the host staging check passed (host verifies
+// tables_filter_table_offset + FILTER_TABLE_SIZE <= width before dispatch);
+// same unreachable-guard style as the body's width==0 note
+// (init_from_camera.slang:260-264).
+float lookup_table_read(MathParams p, float x, const int offset, const int size)
+{
+    /* source: lookup_table.h:16 - saturatef(x) (util/math_base.h: clamp to
+     * [0,1]). */
+    x = clamp(x, 0.0f, 1.0f) * (float)(size - 1);
+
+    /* source: lookup_table.h:18-20 - float_to_int is (int)f
+     * (util/math_base.h:421-424); x >= 0 here so truncation == the C cast. */
+    const int index = min((int)x, size - 1);
+    const int nindex = min(index + 1, size - 1);
+    const float t = x - (float)index;
+
+    /* AGENTS.md SLANG RULE: take a base pointer once, never index a fixed
+     * array member inline through a device pointer. NO pointer==null
+     * comparison anywhere (film_queue.slang header constraint 3: it lowers to
+     * OpConvertPtrToU and crashes SwiftShader) - the width check below is the
+     * guard: a null BDA can only arrive with width == 0 (host fills both from
+     * the same MEM_GLOBAL), and then i0 >= width trips immediately. */
+    float* lut = p.tables_lookup_table;
+    const int i0 = index + offset;
+    const int i1 = nindex + offset;
+    if (i0 < 0 || i0 >= p.tables_lookup_table_width || i1 < 0 ||
+        i1 >= p.tables_lookup_table_width)
+    {
+        return 0.0f; /* defensive: see header note above */
+    }
+    /* source: lookup_table.h:22-28 */
+    const float data0 = lut[i0];
+    if (t == 0.0f) {
+        return data0;
+    }
+    const float data1 = lut[i1];
+    return (1.0f - t) * data0 + t * data1;
+}
+
 // source: kernel/camera/camera.h:449 (camera_sample). Faithful for the gate
-// config: pixel_jitter.x != FLT_MAX (raster += -pixel_jitter, camera.h:466-468;
-// the FLT_MAX filter-table branch at :461-464 is NOT covered), shuttertime ==
-// -1 (ray->time = 0.5, camera.h:471-472; the shutter-table branch at :478-505 is
+// config: shuttertime == -1 (ray->time = 0.5, camera.h:471-472; the shutter-
+// table branch at :478-505 is
 // NOT covered), and cam.type == CAMERA_PERSPECTIVE (camera.h:510-511). Other
 // camera types return false in `ok`.
 void camera_sample(MathParams p, int x, int y, float2 filter_uv, float time, float2 lens_uv,
@@ -552,13 +867,20 @@ void camera_sample(MathParams p, int x, int y, float2 filter_uv, float time, flo
     ray_dD = 0.0f;
     ok = false;
 
-    // camera.h:461-468 pixel filter. Gate: pixel_jitter.x != FLT_MAX.
-    if (p.pixel_jitter_x == asfloat(0x7F7FFFFFu) /* FLT_MAX */) {
-        // Filter-table branch needs kernel_data.tables.lookup_table: NOT covered in S1a.
-        ok = false;
-        return;
+    // source: camera.h:461-468 pixel filter.
+    if (p.pixel_jitter_x == asfloat(0x7F7FFFFFu) /* FLT_MAX == the default when
+        integrator.use_pixel_jitter is false (scene/integrator.cpp:401);
+        Cycles compares pixel_jitter.x == FLT_MAX at camera.h:461 */) {
+        /* source: camera.h:462-464 - Blackman-Harris filter table. FILTER_TABLE_SIZE
+         * = 1024 (kernel/types.h:34). */
+        const int filter_table_offset = p.tables_filter_table_offset;
+        raster.x += lookup_table_read(p, filter_uv.x, filter_table_offset, 1024);
+        raster.y += lookup_table_read(p, filter_uv.y, filter_table_offset, 1024);
     }
-    raster += -float2(p.pixel_jitter_x, p.pixel_jitter_y);
+    else {
+        /* source: camera.h:467 */
+        raster += -float2(p.pixel_jitter_x, p.pixel_jitter_y);
+    }
 
     // camera.h:471-472 motion blur (time). Gate: shuttertime == -1.
     if (p.shuttertime == -1.0f) {

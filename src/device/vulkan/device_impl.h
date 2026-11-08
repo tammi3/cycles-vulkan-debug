@@ -69,6 +69,48 @@ class VulkanDevice : public GPUDevice {
    * blob (device.cpp:317 memcpy's const data into host_params_). Read-only. */
   const KernelData &host_kernel_data() const { return host_params_.data; }
 
+  /* M4f slice 5: const access to the host shadow of the whole fixed kernel
+   * params buffer (KernelParamsVulkan, kernel/device/vulkan/params.h). The
+   * production dispatch reads the BDA slots it needs from the SAME host bytes
+   * const_copy_to uploaded: integrator_state (the SoA slice addresses set by
+   * PathTraceWorkGPU) and the KERNEL_DATA_ARRAY pointers such as lookup_table
+   * / sample_pattern_lut (device.cpp:532 writes each MEM_GLOBAL's device
+   * pointer here by name). Read-only. */
+  const KernelParamsVulkan &host_params() const { return host_params_; }
+
+  /* M4f slice 5: copy of the last-uploaded HOST contents of a MEM_GLOBAL
+   * kernel array (name = device_memory::global_name(), e.g. "lookup_table",
+   * "sample_pattern_lut"). Returns an empty vector when no global with that
+   * name exists or it was never uploaded. The slice-5 gate's CPU reference
+   * reads the SAME bytes the GPU buffer holds (global_last_uploaded is the
+   * snapshot mem_copy_to keeps, device.cpp:521-528). */
+  vector<uint8_t> global_snapshot(const char *name) const;
+
+  /* M4f slice 5: download `size` bytes of a device allocation - identified by
+   * its Buffer Device Address, which is what device_ptr IS on this backend
+   * (device.cpp:759-763) - starting `offset` bytes into it. Gate readback
+   * helper: mirrors copy_host_to_device (device.cpp:778) with the
+   * staging-download pattern of mem_copy_from (device.cpp:582-628);
+   * address_to_alloc_map is private, so the lookup must live here. Returns
+   * false with a LOG_ERROR when the device is not ready, the address is
+   * unknown, or the request exceeds the allocation (fail loudly instead of
+   * reading out of range). NOTE: the map keys are allocation BASE addresses
+   * only, so `device_pointer` must be one - sub-ranges go through `offset`. */
+  bool copy_device_to_host(const void *device_pointer,
+                           const size_t offset,
+                           void *host,
+                           const size_t size);
+
+  /* M4f slice 5: host -> device upload at an offset within an allocation.
+   * Symmetric mirror of copy_device_to_host. */
+  bool copy_host_to_device_at(void *device_pointer,
+                              const size_t offset,
+                              const void *host,
+                              const size_t size);
+
+  /* Allocation size of a device pointer registered in address_to_alloc_map (0 if unknown). */
+  size_t allocation_size(const void *device_pointer) const;
+
  private:
   VkInstance instance;
   VkPhysicalDevice physical_device;

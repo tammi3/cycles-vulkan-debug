@@ -78,6 +78,18 @@ bool vulkan_film_queue_probe(VulkanDevice *device);
  * REAL Cycles function (see kernels.cpp for the full doc). */
 bool vulkan_init_from_camera_body_probe(VulkanDevice *device);
 
+/* M4f SLICE 5 production dispatch, implemented in kernels.cpp. Tri-state:
+ *   1  -> the kernel was dispatched (or there was nothing to do)
+ *   0  -> not implemented yet (the M4 error below is kept for it)
+ *  -1  -> failed; kernels.cpp has already called set_error(), so this file
+ *         must NOT overwrite the device error and just returns false.
+ * Scope is DEVICE_KERNEL_INTEGRATOR_RESET and
+ * DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA only (see kernels.cpp). */
+int vulkan_queue_enqueue(VulkanDevice *device,
+                         DeviceKernel k,
+                         int n,
+                         const DeviceKernelArguments &args);
+
 VulkanQueue::VulkanQueue(VulkanDevice *d) : DeviceQueue(d), vulkan_device_(d) {}
 
 int VulkanQueue::num_concurrent_states(const size_t s) const {
@@ -96,12 +108,14 @@ void VulkanQueue::load_image_info() {
   // M4: Will be implemented when texture handling is added
 }
 
-bool VulkanQueue::enqueue(DeviceKernel k, const int n, const DeviceKernelArguments &) {
+bool VulkanQueue::enqueue(DeviceKernel k, const int n, const DeviceKernelArguments &args) {
   debug_enqueue_begin(k, n);
   /* M4b: optional one-shot ABI probe (env CYCLES_VULKAN_ABI_PROBE=1). The
    * first enqueue happens after the scene upload, so the probe sees what
    * Cycles actually put in the params buffer. No-op unless the env var is
-   * set; the M4 stub error below is emitted either way. */
+   * set. Every probe hook below shares that semantics; the M4 stub error is
+   * now emitted only for kernels OUTSIDE slice-5's scope (see the tail of
+   * this function). */
   vulkan_abi_probe(vulkan_device_);
   /* M4c: optional one-shot traverse probe (env CYCLES_VULKAN_TRAVERSE_PROBE=1)
    * with the same no-op-unless-set semantics. */
@@ -143,14 +157,42 @@ bool VulkanQueue::enqueue(DeviceKernel k, const int n, const DeviceKernelArgumen
    * CYCLES_VULKAN_INIT_FROM_CAMERA_BODY_PROBE=1), same no-op-unless-set
    * semantics. */
   vulkan_init_from_camera_body_probe(vulkan_device_);
-  vulkan_device_->set_error("Vulkan: kernel dispatch not implemented yet (M4)");
+  /* M4f SLICE 5: the two production kernels the plumbing covers are actually
+   * dispatched here (RESET + INIT_FROM_CAMERA). Everything else still falls
+   * through to the M4 error, which is what stops a real session at the first
+   * unimplemented kernel. */
+  const int dispatched = vulkan_queue_enqueue(
+      vulkan_device_, k, n, args);
+  if (dispatched < 0) {
+    /* vulkan_queue_enqueue() already set the device error; overwriting it
+     * here would hide the real cause. */
+    debug_enqueue_end();
+    return false;
+  }
+  if (dispatched == 0) {
+    /* Name the kernel: the slice-5 gate uses this line to prove the session
+     * stopped at exactly the first unimplemented kernel. */
+    vulkan_device_->set_error(
+        string("Vulkan: kernel dispatch not implemented yet (M4): ") +
+        device_kernel_as_string(k));
+    debug_enqueue_end();
+    return false;
+  }
   debug_enqueue_end();
-  return false;
+  return true;
 }
 
 bool VulkanQueue::synchronize() { 
   debug_synchronize();
-  return true; 
+  /* Report failure once the device is in error, exactly like the other GPU
+   * backends (cuda/queue.cpp:143, hip/queue.cpp:145, oneapi/queue.cpp:133:
+   * `return !(device->have_error())`). PathTraceWorkGPU::
+   * update_queue_counter_and_cache() (path_trace_work_gpu.cpp:329-331) breaks
+   * its render loop on a false return; without this the loop would keep
+   * re-dispatching a kernel that can never succeed once slice 5 has advanced
+   * the integrator past the kernels that ARE implemented. Probes and clean
+   * runs never set an error, so their behaviour is unchanged. */
+  return !vulkan_device_->have_error();
 }
 
 void VulkanQueue::zero_to_device(device_memory &m) { 
