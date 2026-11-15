@@ -1,0 +1,198 @@
+================================================================================
+ANTIGRAVITY AGENT SUMMARY & PROJECT BRIEFING
+Project: Cycles Vulkan Backend (cycles-vulkan-debug)
+Target Milestone: M4f (Slice 5 in progress)
+Date: 2026-11-08
+================================================================================
+
+1. PROJECT SCOPE & PURPOSE
+--------------------------------------------------------------------------------
+The primary objective of this project is to develop and integrate a native Vulkan
+compute backend for Blender's physically-based path tracer, Cycles (Cycles X).
+The kernels are authored in Slang and compiled to SPIR-V, communicating with a
+custom C++ Vulkan device runtime.
+
+Key Repositories and Directories:
+- Working Repository: `C:\dev\cycles-vulkan-debug`
+  All development, compilation, testing, and file edits occur exclusively here.
+- User's Public Fork: `https://github.com/tammi3/cycles-vulkan-debug`
+  Matches the local working clone.
+- Early Research / Prototype Repo: `https://github.com/tammi3/Vulkan-backend-Blender-CyclesX`
+  Historical reference for early spikes and design concepts.
+- Local Reference Repository (READ-ONLY): `C:\dev\cycles-vulkan`
+  Read-only baseline where M0-M2 spikes originated. NEVER edit files here.
+- Local Reference Folder (READ-ONLY): `C:\dev\cycles-vulkan-debug\agentreference\`
+  User-supplied reference files (e.g. bvh_traverse.slang, raytri_cpu.h).
+- Full Blender Repository Clone: `E:\blender-git\blender` and `E:\blender-git\build_windows_x64_vc17_Release`
+  Where Blender itself is built. Once standalone Cycles validation is complete,
+  the backend will be introduced into Blender as an experimental device:
+  "Vulkan (experimental)".
+
+Milestone Roadmap:
+- M0 - M2: Initial architecture, Vulkan compute spikes, BVH traversal.
+- M3: Host binding, descriptor sets / BDA pipeline, basic shader dispatch.
+- M4: Lambertian diffuse sphere render (16 spp), verified pixel-by-pixel against
+      Cycles CPU reference.
+      - M4a - M4e: Traversal fixes, ABI validation, typed integrator state,
+        sub-word store strategies, driver bug bisects.
+      - M4f: Integrator kernel decomposition into modular Slang slices:
+        * Slice 1: Camera sample generation (integrate_camera_sample) [PASSED]
+        * Slice 2: State initialization (path_state_init cluster) [PASSED]
+        * Slice 3: Film + queue layer (film_queue.slang) [PASSED]
+        * Slice 4: Faithful integrator_init_from_camera body port & probe [PASSED]
+        * Slice 5: Production dispatch plumbing for RESET + INIT_FROM_CAMERA [IN PROGRESS]
+- M5: Cornell box with single area light at low resolution vs Cycles CPU render.
+- M6: Materials, textures, and additional light types.
+- M7: Integration into Blender proper (E:\blender-git).
+
+--------------------------------------------------------------------------------
+2. TARGET HARDWARE & EXECUTION PLATFORMS
+--------------------------------------------------------------------------------
+User System Specifications:
+- CPU: Intel Core i5 7400 (4 cores, 4 threads, 3.00 GHz base / 3.50 GHz turbo)
+- GPU: AMD Radeon RX 570 4GB (Polaris 20, 2048 stream processors, 4GB GDDR5 VRAM)
+- Memory: 16 GB DDR4 RAM (2x8 GB)
+- OS: Windows x64
+- Toolchains: MSVC (C++20, /std:c++20), Vulkan SDK (1.4.363.0), Slang Compiler (slangc)
+- Driver: AMDVLK / Adrenalin 31.0.21925.1001
+
+Execution Platforms:
+1. Primary Physical Target: AMD Radeon RX 570 4GB.
+   All production kernels, gates, and performance measurements target this hardware.
+   Philosophy: Ensuring efficient, correct path tracing on accessible, older hardware.
+2. Secondary Reference Platform: SwiftShader CPU Vulkan implementation.
+   `VK_ICD_FILENAMES=C:\Windows\System32\Microsoft-Edge-WebView\vk_swiftshader_icd.json`
+   Used to cross-check shader correctness and isolate GPU driver miscompiles.
+   Agreement between RX 570 and SwiftShader confirms algorithmic correctness;
+   disagreement indicates a driver defect until proven otherwise.
+
+--------------------------------------------------------------------------------
+3. CRITICAL HARDWARE QUIRKS & DRIVER WORKAROUNDS (MUST RESPECT)
+--------------------------------------------------------------------------------
+Past milestone investigations (M4e, M4f) identified severe driver defects in the
+RX 570 driver (31.0.21925.1001) and specific limits in SwiftShader:
+
+1. Dynamic Indexing on BDA Fixed Arrays:
+   - Driver Bug: AMD driver miscompiles `OpAccessChain` when dynamically indexing
+     a fixed-size array inside a `PhysicalStorageBuffer` (BDA) struct (e.g.,
+     `params->data.words[i]`), invariably returning element 0.
+   - Rule: NEVER dynamically index fixed-size arrays inside BDA structs. Always take
+     a base pointer once (`uint* base = &params->data.words[0];`) and index through
+     it, or pass a raw pointer view.
+
+2. Pointer OpBitcast Rules:
+   - RX 570 Bug: OpBitcasting a `PhysicalStorageBuffer` pointer involving 16-bit
+     or 8-bit pointees crashes `vkCreateComputePipelines` with access violation (0xC0000005).
+   - RX 570 Atomic Bug: OpBitcasting a pointer before an atomic operation drops the
+     element offset, causing the atomic to execute at the buffer's BASE address.
+     Workaround: pass the buffer device address twice with distinct types (e.g.,
+     `float*` and `uint*` in push constants).
+   - SwiftShader Bug: SwiftShader Subzero JIT crashes (0xC00000FD) on ANY pointer-to-pointer
+     `OpBitcast` on `PhysicalStorageBuffer` pointers.
+   - Rule: Zero pointer OpBitcasts across Slang modules. Perform pointer math in
+     typed terms or via integers/scalars.
+
+3. Truncated Pointer Loads (AMDVLK):
+   - Driver Bug: `OpLoad` of a struct pointer member is truncated to the innermost
+     pointee width (loads 2 bytes for `uint16_t*`, 1 byte for `uint8_t*`).
+   - Workaround (Form A): Compute the slot address via integer math (`(uint64_t)ist + offset`),
+     cast to `uint64_t*`, load as an 8-byte scalar, and convert with `OpConvertUToPtr`.
+
+4. SwiftShader Capability Constraints:
+   - SwiftShader does not support `shaderInt64`, `shaderInt16`, or `shaderInt8`.
+   - Shaders intended for dual-device validation must avoid emitting these capabilities
+     (e.g., using 32-bit atomic fallback for sub-words in default mode).
+
+--------------------------------------------------------------------------------
+4. STRICT OPERATIONAL RULES & METHODOLOGY (AGENTS.md)
+--------------------------------------------------------------------------------
+1. File Boundaries:
+   - Only edit files explicitly permitted by the active task prompt.
+   - Never edit `C:\dev\cycles-vulkan`, `agentreference/`, or files outside `src/`
+     unless specifically instructed.
+   - The verification harness, tolerances, and test images are immutable and sacred.
+     If a test fails, the code is wrong, not the test.
+
+2. Translation Fidelity (Cycles C++ -> Slang):
+   - Translate faithfully, line-for-line. Do not "improve", refactor, or prematurely
+     optimize Cycles logic during translation. Cycles CPU is the ground-truth reference.
+   - Cite source file and line on non-trivial logic: `// source: <path>:<line>`.
+   - Divergence Exception: Allowed only if strictly necessary for driver workarounds
+     or measured faster on the RX 570.
+     * Port faithfully first.
+     * Gate must pass in faithful mode before any divergence is introduced.
+     * Divergence must be guarded behind a macro/specialization constant.
+     * Fully documented in `DIVERGENCES.md` with measured timings.
+     * No optimization passes before M5 gate is cleared.
+
+3. Slang Language Rules:
+   - No virtual dispatch (no interfaces or function pointers in hot execution paths).
+     Use explicit `switch` statements over closure / kernel types.
+   - Straight-line execution: no recursion.
+   - No dynamic allocations or variable-length arrays.
+   - 64-bit BDA raw pointers allowed, but never create pointers to function locals
+     (use `inout` / `out`).
+   - Explicit storage classes: `ccl_private` -> local/inout, `ccl_global` -> BDA pointer,
+     `ccl_constant` -> push constants.
+   - Layouts must be verified against real C++ headers with `static_assert(offsetof(...))`.
+   - Bounds-check all pointer array accesses and cap all loops defensively.
+
+4. Verification Gates & Quality Assurance:
+   - Every shader must compile cleanly with `slangc -target spirv` and pass `spirv-val`.
+   - Check every `VkResult` in C++ Vulkan host code.
+   - All gate runs must have Vulkan validation layers active (`VK_LAYER_KHRONOS_validation`)
+     and produce 0 VUID errors and 0 validation errors.
+   - Verification policy: raw-bit exact match for integers/pointers; relative float
+     tolerance `|gpu - ref| <= 1e-5 * max(1, |ref|)`.
+   - Negative tests require a clean baseline; faults must be detected within exact masks
+     with zero spillover to unrelated data regions.
+
+5. Communication & Working Style:
+   - The user has deep expertise in shader theory and path tracing, but is learning
+     C++ and its build systems.
+   - Code must be heavily commented: explain WHAT every block does and WHY.
+   - Explain design decisions in plain, accessible language.
+   - State assumptions upfront in 3-5 bullet points before writing code.
+   - Update `lastsession.txt` incrementally after each completed step.
+   - Three-strikes rule: if a fix or command fails three times, stop and report.
+   - No elevated actions (UAC/admin). No untracked generated files in the repo root.
+
+--------------------------------------------------------------------------------
+5. SKILLS AVAILABLE IN agents/skills
+--------------------------------------------------------------------------------
+1. `slang-shader-engineer`:
+   - Specialization in Slang shader development, SPIR-V compilation, parameter blocks,
+     memory layout, compute kernel optimization, cross-compilation, and C++ engine bindings.
+   - References available: `language-reference.md`, `rules-and-patterns.md`, and
+     `slang-documentation-full.md`.
+
+2. `renderdoc-gpu-debug`:
+   - Deep GPU inspection and debugging using `rdc-cli` / RenderDoc Python API.
+   - Capabilities: headless and interactive frame captures, pipeline state inspection,
+     shader disassembly, pixel history, buffer/texture exports, and visual diffing.
+   - References available: `commands-quick-ref.md` and `debugging-recipes.md`.
+
+--------------------------------------------------------------------------------
+6. CURRENT STATUS & NEXT TASK (M4f Slice 5)
+--------------------------------------------------------------------------------
+Recent Accomplishments (M4f Slice 5 Steps A - C):
+- Filter-table prerequisite faithfully ported in `math_core.slang` (Step A).
+- Production kernel entry shaders created: `integrator_reset.slang` and
+  `init_from_camera_kernel.slang` (Step B).
+- Tabulated Sobol sampler prerequisite ported in `math_core.slang` (Step A2).
+- Host dispatch infrastructure added in `device_impl.h`, `device.cpp`, `kernels.cpp`,
+  and `queue.cpp` (Step C).
+- Smoke test defects resolved (pipeline cache leaks, device_vector allocation in mem_copy_to).
+- Smoke 3 verified clean: runs INTEGRATOR_RESET -> INIT_FROM_CAMERA -> terminates
+  gracefully at first unimplemented kernel (`integrator_intersect_closest`) with 0 VUIDs.
+
+Next Immediate Task (Step D):
+- Implement and execute the Real-Session Dispatch Gate (`CYCLES_VULKAN_DISPATCH_GATE`).
+- Validate real dispatch readbacks (film buffer, SoA, integrator queue counters)
+  against the CPU reference under clean execution and targeted negative fault modes.
+- Verify across all three gate configurations (RX 570 default, RX 570 narrow,
+  SwiftShader default) along with regression probes.
+
+================================================================================
+END OF SUMMARY
+================================================================================

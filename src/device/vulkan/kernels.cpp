@@ -47,6 +47,7 @@
  * for the probe we include it explicitly.) state_flow.h itself only needs
  * globals.h/types.h/write.h/state.h, all already included above. */
 #include "kernel/integrator/state_flow.h"
+#include "kernel/bvh/bvh.h"
 
 #include "util/log.h"
 
@@ -8856,6 +8857,31 @@ struct QueueInitPush {
 static_assert(sizeof(QueueInitPush) == 72,
               "QueueInitPush layout must match InitPush (init_from_camera_kernel.slang:125-140)");
 
+/* integrator_intersect_closest.slang:48-60 - five pointers (40) + four 4-byte
+ * members (16) = 56 bytes. */
+struct QueueIntersectPush {
+  VkDeviceAddress params;               /*  0 */
+  VkDeviceAddress render_buffer;        /*  8 */
+  VkDeviceAddress path_index_array;     /* 16 */
+  VkDeviceAddress th;                   /* 24 TraverseHeader */
+  VkDeviceAddress tri_shader;           /* 32 */
+  int32_t work_size;                    /* 40 */
+  uint32_t has_path_index_array;        /* 44 */
+  uint32_t has_th;                      /* 48 */
+  uint32_t has_tri_shader;              /* 52 */
+};
+static_assert(sizeof(QueueIntersectPush) == 56,
+              "QueueIntersectPush layout must match QueueIntersectPush (integrator_intersect_closest.slang)");
+static_assert(offsetof(QueueIntersectPush, params) == 0, "QueueIntersectPush offset");
+static_assert(offsetof(QueueIntersectPush, render_buffer) == 8, "QueueIntersectPush offset");
+static_assert(offsetof(QueueIntersectPush, path_index_array) == 16, "QueueIntersectPush offset");
+static_assert(offsetof(QueueIntersectPush, th) == 24, "QueueIntersectPush offset");
+static_assert(offsetof(QueueIntersectPush, tri_shader) == 32, "QueueIntersectPush offset");
+static_assert(offsetof(QueueIntersectPush, work_size) == 40, "QueueIntersectPush offset");
+static_assert(offsetof(QueueIntersectPush, has_path_index_array) == 44, "QueueIntersectPush offset");
+static_assert(offsetof(QueueIntersectPush, has_th) == 48, "QueueIntersectPush offset");
+static_assert(offsetof(QueueIntersectPush, has_tri_shader) == 52, "QueueIntersectPush offset");
+
 /* init_from_camera_kernel.slang:102-121 - MathParams (256) + 9 * 4 = 292
  * payload bytes. MSVC rounds this HOST struct to 296 because MathProbeParams
  * holds VkDeviceAddress members (alignment 8); the 4 tail bytes are never read
@@ -8910,9 +8936,8 @@ struct QueuePipelineSlot {
 };
 QueuePipelineSlot queue_pipeline_slots[QUEUE_PIPELINE_SLOTS];
 
-/* The single staging buffer that carries DispatchParams to the INIT kernel.
- * Created lazily on the first INIT dispatch, then reused (const_copy_to
- * precedent: map + memcpy + unmap per write). */
+/* The staging buffers that carry DispatchParams to the INIT kernel and
+ * TraverseHeader to the INTERSECT_CLOSEST kernel. Created lazily, then reused. */
 struct QueueStaging {
   bool used = false;
   VkDevice device = VK_NULL_HANDLE;
@@ -8921,7 +8946,8 @@ struct QueueStaging {
   VkDeviceAddress address = 0;
   VkDeviceSize size = 0;
 };
-QueueStaging queue_staging;
+QueueStaging queue_staging_dp;
+QueueStaging queue_staging_th;
 
 /* RAII for the handles one dispatch creates (probe pattern:
  * AbiProbeResources, kernels.cpp:344). Every early return below therefore
@@ -9077,15 +9103,22 @@ bool queue_create_pipeline(VulkanDevice *dev,
   /* 1. SPIR-V location: env override -> CWD -> source tree (probe loading
    *    pattern, kernels.cpp:397-399). slangc is NOT part of the build
    *    (AGENTS.md), so the .spv is an artifact the operator produces. */
-  const char *env_path = getenv((k == DEVICE_KERNEL_INTEGRATOR_RESET) ?
-                                    "CYCLES_VULKAN_RESET_SPV" :
-                                    "CYCLES_VULKAN_INIT_FROM_CAMERA_KERNEL_SPV");
-  const char *local_path = (k == DEVICE_KERNEL_INTEGRATOR_RESET) ?
-                               "integrator_reset.spv" :
-                               "init_from_camera_kernel.spv";
-  const char *src_path = (k == DEVICE_KERNEL_INTEGRATOR_RESET) ?
-                             "src/kernel/device/vulkan/integrator_reset.spv" :
-                             "src/kernel/device/vulkan/init_from_camera_kernel.spv";
+  const char *env_path = nullptr;
+  const char *local_path = nullptr;
+  const char *src_path = nullptr;
+  if (k == DEVICE_KERNEL_INTEGRATOR_RESET) {
+    env_path = getenv("CYCLES_VULKAN_RESET_SPV");
+    local_path = "integrator_reset.spv";
+    src_path = "src/kernel/device/vulkan/integrator_reset.spv";
+  } else if (k == DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA) {
+    env_path = getenv("CYCLES_VULKAN_INIT_FROM_CAMERA_KERNEL_SPV");
+    local_path = "init_from_camera_kernel.spv";
+    src_path = "src/kernel/device/vulkan/init_from_camera_kernel.spv";
+  } else if (k == DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST) {
+    env_path = getenv("CYCLES_VULKAN_INTERSECT_CLOSEST_SPV");
+    local_path = "integrator_intersect_closest.spv";
+    src_path = "src/kernel/device/vulkan/integrator_intersect_closest.spv";
+  }
   const char *candidates[3] = {env_path, local_path, src_path};
   std::vector<char> spirv;
   const char *found = nullptr;
@@ -9207,41 +9240,38 @@ bool queue_get_pipeline(VulkanDevice *dev,
   return false;
 }
 
-/* Create (once per device) and fill the DispatchParams staging buffer.
+/* Create (once per device) and fill a staging buffer.
  * STORAGE | SHADER_DEVICE_ADDRESS because the shader reads it through a raw
  * device pointer; host-visible + coherent so the mapping is valid as soon as
  * the (implicit) upload is done - same pair the ABI probe's readback uses
  * (kernels.cpp:476,489-491). */
-bool queue_write_dispatch_params(VulkanDevice *dev,
-                                 const QueueDispatchParams &dp,
-                                 VkDeviceAddress &out_addr)
+static bool queue_write_staging_buffer(VulkanDevice *dev,
+                                       QueueStaging &st,
+                                       const void *data,
+                                       const VkDeviceSize need,
+                                       VkDeviceAddress &out_addr)
 {
   const VkDevice vk_dev = dev->vk_device();
-  const VkDeviceSize need = sizeof(QueueDispatchParams);
 
-  if (!(queue_staging.used && queue_staging.device == vk_dev &&
-        queue_staging.size >= need))
-  {
-    if (queue_staging.used && queue_staging.device == vk_dev) {
-      /* Same device but too small (cannot happen: the size is a constant) -
-       * destroy before recreating so nothing leaks. */
-      vkDestroyBuffer(vk_dev, queue_staging.buffer, nullptr);
-      vkFreeMemory(vk_dev, queue_staging.memory, nullptr);
-      queue_staging = QueueStaging();
+  if (!(st.used && st.device == vk_dev && st.size >= need)) {
+    if (st.used && st.device == vk_dev) {
+      vkDestroyBuffer(vk_dev, st.buffer, nullptr);
+      vkFreeMemory(vk_dev, st.memory, nullptr);
+      st = QueueStaging();
     }
     VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bci.size = need;
     bci.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
                 VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     bci.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (vkCreateBuffer(vk_dev, &bci, nullptr, &queue_staging.buffer) != VK_SUCCESS) {
+    if (vkCreateBuffer(vk_dev, &bci, nullptr, &st.buffer) != VK_SUCCESS) {
       LOG_ERROR << "Vulkan: queue dispatch: staging buffer creation failed.";
-      queue_staging = QueueStaging();
+      st = QueueStaging();
       return false;
     }
 
     VkMemoryRequirements reqs;
-    vkGetBufferMemoryRequirements(vk_dev, queue_staging.buffer, &reqs);
+    vkGetBufferMemoryRequirements(vk_dev, st.buffer, &reqs);
     VkMemoryAllocateFlagsInfo flags_info{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
     flags_info.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
     VkMemoryAllocateInfo ai{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
@@ -9250,39 +9280,51 @@ bool queue_write_dispatch_params(VulkanDevice *dev,
     ai.memoryTypeIndex = dev->find_memory_type(
         reqs.memoryTypeBits,
         VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    if (vkAllocateMemory(vk_dev, &ai, nullptr, &queue_staging.memory) != VK_SUCCESS) {
+    if (vkAllocateMemory(vk_dev, &ai, nullptr, &st.memory) != VK_SUCCESS) {
       LOG_ERROR << "Vulkan: queue dispatch: staging memory allocation failed.";
-      vkDestroyBuffer(vk_dev, queue_staging.buffer, nullptr);
-      queue_staging = QueueStaging();
+      vkDestroyBuffer(vk_dev, st.buffer, nullptr);
+      st = QueueStaging();
       return false;
     }
-    if (vkBindBufferMemory(vk_dev, queue_staging.buffer, queue_staging.memory, 0) !=
-        VK_SUCCESS)
-    {
+    if (vkBindBufferMemory(vk_dev, st.buffer, st.memory, 0) != VK_SUCCESS) {
       LOG_ERROR << "Vulkan: queue dispatch: staging buffer bind failed.";
-      vkDestroyBuffer(vk_dev, queue_staging.buffer, nullptr);
-      vkFreeMemory(vk_dev, queue_staging.memory, nullptr);
-      queue_staging = QueueStaging();
+      vkDestroyBuffer(vk_dev, st.buffer, nullptr);
+      vkFreeMemory(vk_dev, st.memory, nullptr);
+      st = QueueStaging();
       return false;
     }
     VkBufferDeviceAddressInfo bai{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
-    bai.buffer = queue_staging.buffer;
-    queue_staging.device = vk_dev;
-    queue_staging.address = vkGetBufferDeviceAddress(vk_dev, &bai);
-    queue_staging.size = need;
-    queue_staging.used = true;
+    bai.buffer = st.buffer;
+    st.device = vk_dev;
+    st.address = vkGetBufferDeviceAddress(vk_dev, &bai);
+    st.size = need;
+    st.used = true;
   }
 
   void *mapped = nullptr;
-  if (vkMapMemory(vk_dev, queue_staging.memory, 0, need, 0, &mapped) != VK_SUCCESS) {
+  if (vkMapMemory(vk_dev, st.memory, 0, need, 0, &mapped) != VK_SUCCESS) {
     LOG_ERROR << "Vulkan: queue dispatch: mapping the staging buffer failed.";
     return false;
   }
-  memcpy(mapped, &dp, (size_t)need);
-  vkUnmapMemory(vk_dev, queue_staging.memory);
+  memcpy(mapped, data, (size_t)need);
+  vkUnmapMemory(vk_dev, st.memory);
 
-  out_addr = queue_staging.address;
+  out_addr = st.address;
   return true;
+}
+
+bool queue_write_dispatch_params(VulkanDevice *dev,
+                                 const QueueDispatchParams &dp,
+                                 VkDeviceAddress &out_addr)
+{
+  return queue_write_staging_buffer(dev, queue_staging_dp, &dp, sizeof(QueueDispatchParams), out_addr);
+}
+
+bool queue_write_traverse_header(VulkanDevice *dev,
+                                 const TpHeader &th,
+                                 VkDeviceAddress &out_addr)
+{
+  return queue_write_staging_buffer(dev, queue_staging_th, &th, sizeof(TpHeader), out_addr);
 }
 
 /* Record + submit + fence-wait ONE dispatch. Own TRANSIENT command pool on the
@@ -9986,6 +10028,267 @@ static bool vulkan_dispatch_gate_init(VulkanDevice *dev,
   return all_ok;
 }
 
+/* ===========================================================================
+ * M4f Slice 6: Real-Session Dispatch Gate for INTERSECT_CLOSEST.
+ *
+ * Verifies that the GPU BVH2 traversal and queue scheduling matches the
+ * REAL Cycles CPU reference (scene_intersect) across all active paths.
+ * Evaluates clean execution and 2 fault injections (negative tests).
+ * =========================================================================== */
+static bool vulkan_dispatch_gate_intersect(VulkanDevice *dev,
+                                          const QueuePipeline &pipeline,
+                                          const uint32_t push_bytes,
+                                          const uint32_t groups,
+                                          const QueueIntersectPush &push,
+                                          const TpHeader &th,
+                                          const int n,
+                                          const uint64_t path_index_array,
+                                          const uint64_t render_buffer)
+{
+  static bool ran = false;
+  if (ran) return true;
+  ran = true;
+
+  LOG_INFO << "Vulkan: Real-session dispatch gate: testing INTERSECT_CLOSEST (n=" << n << ")...";
+
+  std::vector<int32_t> host_pia;
+  if (path_index_array != 0) {
+    host_pia.resize((size_t)n);
+    if (!dev->copy_device_to_host((void*)path_index_array, 0, host_pia.data(), n * sizeof(int32_t))) {
+      LOG_ERROR << "Vulkan: Real-session dispatch gate: failed to read path_index_array.";
+      return false;
+    }
+  }
+
+  const IntegratorStateGPU &ist = dev->host_params().integrator_state;
+
+  std::vector<float> ray_P((size_t)n * 3), ray_D((size_t)n * 3), ray_tmin((size_t)n), ray_tmax((size_t)n);
+  std::vector<uint32_t> ray_vis((size_t)n);
+  if (!dev->copy_device_to_host((void*)ist.ray.P, 0, ray_P.data(), n * 3 * sizeof(float)) ||
+      !dev->copy_device_to_host((void*)ist.ray.D, 0, ray_D.data(), n * 3 * sizeof(float)) ||
+      !dev->copy_device_to_host((void*)ist.ray.tmin, 0, ray_tmin.data(), n * sizeof(float)) ||
+      !dev->copy_device_to_host((void*)ist.ray.tmax, 0, ray_tmax.data(), n * sizeof(float)) ||
+      !dev->copy_device_to_host((void*)ist.path.visibility, 0, ray_vis.data(), n * sizeof(uint32_t)))
+  {
+    LOG_ERROR << "Vulkan: Real-session dispatch gate: failed to read ray data from device.";
+    return false;
+  }
+
+  std::vector<uint32_t> host_tri_shader;
+  if (push.tri_shader != 0) {
+    size_t tri_bytes = dev->global_snapshot("tri_shader").size();
+    if (tri_bytes == 0) tri_bytes = dev->allocation_size((const void*)push.tri_shader);
+    if (tri_bytes > 0) {
+      host_tri_shader.resize(tri_bytes / sizeof(uint32_t));
+      dev->copy_device_to_host((void*)push.tri_shader, 0, host_tri_shader.data(), tri_bytes);
+    }
+  }
+
+  KernelGlobalsCPU kg_cpu;
+  kg_cpu.data = dev->host_kernel_data();
+
+#define BIND_REF_ARRAY(type, name) \
+  std::vector<uint8_t> snap_##name = dev->global_snapshot(#name); \
+  if (!snap_##name.empty()) { \
+    kg_cpu.name.data = reinterpret_cast<const type *>(snap_##name.data()); \
+    kg_cpu.name.width = (int)(snap_##name.size() / sizeof(type)); \
+  }
+  BIND_REF_ARRAY(float4, bvh_nodes);
+  BIND_REF_ARRAY(float4, bvh_leaf_nodes);
+  BIND_REF_ARRAY(uint, prim_visibility);
+  BIND_REF_ARRAY(uint, prim_index);
+  BIND_REF_ARRAY(uint, prim_object);
+  BIND_REF_ARRAY(uint, object_node);
+  BIND_REF_ARRAY(KernelObject, objects);
+  BIND_REF_ARRAY(uint, tri_shader);
+  BIND_REF_ARRAY(packed_uint3, tri_vindex);
+  BIND_REF_ARRAY(packed_float3, tri_verts);
+  BIND_REF_ARRAY(float, lookup_table);
+  BIND_REF_ARRAY(float, sample_pattern_lut);
+#undef BIND_REF_ARRAY
+
+  Profiler profiler;
+  ThreadKernelGlobalsCPU tkg(kg_cpu, nullptr, profiler, 0);
+  KernelGlobals kg = &tkg;
+
+  struct RefIsect {
+    float t = 0.0f, u = 0.0f, v = 0.0f;
+    int32_t prim = -1, object = -1, type = 0;
+    uint32_t queued_kernel = 0;
+    uint32_t shader_sort_key = 0;
+  };
+  std::vector<RefIsect> ref_isects((size_t)n);
+  int ref_hits = 0, ref_misses = 0;
+
+  for (int i = 0; i < n; i++) {
+    const int state = (path_index_array != 0) ? host_pia[i] : i;
+    Ray ray;
+    ray.P = make_float3(ray_P[(size_t)state * 3 + 0], ray_P[(size_t)state * 3 + 1], ray_P[(size_t)state * 3 + 2]);
+    ray.D = make_float3(ray_D[(size_t)state * 3 + 0], ray_D[(size_t)state * 3 + 1], ray_D[(size_t)state * 3 + 2]);
+    ray.tmin = ray_tmin[state];
+    ray.tmax = ray_tmax[state];
+    ray.time = 0.5f;
+    ray.self.object = OBJECT_NONE;
+    ray.self.prim = PRIM_NONE;
+    ray.self.light_object = OBJECT_NONE;
+    ray.self.light_prim = PRIM_NONE;
+
+    const uint visibility = ray_vis[state];
+
+    Intersection isect;
+    isect.object = OBJECT_NONE;
+    isect.prim = PRIM_NONE;
+    isect.type = 0;
+    isect.u = 0.0f;
+    isect.v = 0.0f;
+    isect.t = ray.tmax;
+
+    bool hit = false;
+    if (ray.tmax > 0.0f) {
+      hit = scene_intersect(kg, &ray, visibility, &isect);
+    }
+    if (!hit) {
+      isect.prim = PRIM_NONE;
+      isect.object = OBJECT_NONE;
+      isect.type = 0;
+      isect.t = ray.tmax;
+      isect.u = 0.0f;
+      isect.v = 0.0f;
+    }
+
+    ref_isects[state].t = isect.t;
+    ref_isects[state].u = isect.u;
+    ref_isects[state].v = isect.v;
+    ref_isects[state].prim = isect.prim;
+    ref_isects[state].object = isect.object;
+    ref_isects[state].type = isect.type;
+
+    if (hit) {
+      ref_hits++;
+      ref_isects[state].queued_kernel = DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE;
+      uint32_t shader = 0;
+      if ((isect.type & PRIMITIVE_TRIANGLE) && !host_tri_shader.empty() && (size_t)isect.prim < host_tri_shader.size()) {
+        shader = host_tri_shader[isect.prim] & 0x00FFFFFFu;
+      }
+      ref_isects[state].shader_sort_key = shader;
+    } else {
+      ref_misses++;
+      ref_isects[state].queued_kernel = DEVICE_KERNEL_INTEGRATOR_SHADE_BACKGROUND;
+      ref_isects[state].shader_sort_key = 0;
+    }
+  }
+
+  LOG_INFO << "Vulkan: Real-session dispatch gate: CPU reference computed ("
+           << ref_hits << " hits, " << ref_misses << " misses).";
+
+  /* 1. CLEAN RUN */
+  if (!queue_submit_dispatch(dev, pipeline, &push, push_bytes, groups)) {
+    LOG_ERROR << "Vulkan: Real-session dispatch gate: CLEAN submit failed.";
+    return false;
+  }
+
+  std::vector<float> gpu_t((size_t)n), gpu_u((size_t)n), gpu_v((size_t)n);
+  std::vector<int32_t> gpu_prim((size_t)n), gpu_obj((size_t)n), gpu_type((size_t)n);
+  std::vector<uint32_t> gpu_queued((size_t)n), gpu_shader((size_t)n);
+
+  dev->copy_device_to_host((void*)ist.isect.t, 0, gpu_t.data(), n * sizeof(float));
+  dev->copy_device_to_host((void*)ist.isect.u, 0, gpu_u.data(), n * sizeof(float));
+  dev->copy_device_to_host((void*)ist.isect.v, 0, gpu_v.data(), n * sizeof(float));
+  dev->copy_device_to_host((void*)ist.isect.prim, 0, gpu_prim.data(), n * sizeof(int32_t));
+  dev->copy_device_to_host((void*)ist.isect.object, 0, gpu_obj.data(), n * sizeof(int32_t));
+  dev->copy_device_to_host((void*)ist.isect.type, 0, gpu_type.data(), n * sizeof(int32_t));
+  dev->copy_device_to_host((void*)ist.path.queued_kernel, 0, gpu_queued.data(), n * sizeof(uint32_t));
+  dev->copy_device_to_host((void*)ist.path.shader_sort_key, 0, gpu_shader.data(), n * sizeof(uint32_t));
+
+  int prim_diffs = 0, obj_diffs = 0, type_diffs = 0, queued_diffs = 0, shader_diffs = 0;
+  int float_diffs = 0;
+  float max_norm_err = 0.0f;
+
+  for (int i = 0; i < n; i++) {
+    const int state = (path_index_array != 0) ? host_pia[i] : i;
+    if (gpu_prim[state] != ref_isects[state].prim) prim_diffs++;
+    if (gpu_obj[state] != ref_isects[state].object) obj_diffs++;
+    if (gpu_type[state] != ref_isects[state].type) type_diffs++;
+    if (gpu_queued[state] != ref_isects[state].queued_kernel) queued_diffs++;
+    if (gpu_shader[state] != ref_isects[state].shader_sort_key) shader_diffs++;
+
+    auto check_flt = [&](float g, float r) {
+      float diff = std::abs(g - r);
+      float norm = diff / std::max(1.0f, std::abs(r));
+      max_norm_err = std::max(max_norm_err, norm);
+      if (norm > 1e-5f) float_diffs++;
+    };
+    check_flt(gpu_t[state], ref_isects[state].t);
+    check_flt(gpu_u[state], ref_isects[state].u);
+    check_flt(gpu_v[state], ref_isects[state].v);
+  }
+
+  bool clean_ok = (prim_diffs == 0 && obj_diffs == 0 && type_diffs == 0 &&
+                   queued_diffs == 0 && shader_diffs == 0 && float_diffs == 0);
+
+  LOG_INFO << "Vulkan: Real-session dispatch gate: CLEAN RUN: prim_diffs=" << prim_diffs
+           << " obj_diffs=" << obj_diffs << " type_diffs=" << type_diffs
+           << " queued_diffs=" << queued_diffs << " shader_diffs=" << shader_diffs
+           << " float_diffs=" << float_diffs << " max_norm_err=" << max_norm_err;
+
+  /* 2. NEGATIVE 1: Corrupt BVH root */
+  TpHeader th_neg = th;
+  th_neg.root = 0x3FFFFFFFu;
+  VkDeviceAddress th_neg_addr = 0;
+  queue_write_traverse_header(dev, th_neg, th_neg_addr);
+  QueueIntersectPush push_neg = push;
+  push_neg.th = th_neg_addr;
+  queue_submit_dispatch(dev, pipeline, &push_neg, push_bytes, groups);
+
+  std::vector<int32_t> neg1_prim((size_t)n);
+  dev->copy_device_to_host((void*)ist.isect.prim, 0, neg1_prim.data(), n * sizeof(int32_t));
+  int neg1_diffs = 0;
+  for (int i = 0; i < n; i++) {
+    const int state = (path_index_array != 0) ? host_pia[i] : i;
+    if (neg1_prim[state] != ref_isects[state].prim) neg1_diffs++;
+  }
+  const bool neg1_ok = (ref_hits > 0) ? (neg1_diffs > 0) : true;
+  LOG_INFO << "Vulkan: Real-session dispatch gate: NEGATIVE 1 (corrupt root): diffs=" << neg1_diffs
+           << (neg1_ok ? " [DETECTED]" : " [FAILED]");
+
+  /* 3. NEGATIVE 2: Half work size */
+  QueueIntersectPush push_neg2 = push;
+  push_neg2.work_size = n / 2;
+  std::vector<uint32_t> reset_queued((size_t)n, 0);
+  dev->copy_host_to_device((void*)ist.path.queued_kernel, reset_queued.data(), n * sizeof(uint32_t));
+  queue_submit_dispatch(dev, pipeline, &push_neg2, push_bytes, (groups + 1) / 2);
+
+  std::vector<uint32_t> neg2_queued((size_t)n);
+  dev->copy_device_to_host((void*)ist.path.queued_kernel, 0, neg2_queued.data(), n * sizeof(uint32_t));
+  int neg2_upper_diffs = 0, neg2_lower_diffs = 0;
+  for (int i = 0; i < n; i++) {
+    const int state = (path_index_array != 0) ? host_pia[i] : i;
+    if (i < n / 2) {
+      if (neg2_queued[state] != ref_isects[state].queued_kernel) neg2_lower_diffs++;
+    } else {
+      if (neg2_queued[state] != ref_isects[state].queued_kernel) neg2_upper_diffs++;
+    }
+  }
+  const bool neg2_ok = (neg2_upper_diffs > 0 && neg2_lower_diffs == 0);
+  LOG_INFO << "Vulkan: Real-session dispatch gate: NEGATIVE 2 (half work_size): upper_diffs="
+           << neg2_upper_diffs << " lower_diffs=" << neg2_lower_diffs
+           << (neg2_ok ? " [DETECTED]" : " [FAILED]");
+
+  /* 4. Restore clean state */
+  queue_write_traverse_header(dev, th, const_cast<VkDeviceAddress&>(push.th));
+  queue_submit_dispatch(dev, pipeline, &push, push_bytes, groups);
+
+  const bool all_ok = clean_ok && neg1_ok && neg2_ok;
+  if (all_ok) {
+    LOG_INFO << "Vulkan: Real-session dispatch gate: INTERSECT_CLOSEST GATE MET.";
+    fprintf(stderr, "\nVulkan: Real-session dispatch gate: INTERSECT_CLOSEST GATE MET\n\n");
+  } else {
+    LOG_ERROR << "Vulkan: Real-session dispatch gate: INTERSECT_CLOSEST GATE FAILED.";
+    fprintf(stderr, "\nVulkan: Real-session dispatch gate: INTERSECT_CLOSEST GATE FAILED\n\n");
+  }
+  return all_ok;
+}
+
 } /* namespace */
 
 /* The single entry point VulkanQueue::enqueue() hands slice-5 kernels to.
@@ -9998,7 +10301,8 @@ int vulkan_queue_enqueue(VulkanDevice *dev,
   /* ---- 0. Scope ------------------------------------------------------- */
   const bool is_reset = (k == DEVICE_KERNEL_INTEGRATOR_RESET);
   const bool is_init = (k == DEVICE_KERNEL_INTEGRATOR_INIT_FROM_CAMERA);
-  if (!is_reset && !is_init) {
+  const bool is_intersect = (k == DEVICE_KERNEL_INTEGRATOR_INTERSECT_CLOSEST);
+  if (!is_reset && !is_init && !is_intersect) {
     return 0; /* queue.cpp keeps the M4 "not implemented" error */
   }
   if (dev == nullptr) {
@@ -10111,6 +10415,7 @@ int vulkan_queue_enqueue(VulkanDevice *dev,
    *                 max_tile_work_size, NULL, 0)
    *   restart branch path_trace_work_gpu.cpp:559-564 (NULL, 0, buffer, 0,
    *                 d_path_index, num_path_indices) */
+  if (is_init) {
   if (args.count != 6 || args.types[0] != DeviceKernelArguments::POINTER ||
       args.types[1] != DeviceKernelArguments::INT32 ||
       args.types[2] != DeviceKernelArguments::POINTER ||
@@ -10291,6 +10596,114 @@ int vulkan_queue_enqueue(VulkanDevice *dev,
     return -1;
   }
   return 1;
+  }
+
+  /* ---- 4. INTERSECT_CLOSEST ------------------------------------------ */
+  if (is_intersect) {
+    if (args.count != 3 ||
+        args.types[0] != DeviceKernelArguments::POINTER ||
+        args.types[1] != DeviceKernelArguments::POINTER ||
+        args.types[2] != DeviceKernelArguments::INT32)
+    {
+      LOG_ERROR << "Vulkan: queue dispatch: INTERSECT_CLOSEST expects 3 arguments (P,P,I), got "
+                << args.count << " args.";
+      dev->set_error("Vulkan: queue dispatch: bad INTERSECT_CLOSEST arguments.");
+      return -1;
+    }
+    const uint64_t path_index_array = *static_cast<const uint64_t *>(args.values[0]);
+    const uint64_t render_buffer = *static_cast<const uint64_t *>(args.values[1]);
+    const int32_t work_size = *static_cast<const int32_t *>(args.values[2]);
+
+    if (work_size != n) {
+      LOG_WARNING << "Vulkan: queue dispatch: INTERSECT_CLOSEST work_size (" << work_size
+                  << ") != work size (" << n << "); using the work size for the grid.";
+    }
+
+    const KernelParamsVulkan &kp = dev->host_params();
+    const KernelData &kd = dev->host_kernel_data();
+
+    TpHeader th{};
+    th.bvh_nodes = kp.bvh_nodes;
+    th.bvh_leaf_nodes = kp.bvh_leaf_nodes;
+    th.prim_index = kp.prim_index;
+    th.prim_visibility = kp.prim_visibility;
+    th.prim_object = kp.prim_object;
+    th.tri_vindex = kp.tri_vindex;
+    th.tri_verts = kp.tri_verts;
+    th.objects = kp.objects;
+    th.object_node = kp.object_node;
+    th.root = kd.bvh.root;
+
+    size_t bvh_nodes_bytes = dev->global_snapshot("bvh_nodes").size();
+    if (bvh_nodes_bytes == 0) bvh_nodes_bytes = dev->allocation_size((const void*)kp.bvh_nodes);
+    th.node_count = (uint32_t)(bvh_nodes_bytes / 16);
+
+    size_t leaf_bytes = dev->global_snapshot("bvh_leaf_nodes").size();
+    if (leaf_bytes == 0) leaf_bytes = dev->allocation_size((const void*)kp.bvh_leaf_nodes);
+    th.leaf_count = (uint32_t)(leaf_bytes / 16);
+
+    size_t prim_bytes = dev->global_snapshot("prim_index").size();
+    if (prim_bytes == 0) prim_bytes = dev->allocation_size((const void*)kp.prim_index);
+    th.prim_count = (uint32_t)(prim_bytes / 4);
+
+    size_t tri_bytes = dev->global_snapshot("tri_vindex").size();
+    if (tri_bytes == 0) tri_bytes = dev->allocation_size((const void*)kp.tri_vindex);
+    th.tri_count = (uint32_t)(tri_bytes / 12);
+
+    size_t vert_bytes = dev->global_snapshot("tri_verts").size();
+    if (vert_bytes == 0) vert_bytes = dev->allocation_size((const void*)kp.tri_verts);
+    th.vert_count = (uint32_t)(vert_bytes / 12);
+
+    size_t obj_bytes = dev->global_snapshot("objects").size();
+    if (obj_bytes == 0) obj_bytes = dev->allocation_size((const void*)kp.objects);
+    th.object_count = (uint32_t)(obj_bytes / 256);
+
+    size_t obj_node_bytes = dev->global_snapshot("object_node").size();
+    if (obj_node_bytes == 0) obj_node_bytes = dev->allocation_size((const void*)kp.object_node);
+    th.object_node_count = (uint32_t)(obj_node_bytes / 4);
+
+    VkDeviceAddress th_addr = 0;
+    if (!queue_write_traverse_header(dev, th, th_addr)) {
+      dev->set_error("Vulkan: queue dispatch: TraverseHeader staging failed.");
+      return -1;
+    }
+
+    push_bytes = sizeof(QueueIntersectPush);
+    if (!queue_get_pipeline(dev, k, push_bytes, pipeline)) {
+      dev->set_error("Vulkan: queue dispatch: could not build the INTERSECT_CLOSEST pipeline.");
+      return -1;
+    }
+
+    QueueIntersectPush push{};
+    push.params = params_addr;
+    push.render_buffer = render_buffer;
+    push.path_index_array = path_index_array;
+    push.th = th_addr;
+    push.tri_shader = kp.tri_shader;
+    push.work_size = n;
+    push.has_path_index_array = (path_index_array != 0) ? 1u : 0u;
+    push.has_th = (th_addr != 0) ? 1u : 0u;
+    push.has_tri_shader = (kp.tri_shader != 0) ? 1u : 0u;
+
+    LOG_INFO << "Vulkan: queue dispatch: INTERSECT_CLOSEST n=" << n << " groups=" << groups
+             << " root=" << th.root << " nodes=" << th.node_count << " tris=" << th.tri_count;
+
+    if (getenv("CYCLES_VULKAN_DISPATCH_GATE") != nullptr) {
+      if (!vulkan_dispatch_gate_intersect(dev, pipeline, push_bytes, groups, push, th, n,
+                                         path_index_array, render_buffer))
+      {
+        dev->set_error("Vulkan: dispatch gate: INTERSECT_CLOSEST gate failed.");
+        return -1;
+      }
+    }
+
+    if (!queue_submit_dispatch(dev, pipeline, &push, push_bytes, groups)) {
+      dev->set_error("Vulkan: queue dispatch: INTERSECT_CLOSEST submit failed.");
+      return -1;
+    }
+    return 1;
+  }
+  return 0;
 }
 
 /* M4f slice 5: tear down every Vulkan object THIS file created that outlives
@@ -10320,10 +10733,16 @@ void vulkan_queue_dispatch_shutdown(VulkanDevice *dev)
     slot = QueuePipelineSlot(); /* used=false again: idempotent on a 2nd call */
   }
 
-  if (queue_staging.used && queue_staging.device == vk_dev) {
-    if (queue_staging.buffer) vkDestroyBuffer(vk_dev, queue_staging.buffer, nullptr);
-    if (queue_staging.memory) vkFreeMemory(vk_dev, queue_staging.memory, nullptr);
-    queue_staging = QueueStaging();
+  if (queue_staging_dp.used && queue_staging_dp.device == vk_dev) {
+    if (queue_staging_dp.buffer) vkDestroyBuffer(vk_dev, queue_staging_dp.buffer, nullptr);
+    if (queue_staging_dp.memory) vkFreeMemory(vk_dev, queue_staging_dp.memory, nullptr);
+    queue_staging_dp = QueueStaging();
+  }
+
+  if (queue_staging_th.used && queue_staging_th.device == vk_dev) {
+    if (queue_staging_th.buffer) vkDestroyBuffer(vk_dev, queue_staging_th.buffer, nullptr);
+    if (queue_staging_th.memory) vkFreeMemory(vk_dev, queue_staging_th.memory, nullptr);
+    queue_staging_th = QueueStaging();
   }
 }
 

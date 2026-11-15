@@ -704,6 +704,30 @@ void write_isect_t(IntegratorStateGPU* ist, uint state, float v)
     data_ptr[state] = v;
 }
 
+float read_isect_u(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:94 (float)
+    float* data_ptr = ist->isect.u;
+    return data_ptr[state];
+}
+void write_isect_u(IntegratorStateGPU* ist, uint state, float v)
+{
+    float* data_ptr = ist->isect.u;
+    data_ptr[state] = v;
+}
+
+float read_isect_v(IntegratorStateGPU* ist, uint state)
+{
+    // source: state_template.h:95 (float)
+    float* data_ptr = ist->isect.v;
+    return data_ptr[state];
+}
+void write_isect_v(IntegratorStateGPU* ist, uint state, float v)
+{
+    float* data_ptr = ist->isect.v;
+    data_ptr[state] = v;
+}
+
 int read_isect_prim(IntegratorStateGPU* ist, uint state)
 {
     // source: state_template.h:96 (int); read: intersect_closest.h:363
