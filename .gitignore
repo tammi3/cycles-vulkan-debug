@@ -44,3 +44,13 @@ abi_probe.spv
 m4c_live_kerneldata.bin
 traverse_prepare.spv
 traverse_probe.spv
+
+# Generated SPIR-V binaries
+*.spv
+
+# Stray root log file
+/log
+
+# Build logs
+build/logs/
+build\logs\

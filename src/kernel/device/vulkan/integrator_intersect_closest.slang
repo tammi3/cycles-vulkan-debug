@@ -40,6 +40,55 @@
  *     has_tri_shader) per platform constraint 3 (avoid OpConvertPtrToU).
  */
 
+/* KNOWN GAPS vs REAL CYCLES (Task A5 Gap Analysis):
+ * Compare against src/kernel/integrator/intersect_closest.h:351-446 and
+ * kernel_intersect_next_kernel (intersect_closest.h:~195-300):
+ *
+ * 1. Self-intersection avoidance (ray.self.object/prim = last isect):
+ *    - Cycles: intersect_closest.h:382-385 sets ray.self.object/prim = last_isect_object/prim.
+ *    - Slang: traverse() call does not receive or check ray.self primitives.
+ *    - Reachable in instance2.xml (kernel_features=0x80000803)? NO on camera bounce 0; YES on bounce > 0.
+ *      Proof: On camera rays (bounce 0), state_init zeroes isect (last_isect_object = OBJECT_NONE,
+ *      last_isect_prim = PRIM_NONE, state_template.h:96). Indirect bounces require it.
+ *
+ * 2. Light MIS (lights_intersect / use_light_mis):
+ *    - Cycles: intersect_closest.h:424-438 calls lights_intersect() if kernel_data.integrator.use_light_mis.
+ *    - Slang: Omitted.
+ *    - Reachable in instance2.xml (kernel_features=0x80000803)? NO.
+ *      Proof: instance2.xml contains 0 lights (log lines 286-287: "Total 0 lights",
+ *      "Number of lights sent to the device: 0").
+ *
+ * 3. Sorted queue for SHADE_SURFACE (integrator_path_next_sorted):
+ *    - Cycles: intersect_closest.h:273-275 calls integrator_path_next_sorted() which uses
+ *      atomic sort_key_counter and INTEGRATOR_SORT_KEY partitioning.
+ *    - Slang: Uses unsorted integrator_path_next() to DEVICE_KERNEL_INTEGRATOR_SHADE_SURFACE.
+ *    - Reachable in instance2.xml (kernel_features=0x80000803)? YES.
+ *      Proof: Rays hitting cubes in instance2.xml transition to SHADE_SURFACE. Cycles GPU backend
+ *      unconditionally calls integrator_path_next_sorted in intersect_closest.h:273-275.
+ *
+ * 4. Shader flags / termination (intersection_get_shader + shaders[].flags + integrator_intersect_terminate):
+ *    - Cycles: intersect_closest.h:257-260 checks shader flags and calls integrator_intersect_terminate().
+ *    - Slang: Reads shader ID directly from pc.tri_shader, omits shaders[].flags and termination check.
+ *    - Reachable in instance2.xml (kernel_features=0x80000803)? NO.
+ *      Proof: instance2.xml has opaque diffuse materials without transparency (log line 266:
+ *      "Use Transparent False"; KERNEL_FEATURE_TRANSPARENT bit 1<<19 is 0 in kernel_features=0x80000803).
+ *
+ * 5. AO bounce distance clamping (path_state_ao_bounce -> ray.tmax):
+ *    - Cycles: intersect_closest.h:367-376 clamps ray.tmax if path_state_ao_bounce is true.
+ *    - Slang: Omitted.
+ *    - Reachable in instance2.xml (kernel_features=0x80000803)? NO.
+ *      Proof: KERNEL_FEATURE_AO (bits 1<<22 | 1<<23 = 0xC00000) is 0 in kernel_features=0x80000803
+ *      (features.h:63); AO bounces are disabled in instance2.xml.
+ *
+ * 6. Caustics (MNEE) / raytrace kernels, shadow catcher, volume:
+ *    - Cycles: intersect_closest.h:228-248 (volume), 265-271 (MNEE / raytrace), 277-280 (shadow catcher).
+ *    - Slang: All omitted.
+ *    - Reachable in instance2.xml (kernel_features=0x80000803)? NO for all four.
+ *      Proof: In kernel_features=0x80000803, KERNEL_FEATURE_MNEE (bit 1<<24), KERNEL_FEATURE_NODE_RAYTRACE
+ *      (bit 1<<6), KERNEL_FEATURE_SHADOW_CATCHER (bit 1<<20), and KERNEL_FEATURE_VOLUME (bits 1<<2, 1<<18)
+ *      are all 0 (log lines 261, 264, 265, 274, 275 report them False).
+ */
+
 #include "integrator_state.slang"
 #include "film_queue.slang"
 #include "traverse.slang"

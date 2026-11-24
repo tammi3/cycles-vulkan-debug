@@ -1,4 +1,65 @@
 ================================================================================
+M4f SLICE 6 — STATUS AT INTERRUPTION (Date of commit: 2026-11-15 03:30:45 -0300)
+================================================================================
+STATUS: DIAGNOSIS COMPLETE (TASK A).
+Commit 3d721c8 was an interrupted snapshot following a power outage during Slice 6
+(INTEGRATOR_INTERSECT_CLOSEST). The working tree is whole and compiles cleanly.
+The gate failure in Negative 3 (spillover=256182) was diagnosed as a pre-existing
+HARNESS ISSUE in vulkan_dispatch_gate_init (not a regression from Slice 6 code).
+Validation layer active (VK_LAYER_KHRONOS_validation) with 0 VUID errors / 0 Validation Errors.
+
+--------------------------------------------------------------------------------
+REPORT FORMAT:
+--------------------------------------------------------------------------------
+
+1. Snapshot integrity (A1)
+- Git status: Working tree clean (all tracked files intact, no untracked sources). No half-edited files, unclosed syntax blocks, or TODO markers in kernels.cpp, integrator_state.slang, or integrator_intersect_closest.slang.
+- Release build: cmake --build build --config Release --target cycles compiled and linked cleanly with exit code 0 (cycles.exe).
+- SPIR-V compilation: All 3 .slang entries compiled with slangc (exit code 0) and validated with spirv-val --target-env vulkan1.3 (exit code 0); freshly compiled SPV files are byte-identical in size and SHA256 to committed .spv binaries.
+
+2. Gate runs table (A2)
+| Run | RESET Clean | RESET N (num_states/2) | INIT Clean | INIT N1 (tile_offset) | INIT N2 (start_sample) | INIT N3 (rb_push) Spillover | VUID Errors | Verdict |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| Run 1 | PASS (0/2097152) | DETECTED (1048576) | PASS (0/524288) | DETECTED (526344) | DETECTED (524288) | FAILED (spillover=256182) | 0 | Deterministic Failure |
+| Run 2 | PASS (0/2097152) | DETECTED (1048576) | PASS (0/524288) | DETECTED (526344) | DETECTED (524288) | FAILED (spillover=256182) | 0 | Deterministic Failure |
+| Run 3 | PASS (0/2097152) | DETECTED (1048576) | PASS (0/524288) | DETECTED (526344) | DETECTED (524288) | FAILED (spillover=256182) | 0 | Deterministic Failure |
+Determinism: 100% deterministic across all 3 runs (exact same spillover 256,182 every time; validation layer active with 0 VUID errors).
+
+3. N3 verdict: HARNESS ISSUE
+Verdict: HARNESS ISSUE (not a code regression, not flaky).
+Evidence:
+- git diff 2a0ec92 HEAD contains ZERO diff hunks inside vulkan_dispatch_gate_init or init_from_camera_kernel.slang. Recompiling init_from_camera_kernel.spv against the 2a0ec92 tree produces a byte-identical binary (SHA256 0820808CD8BBE8C932FD28CC835D7D6ADDDE08BCE1FCE5C67E5532822AA89186, 144,724 bytes), proving that no shader code generation or dispatch structure changed between 2a0ec92 and HEAD.
+- In kernels.cpp lines 9984-9987, N3 artificially overrides `if (dp_neg.pass_sample_count == PASS_UNUSED) dp_neg.pass_sample_count = 0;` for the GPU dispatch, but the CPU reference exp_slices was computed once at lines 9742-9770 with the host scene's pristine `dp.pass_sample_count == PASS_UNUSED` (-1).
+- Furthermore, Negative 2 (neg_start_sample, line 9947) ran immediately before Negative 3 without a clean dispatch to restore pristine GPU Integrator SoA state (path.sample = 1 and mutated rays remained in device memory).
+- When N3 runs with dp_neg.pass_sample_count = 0 and shifted render_buffer + 16, any early exit in film_need_sample_pixel or discrepancy in film_write_sample leaves behind mutated SoA data, which compare_with_ref sums across all 37 slices (total_slice_spillover = sum(slice_diffs[s])) without allowing any slice differences.
+
+4. Git commands I should run:
+git rm --cached init_from_camera_kernel.spv
+git rm --cached integrator_intersect_closest.spv
+git rm --cached integrator_reset.spv
+git rm --cached src/kernel/device/vulkan/init_from_camera_kernel.spv
+git rm --cached src/kernel/device/vulkan/integrator_intersect_closest.spv
+git rm --cached src/kernel/device/vulkan/integrator_reset.spv
+git rm --cached log
+git add .gitignore
+git add src/kernel/device/vulkan/integrator_intersect_closest.slang
+git add lastsession.txt
+git commit -m "M4f Slice 6: diagnose N3 gate failure, add gap analysis and update gitignore"
+
+5. Gap table (A5)
+| # | Feature Gap vs Real Cycles | Cycles Source | Slang Implementation | Reachable in instance2.xml (0x80000803)? | Proof Flag / Line |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| 1 | Self-intersection avoidance (ray.self) | intersect_closest.h:382-385 | Missing (omitted from traverse call) | NO on camera bounce 0; YES on bounce > 0 | Bounce 0 has last_isect_prim = PRIM_NONE, last_isect_object = OBJECT_NONE (state_template.h:96). Indirect bounces require it. |
+| 2 | Light MIS (lights_intersect / use_light_mis) | intersect_closest.h:424-438 | Missing (omitted) | NO | instance2.xml has 0 lights (Total 0 lights, Number of lights sent to the device: 0, log lines 286-287). |
+| 3 | Sorted queue for SHADE_SURFACE (integrator_path_next_sorted) | intersect_closest.h:273-275 | Uses unsorted integrator_path_next | YES | Rays hitting cubes in instance2.xml transition to SHADE_SURFACE; intersect_closest.h:273-275 unconditionally routes surface hits to sorted queue on GPU backend. |
+| 4 | Shader flags & termination (shaders[].flags & integrator_intersect_terminate) | intersect_closest.h:257-260 | Shader ID read from tri_shader only; flags and termination omitted | NO | instance2.xml uses opaque diffuse shaders without transparency (Use Transparent False, log line 266; KERNEL_FEATURE_TRANSPARENT bit 1<<19 is 0 in 0x80000803). Bounce 0 cannot exceed max bounces. |
+| 5 | AO bounce distance clamping (path_state_ao_bounce) | intersect_closest.h:367-376 | Missing (omitted) | NO | KERNEL_FEATURE_AO (bits 1<<22 \| 1<<23 = 0xC00000) is 0 in kernel_features=0x80000803 (features.h:63). AO bounces disabled. |
+| 6 | Caustics (MNEE), Raytrace, Shadow Catcher, Volume | intersect_closest.h:228-248, 265-271, 277-280 | All omitted | NO for all four | In kernel_features=0x80000803, MNEE (bit 1<<24), Raytrace (bit 1<<6), Shadow Catcher (bit 1<<20), and Volume (bits 1<<2, 1<<18) are all 0 (log lines 261, 264, 265, 274, 275 report them False). |
+
+6. Recommendation for the next task
+In the next task, before advancing INTEGRATOR_INTERSECT_CLOSEST to production gating, address the test harness defect in vulkan_dispatch_gate_init: ensure pristine GPU Integrator SoA state is restored via clean dispatch between each negative fault injection (specifically between Negative 2 and Negative 3), and align Negative 3's CPU reference configuration (dp.pass_sample_count) with the GPU dispatch parameter. Once the INIT gate harness cleanly passes N1-N4 with 0 spillover, wire integrator_path_next_sorted (with sort_key_counter atomic) for SHADE_SURFACE in integrator_intersect_closest.slang, and proceed to gate Slice 6 execution against the real Cycles CPU scene_intersect reference.
+
+================================================================================
 M4f SLICE 5 — COMPLETE (production dispatch plumbing: RESET + INIT_FROM_CAMERA)
 ================================================================================
 STATUS: SLICE 5 COMPLETE AND FULLY GATED.
